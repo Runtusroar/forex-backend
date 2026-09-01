@@ -14,9 +14,17 @@ esac
 mkdir -p "$CHROME_PROFILE_DIR"
 chmod 700 "$CHROME_PROFILE_DIR"
 
-exec "$CHROME_BINARY" \
-  --remote-debugging-address=127.0.0.1 \
-  --remote-debugging-port=9222 \
-  --user-data-dir="$CHROME_PROFILE_DIR" \
-  --no-first-run \
-  --no-default-browser-check
+remote_debugging_address="${CHROME_REMOTE_DEBUGGING_ADDRESS:-127.0.0.1}"
+chrome_args=(
+  "--remote-debugging-address=${remote_debugging_address}"
+  "--remote-debugging-port=9222"
+  "--user-data-dir=${CHROME_PROFILE_DIR}"
+  "--no-first-run"
+  "--no-default-browser-check"
+)
+
+if [[ "${CHROME_CONTAINER_MODE:-0}" == "1" ]]; then
+  chrome_args+=("--no-sandbox" "--disable-dev-shm-usage")
+fi
+
+exec "$CHROME_BINARY" "${chrome_args[@]}"
