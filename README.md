@@ -30,7 +30,7 @@ uv sync
 ```
 
 Set a long random `APP_API_KEY` and your `MOONSHOT_API_KEY` in `.env`. The default translation model
-is `kimi-k2.6` with thinking disabled.
+is [`kimi-k2.6`](https://platform.kimi.ai/docs/guide/kimi-k2-6-quickstart) with thinking disabled.
 
 Start a dedicated Chrome profile on macOS:
 
@@ -42,6 +42,14 @@ bash scripts/start_chrome.sh
 
 On Linux, set `CHROME_BINARY` to the installed Chrome/Chromium executable. Keep CDP port `9222`
 bound to loopback; never expose it publicly.
+
+Keep the server operating-system timezone and the Forex Factory timezone shown in this Chrome
+profile aligned. Calendar rows display wall-clock time rather than a UTC timestamp, so the collector
+converts that source-local time to UTC before storing it. Singapore and China are both UTC+8.
+
+The first collection opens each new story once to obtain its body. Later cycles reuse stored bodies
+unless a story title or summary changes. A single detail-page failure does not block the listing or
+calendar from being stored.
 
 Start the service:
 

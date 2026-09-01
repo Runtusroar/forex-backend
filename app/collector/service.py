@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -6,6 +7,8 @@ from typing import Protocol
 
 from app.parsers import parse_calendar, parse_news_detail, parse_news_listing
 from app.repository import Repository
+
+logger = logging.getLogger(__name__)
 
 
 class BrowserSource(Protocol):
@@ -35,12 +38,34 @@ class Collector:
             enriched = []
             for item in news:
                 if item.body_en is None:
-                    detail = parse_news_detail(await self.browser.news_detail_html(item.url))
-                    item = replace(
-                        item,
-                        body_en=detail.body_en,
-                        image_url=detail.image_url or item.image_url,
-                    )
+                    stored = await self.repository.get_news(item.source_id)
+                    if (
+                        stored
+                        and stored.body_en
+                        and stored.title_en == item.title_en
+                        and stored.summary_en == item.summary_en
+                    ):
+                        item = replace(
+                            item,
+                            body_en=stored.body_en,
+                            image_url=item.image_url or stored.image_url,
+                        )
+                    else:
+                        try:
+                            detail = parse_news_detail(
+                                await self.browser.news_detail_html(item.url)
+                            )
+                            item = replace(
+                                item,
+                                body_en=detail.body_en,
+                                image_url=detail.image_url or item.image_url,
+                            )
+                        except Exception as error:
+                            logger.warning(
+                                "news detail unavailable for %s: %s",
+                                item.source_id,
+                                type(error).__name__,
+                            )
                 enriched.append(item)
             await self.repository.upsert_news(enriched)
             return CollectionResult(len(calendar), len(enriched))

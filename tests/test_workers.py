@@ -23,6 +23,9 @@ async def repository(tmp_path: Path):
 
 
 class FakeBrowser:
+    def __init__(self) -> None:
+        self.detail_calls = 0
+
     async def calendar_html(self) -> str:
         return (FIXTURES / "calendar.html").read_text()
 
@@ -30,6 +33,7 @@ class FakeBrowser:
         return (FIXTURES / "news.html").read_text()
 
     async def news_detail_html(self, _url: str) -> str:
+        self.detail_calls += 1
         return (FIXTURES / "news_article.html").read_text()
 
 
@@ -46,6 +50,12 @@ class FailingTranslator:
         raise httpx.ReadTimeout("timed out")
 
 
+class FailingDetailBrowser(FakeBrowser):
+    async def news_detail_html(self, _url: str) -> str:
+        self.detail_calls += 1
+        raise TimeoutError("detail timed out")
+
+
 async def test_collection_cycle_commits_calendar_and_news(repository: Repository) -> None:
     result = await Collector(FakeBrowser(), repository).run_cycle(
         datetime(2026, 9, 1, 12, tzinfo=UTC)
@@ -54,6 +64,32 @@ async def test_collection_cycle_commits_calendar_and_news(repository: Repository
     assert result.calendar_count == 2
     assert result.news_count == 1
     assert (await repository.get_news("9001")).body_en == "The dollar advanced.\n\nYields rose."
+
+
+async def test_collection_reuses_stored_news_detail_on_later_cycles(
+    repository: Repository,
+) -> None:
+    browser = FakeBrowser()
+    collector = Collector(browser, repository)
+
+    await collector.run_cycle(datetime(2026, 9, 1, 12, tzinfo=UTC))
+    await collector.run_cycle(datetime(2026, 9, 1, 12, 1, tzinfo=UTC))
+
+    assert browser.detail_calls == 1
+
+
+async def test_detail_failure_does_not_block_news_listing_storage(
+    repository: Repository,
+) -> None:
+    result = await Collector(FailingDetailBrowser(), repository).run_cycle(
+        datetime(2026, 9, 1, 12, tzinfo=UTC)
+    )
+
+    stored = await repository.get_news("9001")
+    assert result.news_count == 1
+    assert stored is not None
+    assert stored.title_en == "Dollar rises"
+    assert stored.body_en is None
 
 
 async def test_translation_worker_applies_pending_translation(repository: Repository) -> None:

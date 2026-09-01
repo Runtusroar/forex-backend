@@ -27,24 +27,40 @@ def parse_news_listing(html: str, now: datetime) -> list[NewsObservation]:
     reject_challenge(html)
     tree = HTMLParser(html)
     items: list[NewsObservation] = []
-    for node in tree.css(".news__item"):
-        link = node.css_first("a.news__title") or node.css_first("a[href*='/news/']")
+    seen: set[str] = set()
+    for node in tree.css(".news__item, .news-block__item"):
+        classes = node.attributes.get("class", "").split()
+        if "news-block__item--comment" in classes:
+            continue
+        link = (
+            node.css_first("a.news__title")
+            or node.css_first(".news-block__title a[href^='/news/']")
+            or node.css_first("a[href*='/news/']")
+        )
         if not link:
             continue
         url = urljoin(SOURCE_ROOT, link.attributes.get("href", ""))
         title = link.text(strip=True)
         if not title:
             continue
+        source_id = _source_id(url)
+        if source_id in seen:
+            continue
+        seen.add(source_id)
         image = node.css_first("img")
+        source = _text(node, ".news__source") or _text(node, ".news-block__details a")
+        if source:
+            source = source.removeprefix("From ").strip()
         items.append(
             NewsObservation(
-                source_id=_source_id(url),
+                source_id=source_id,
                 url=url,
-                source=_text(node, ".news__source"),
+                source=source,
                 published_at=None,
                 first_seen_at=now,
                 title_en=title,
-                summary_en=_text(node, ".news__preview"),
+                summary_en=_text(node, ".news__preview")
+                or _text(node, ".news-block__preview"),
                 body_en=None,
                 image_url=urljoin(SOURCE_ROOT, image.attributes.get("src", "")) if image else None,
             )

@@ -24,7 +24,9 @@ class BrowserSession:
         await self.calendar_page.goto(
             "https://www.forexfactory.com/calendar?week=this", wait_until="domcontentloaded"
         )
-        await self.calendar_page.wait_for_selector("tr.calendar__row", timeout=20_000)
+        await self.calendar_page.wait_for_selector(
+            "tr.calendar__row", state="attached", timeout=20_000
+        )
         return await self.calendar_page.content()
 
     async def news_html(self) -> str:
@@ -33,7 +35,9 @@ class BrowserSession:
         await self.news_page.goto(
             "https://www.forexfactory.com/news", wait_until="domcontentloaded"
         )
-        await self.news_page.wait_for_selector(".news__item", timeout=20_000)
+        await self.news_page.wait_for_selector(
+            ".news-block__item, .news__item", state="attached", timeout=20_000
+        )
         return await self.news_page.content()
 
     async def news_detail_html(self, url: str) -> str:
@@ -42,7 +46,7 @@ class BrowserSession:
         page = await self.browser.contexts[0].new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded")
-            await page.wait_for_selector(".news__article", timeout=20_000)
+            await page.wait_for_selector(".news__article", state="attached", timeout=20_000)
             return await page.content()
         finally:
             await page.close()

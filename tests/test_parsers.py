@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -22,6 +22,19 @@ def test_calendar_reads_ids_values_and_grouped_rows() -> None:
     assert (rows[1].actual, rows[1].forecast, rows[1].previous) == ("0.2%", "0.1%", "-0.3%")
 
 
+def test_calendar_skips_current_day_breakers_and_converts_source_timezone() -> None:
+    rows = parse_calendar(
+        fixture("calendar_current.html"),
+        datetime(2026, 9, 1, tzinfo=UTC),
+        source_timezone=timezone(timedelta(hours=8)),
+    )
+
+    assert len(rows) == 1
+    assert rows[0].source_id == "149673"
+    assert rows[0].event_at == datetime(2026, 8, 30, 23, 50, tzinfo=UTC)
+    assert rows[0].title_en == "Prelim Industrial Production m/m"
+
+
 def test_news_relative_age_does_not_change_translatable_data() -> None:
     html = fixture("news.html")
     now = datetime(2026, 9, 1, 12, tzinfo=UTC)
@@ -32,6 +45,19 @@ def test_news_relative_age_does_not_change_translatable_data() -> None:
     assert first.title_en == second.title_en
     assert first.summary_en == second.summary_en
     assert first.first_seen_at == second.first_seen_at
+
+
+def test_news_supports_current_blocks_and_skips_comment_cards() -> None:
+    rows = parse_news_listing(
+        fixture("news_current.html"), datetime(2026, 9, 1, 12, tzinfo=UTC)
+    )
+
+    assert len(rows) == 1
+    assert rows[0].source_id == "1415933"
+    assert rows[0].title_en == "Bond markets sell off"
+    assert rows[0].source == "Reuters"
+    assert rows[0].summary_en == "Government borrowing costs rose."
+    assert rows[0].image_url == "https://assets.example/bonds.png"
 
 
 def test_news_detail_supports_article_and_social_content() -> None:
