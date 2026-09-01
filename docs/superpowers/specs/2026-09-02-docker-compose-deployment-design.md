@@ -13,9 +13,10 @@ Docker Compose runs two services from one repository-owned image:
 - `chrome` runs full Chromium under Xvfb with a persistent, non-default browser profile.
 - `api` runs FastAPI, the collector, SQLite storage, and the asynchronous Kimi translator.
 
-The services communicate over the private Compose network at `http://chrome:9222`. Port `9222` is
-not published to the host. The API publishes `127.0.0.1:8000:8000` by default so only a local reverse
-proxy can reach it.
+The API joins the Chrome service's network namespace and reaches CDP over
+`http://127.0.0.1:9222`. This supports Chromium releases that restrict remote debugging to loopback
+even when a wider bind address is requested. Port `9222` is never published. The stack publishes
+`127.0.0.1:8000:8000` by default so only a local reverse proxy can reach the API.
 
 ## Persistence
 
@@ -28,15 +29,16 @@ Both volumes survive `docker compose down` and image upgrades. Operators must no
 
 ## Image and Runtime
 
-The image uses Python 3.12 on Debian and installs Chromium, Xvfb, fonts, and curl. It installs the
+The image uses Python 3.12 on Debian and installs Chromium, Xvfb, xauth, fonts, and curl. It installs the
 locked Python production dependencies with `uv`, copies the application, and runs as an unprivileged
 application user. The same immutable image is shared by both services; Compose supplies a different
 command to each container.
 
 The existing Chrome launcher gains environment-controlled bind address and an explicit container
-mode for `--no-sandbox` and `--disable-dev-shm-usage`. Local execution remains secure by default:
-CDP binds to `127.0.0.1` and sandbox disabling is opt-in. The container keeps CDP private even though
-Chromium binds to the Compose network.
+mode for `--no-sandbox` and `--disable-dev-shm-usage`. Compose starts Xvfb with a readiness probe,
+uses a private writable X11 socket directory, and removes only stale locks belonging to its dedicated
+profile. Local execution remains secure by default: CDP binds to `127.0.0.1` and sandbox disabling is
+opt-in.
 
 ## Configuration and Secrets
 
@@ -48,6 +50,9 @@ The operator copies `.env.example` to `.env` and changes only:
 `APP_PORT` defaults to `8000`. Compose overrides container-specific paths and CDP URL, so the same
 application settings continue to support non-Docker local development. `.env` remains ignored and is
 never copied into the image because `.dockerignore` excludes it.
+
+The default translation configuration targets a Kimi Code membership key at
+`https://api.kimi.com/coding/v1` with model `k3-256k`; both values remain configurable.
 
 ## Startup, Health, and Recovery
 

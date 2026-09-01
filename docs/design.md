@@ -96,7 +96,7 @@ Schema creation is idempotent at process startup. WAL and a busy timeout allow s
 
 ### 4.4 Kimi Translation
 
-Use `kimi-k2.6` by default with thinking disabled. It is a current supported general model and avoids the always-reasoning behavior of `kimi-k3`, which is unnecessary for short translation. `KIMI_MODEL` remains configurable so a future model change requires no code edit.
+Use `k3-256k` through the Kimi Code membership endpoint by default, with thinking disabled for short translation. `KIMI_BASE_URL` and `KIMI_MODEL` remain configurable so a different Kimi credential type or future model change requires no code edit.
 
 English ingestion never waits for translation. After the source transaction commits, a separate worker claims durable pending jobs from SQLite. It translates a bounded batch into strict JSON, validates IDs and non-empty Chinese output, then updates translated fields only when the source hash still matches. A stale result can never overwrite newer English content.
 
@@ -153,8 +153,8 @@ Backend environment:
 - `COLLECT_INTERVAL_SECONDS=30`
 - `APP_API_KEY=<random secret>`
 - `MOONSHOT_API_KEY=<Kimi server-side secret>`
-- `KIMI_BASE_URL=https://api.moonshot.ai/v1`
-- `KIMI_MODEL=kimi-k2.6`
+- `KIMI_BASE_URL=https://api.kimi.com/coding/v1`
+- `KIMI_MODEL=k3-256k`
 
 No real secret is committed. `.env.example` contains names and safe defaults only.
 
