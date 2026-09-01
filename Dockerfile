@@ -13,7 +13,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CHROME_PROFILE_DIR=/app/chrome-profile
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends chromium curl fonts-noto-cjk xauth xvfb \
+    && apt-get install --yes --no-install-recommends \
+       chromium curl fonts-noto-cjk x11-utils xauth xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

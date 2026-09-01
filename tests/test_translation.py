@@ -31,7 +31,7 @@ def job() -> TranslationJob:
 
 
 @respx.mock
-async def test_kimi_uses_k3_without_thinking(tmp_path: Path) -> None:
+async def test_kimi_uses_k3_with_low_reasoning(tmp_path: Path) -> None:
     route = respx.post("https://api.kimi.com/coding/v1/chat/completions").mock(
         return_value=httpx.Response(
             200,
@@ -62,7 +62,8 @@ async def test_kimi_uses_k3_without_thinking(tmp_path: Path) -> None:
     body = json.loads(route.calls[0].request.content)
 
     assert body["model"] == "k3-256k"
-    assert body["thinking"] == {"type": "disabled"}
+    assert body["reasoning_effort"] == "low"
+    assert "thinking" not in body
     assert body["response_format"]["type"] == "json_schema"
     assert result[7]["title_zh"] == "美元上涨"
 

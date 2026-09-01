@@ -96,7 +96,7 @@ Schema creation is idempotent at process startup. WAL and a busy timeout allow s
 
 ### 4.4 Kimi Translation
 
-Use `k3-256k` through the Kimi Code membership endpoint by default, with thinking disabled for short translation. `KIMI_BASE_URL` and `KIMI_MODEL` remain configurable so a different Kimi credential type or future model change requires no code edit.
+Use `k3-256k` through the Kimi Code membership endpoint by default, with low reasoning effort for short translation. Kimi Code routes thinking-disabled K3 requests to an older model, so reasoning remains enabled. `KIMI_BASE_URL` and `KIMI_MODEL` remain configurable so a different Kimi credential type or future model change requires no code edit.
 
 English ingestion never waits for translation. After the source transaction commits, a separate worker claims durable pending jobs from SQLite. It translates a bounded batch into strict JSON, validates IDs and non-empty Chinese output, then updates translated fields only when the source hash still matches. A stale result can never overwrite newer English content.
 

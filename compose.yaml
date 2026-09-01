@@ -50,6 +50,7 @@ services:
       MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:?Set MOONSHOT_API_KEY in .env}
       KIMI_BASE_URL: ${KIMI_BASE_URL:-https://api.kimi.com/coding/v1}
       KIMI_MODEL: ${KIMI_MODEL:-k3-256k}
+      COLLECT_INTERVAL_SECONDS: ${COLLECT_INTERVAL_SECONDS:-30}
       DATABASE_PATH: /app/data/forex_factory.sqlite3
       CDP_URL: http://127.0.0.1:9222
     depends_on:

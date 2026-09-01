@@ -21,7 +21,7 @@ class KimiTranslator:
             return {}
         request = {
             "model": self.settings.kimi_model,
-            "thinking": {"type": "disabled"},
+            "reasoning_effort": "low",
             "messages": [
                 {
                     "role": "system",

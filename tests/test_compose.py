@@ -35,8 +35,20 @@ def test_api_receives_configurable_kimi_endpoint_and_model() -> None:
     assert "KIMI_MODEL: ${KIMI_MODEL:-k3-256k}" in compose
 
 
+def test_api_receives_configurable_collection_interval() -> None:
+    compose = Path("compose.yaml").read_text()
+
+    assert "COLLECT_INTERVAL_SECONDS: ${COLLECT_INTERVAL_SECONDS:-30}" in compose
+
+
 def test_api_has_a_healthcheck() -> None:
     compose = Path("compose.yaml").read_text()
 
     api_section = compose.split("  api:\n", maxsplit=1)[1]
     assert 'test: ["CMD", "curl", "--fail", "http://127.0.0.1:8000/health"]' in api_section
+
+
+def test_image_explicitly_installs_xvfb_readiness_dependency() -> None:
+    dockerfile = Path("Dockerfile").read_text()
+
+    assert "x11-utils" in dockerfile
