@@ -1,0 +1,42 @@
+x-app-image: &app-image
+  image: forex-factory-mvp:local
+
+services:
+  chrome:
+    <<: *app-image
+    build:
+      context: .
+    command: xvfb-run -a bash scripts/start_chrome.sh
+    environment:
+      CHROME_CONTAINER_MODE: "1"
+      CHROME_REMOTE_DEBUGGING_ADDRESS: 0.0.0.0
+    volumes:
+      - chrome-profile:/app/chrome-profile
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://127.0.0.1:9222/json/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  api:
+    <<: *app-image
+    command: uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000
+    environment:
+      APP_API_KEY: ${APP_API_KEY:?Set APP_API_KEY in .env}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:?Set MOONSHOT_API_KEY in .env}
+      DATABASE_PATH: /app/data/forex_factory.sqlite3
+      CDP_URL: http://chrome:9222
+    depends_on:
+      chrome:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:${APP_PORT:-8000}:8000
+    volumes:
+      - database:/app/data
+    restart: unless-stopped
+
+volumes:
+  chrome-profile:
+  database:
