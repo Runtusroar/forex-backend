@@ -69,7 +69,7 @@ class KimiTranslator:
             },
         }
         owns_client = self.client is None
-        client = self.client or httpx.AsyncClient(timeout=30)
+        client = self.client or httpx.AsyncClient(timeout=self.settings.kimi_timeout_seconds)
         try:
             response = await client.post(
                 f"{self.settings.kimi_base_url.rstrip('/')}/chat/completions",

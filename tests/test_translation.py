@@ -79,3 +79,46 @@ async def test_kimi_rejects_missing_job_ids(tmp_path: Path) -> None:
 
     with pytest.raises(TranslationProtocolError):
         await KimiTranslator(settings(tmp_path)).translate([job()])
+
+
+@respx.mock
+async def test_kimi_uses_configured_timeout(tmp_path: Path, monkeypatch) -> None:
+    observed: list[float] = []
+    original_client = httpx.AsyncClient
+
+    class RecordingClient(original_client):
+        def __init__(self, *args, **kwargs) -> None:
+            observed.append(kwargs["timeout"])
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", RecordingClient)
+    respx.post("https://api.kimi.com/coding/v1/chat/completions").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "translations": [
+                                        {
+                                            "job_id": 7,
+                                            "title_zh": "美元上涨",
+                                            "summary_zh": None,
+                                            "body_zh": "美元走强。",
+                                        }
+                                    ]
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+    )
+    configured = settings(tmp_path).model_copy(update={"kimi_timeout_seconds": 75})
+
+    await KimiTranslator(configured).translate([job()])
+
+    assert observed == [75]

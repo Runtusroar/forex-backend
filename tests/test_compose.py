@@ -33,6 +33,7 @@ def test_api_receives_configurable_kimi_endpoint_and_model() -> None:
 
     assert "KIMI_BASE_URL: ${KIMI_BASE_URL:-https://api.kimi.com/coding/v1}" in compose
     assert "KIMI_MODEL: ${KIMI_MODEL:-k3-256k}" in compose
+    assert "KIMI_TIMEOUT_SECONDS: ${KIMI_TIMEOUT_SECONDS:-120}" in compose
 
 
 def test_api_receives_configurable_collection_interval() -> None:

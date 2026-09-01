@@ -18,6 +18,7 @@ def test_settings_have_mvp_defaults(tmp_path: Path) -> None:
     assert settings.collect_interval_seconds == 30
     assert settings.kimi_base_url == "https://api.kimi.com/coding/v1"
     assert settings.kimi_model == "k3-256k"
+    assert settings.kimi_timeout_seconds == 120
 
 
 def test_interval_must_be_positive(tmp_path: Path) -> None:

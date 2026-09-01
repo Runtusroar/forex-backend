@@ -155,6 +155,7 @@ Backend environment:
 - `MOONSHOT_API_KEY=<Kimi server-side secret>`
 - `KIMI_BASE_URL=https://api.kimi.com/coding/v1`
 - `KIMI_MODEL=k3-256k`
+- `KIMI_TIMEOUT_SECONDS=120`
 
 No real secret is committed. `.env.example` contains names and safe defaults only.
 
