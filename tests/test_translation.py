@@ -31,8 +31,8 @@ def job() -> TranslationJob:
 
 
 @respx.mock
-async def test_kimi_uses_k26_without_thinking(tmp_path: Path) -> None:
-    route = respx.post("https://api.moonshot.ai/v1/chat/completions").mock(
+async def test_kimi_uses_k3_without_thinking(tmp_path: Path) -> None:
+    route = respx.post("https://api.kimi.com/coding/v1/chat/completions").mock(
         return_value=httpx.Response(
             200,
             json={
@@ -61,7 +61,7 @@ async def test_kimi_uses_k26_without_thinking(tmp_path: Path) -> None:
     result = await KimiTranslator(settings(tmp_path)).translate([job()])
     body = json.loads(route.calls[0].request.content)
 
-    assert body["model"] == "kimi-k2.6"
+    assert body["model"] == "k3-256k"
     assert body["thinking"] == {"type": "disabled"}
     assert body["response_format"]["type"] == "json_schema"
     assert result[7]["title_zh"] == "美元上涨"
@@ -69,7 +69,7 @@ async def test_kimi_uses_k26_without_thinking(tmp_path: Path) -> None:
 
 @respx.mock
 async def test_kimi_rejects_missing_job_ids(tmp_path: Path) -> None:
-    respx.post("https://api.moonshot.ai/v1/chat/completions").mock(
+    respx.post("https://api.kimi.com/coding/v1/chat/completions").mock(
         return_value=httpx.Response(
             200,
             json={"choices": [{"message": {"content": '{"translations": []}'}}]},

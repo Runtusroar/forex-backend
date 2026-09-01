@@ -13,8 +13,8 @@ class Settings(BaseSettings):
     collect_interval_seconds: int = Field(default=30, gt=0)
     app_api_key: SecretStr
     moonshot_api_key: SecretStr
-    kimi_base_url: str = "https://api.moonshot.ai/v1"
-    kimi_model: str = "kimi-k2.6"
+    kimi_base_url: str = "https://api.kimi.com/coding/v1"
+    kimi_model: str = "k3-256k"
 
 
 @lru_cache(maxsize=1)
