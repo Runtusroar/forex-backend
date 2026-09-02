@@ -29,6 +29,7 @@ Start the stack:
 docker compose up -d --build
 docker compose ps
 curl --fail http://127.0.0.1:8000/health
+docker compose exec -T api python scripts/smoke_news_v2.py
 ```
 
 Only the API port is published, and it is bound to host loopback. Chrome's debugging port is not
