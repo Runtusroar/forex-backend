@@ -173,3 +173,16 @@ async def test_v1_news_is_derived_from_v2_during_client_migration(
     assert detail.json()["title_zh"] == "日元上涨"
     assert detail.json()["body_en"] == "First alert\n\nFull story"
     assert "local_path" not in detail.text
+
+
+async def test_status_exposes_schema_queues_and_sanitized_collector_state(
+    api: httpx.AsyncClient,
+) -> None:
+    response = await api.get(
+        "/api/v2/status", headers={"X-API-Key": "api-secret"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["schema_version"] == 2
+    assert "detail_jobs" in response.json()
+    assert response.json()["last_listing_error"] is None

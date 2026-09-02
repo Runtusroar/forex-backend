@@ -89,6 +89,7 @@ async def test_news_translation_prioritizes_content_and_isolates_missing_items(
     assert result.failed == 3
     assert await news_repository.localized_text("article", "1", "title") == "美元上涨"
     assert await news_repository.localized_status("comment", "10", "text") == "pending"
+    assert await worker.run_once(limit=10) == TranslationRunResult(0, 0)
 
 
 async def test_translation_failure_does_not_change_english_source(

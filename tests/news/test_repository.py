@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -181,3 +182,48 @@ async def test_detail_persists_media_and_comments(news_repository: NewsRepositor
         ("1416149", "https://assets.example/chart.png")
     ]
     assert await news_repository.comment_count("1416149") == 1
+
+
+async def test_concurrent_listing_transactions_are_serialized(
+    news_repository: NewsRepository,
+) -> None:
+    await asyncio.gather(
+        news_repository.apply_listing(batch(observed_at=NOW)),
+        news_repository.apply_listing(batch(observed_at=NOW + timedelta(seconds=1))),
+    )
+
+    assert await news_repository.count_articles() == 1
+
+
+async def test_comment_count_change_requeues_completed_detail(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch())
+    await news_repository.claim_detail_jobs(1, NOW)
+    await news_repository.complete_detail_job("1416149")
+    changed_batch = batch(observed_at=NOW + timedelta(minutes=1))
+    changed_article = changed_batch.articles[0]
+    changed_batch = NewsListingBatch(
+        articles=(
+            ArticleObservation(
+                changed_article.source_id,
+                changed_article.ff_url,
+                changed_article.title_en,
+                changed_article.observed_at,
+                published_at=changed_article.published_at,
+                breaking_impact="high",
+                comment_count=2,
+            ),
+        ),
+        categories=changed_batch.categories,
+        feeds=changed_batch.feeds,
+        observed_at=changed_batch.observed_at,
+        source_hash=changed_batch.source_hash,
+        source_timezone=changed_batch.source_timezone,
+        observed_sections=changed_batch.observed_sections,
+    )
+
+    result = await news_repository.apply_listing(changed_batch)
+
+    assert result.changed_article_ids == ("1416149",)
+    assert await news_repository.detail_job_state("1416149") == "pending"

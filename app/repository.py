@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from typing import Any
 
 from app.db import Database
@@ -14,6 +15,15 @@ from app.domain import (
     NewsRecord,
     TranslationJob,
 )
+
+
+def _serialized_write(method):
+    @wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        async with self.write_lock:
+            return await method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _now() -> datetime:
@@ -37,7 +47,9 @@ class Repository:
     def __init__(self, database: Database) -> None:
         assert database.connection is not None
         self.db = database.connection
+        self.write_lock = database.write_lock
 
+    @_serialized_write
     async def upsert_calendar(self, items: list[CalendarObservation]) -> None:
         now = _iso(_now())
         for item in items:
@@ -76,6 +88,7 @@ class Repository:
                 )
         await self.db.commit()
 
+    @_serialized_write
     async def upsert_news(self, items: list[NewsObservation]) -> None:
         now = _iso(_now())
         for item in items:
@@ -135,6 +148,7 @@ class Repository:
             (entity_type, entity_id, source_hash, json.dumps(payload), _iso(_now())),
         )
 
+    @_serialized_write
     async def claim_translation_jobs(self, limit: int) -> list[TranslationJob]:
         rows = await self.db.execute_fetchall(
             """SELECT * FROM translation_jobs
@@ -160,6 +174,7 @@ class Repository:
             for row in rows
         ]
 
+    @_serialized_write
     async def complete_translation(
         self, job: TranslationJob, translated: dict[str, str | None]
     ) -> bool:
@@ -191,6 +206,7 @@ class Repository:
         await self.db.commit()
         return True
 
+    @_serialized_write
     async def fail_translation(self, job: TranslationJob, error: Exception) -> None:
         delays = (1, 5, 30, 120, 360)
         delay = delays[min(job.attempts, len(delays) - 1)]

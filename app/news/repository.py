@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,15 @@ from app.news.models import (
 )
 
 
+def _serialized_write(method):
+    @wraps(method)
+    async def wrapper(self, *args, **kwargs):
+        async with self.write_lock:
+            return await method(self, *args, **kwargs)
+
+    return wrapper
+
+
 def _iso(value: datetime | None) -> str | None:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z") if value else None
 
@@ -37,14 +48,23 @@ def _hash(article: ArticleObservation) -> str:
         article.source_name,
         article.source_url,
         _iso(article.published_at),
+        article.breaking_impact,
+        str(article.comment_count),
+        article.listing_thumbnail_url,
     )
     return hashlib.sha256("\n".join(value or "" for value in values).encode()).hexdigest()
 
 
 class NewsRepository:
-    def __init__(self, connection: aiosqlite.Connection) -> None:
+    def __init__(
+        self,
+        connection: aiosqlite.Connection,
+        write_lock: asyncio.Lock | None = None,
+    ) -> None:
         self.db = connection
+        self.write_lock = write_lock or asyncio.Lock()
 
+    @_serialized_write
     async def apply_listing(self, batch: NewsListingBatch) -> ListingApplyResult:
         new_ids: list[str] = []
         changed_ids: list[str] = []
@@ -257,6 +277,7 @@ class NewsRepository:
         rows = await self.db.execute_fetchall("SELECT count(*) AS count FROM news_articles")
         return int(rows[0]["count"])
 
+    @_serialized_write
     async def claim_detail_jobs(
         self, limit: int, now: datetime | None = None
     ) -> list[DetailJob]:
@@ -295,39 +316,69 @@ class NewsRepository:
             for row in rows
         ]
 
-    async def complete_detail_job(self, article_id: str) -> None:
-        await self.db.execute(
-            """UPDATE news_detail_jobs SET state='done',claimed_at=NULL,last_error=NULL
-               WHERE article_id=?""",
-            (article_id,),
-        )
+    @_serialized_write
+    async def complete_detail_job(
+        self, article_id: str, desired_source_hash: str | None = None
+    ) -> None:
+        if desired_source_hash is None:
+            await self.db.execute(
+                """UPDATE news_detail_jobs SET state='done',claimed_at=NULL,last_error=NULL
+                   WHERE article_id=?""",
+                (article_id,),
+            )
+        else:
+            await self.db.execute(
+                """UPDATE news_detail_jobs SET state='done',claimed_at=NULL,last_error=NULL
+                   WHERE article_id=? AND desired_source_hash=?""",
+                (article_id, desired_source_hash),
+            )
         await self.db.commit()
 
+    @_serialized_write
     async def fail_detail_job(
         self,
         article_id: str,
         error: Exception,
         now: datetime | None = None,
         max_attempts: int = 8,
+        desired_source_hash: str | None = None,
     ) -> None:
         failed_at = now or datetime.now(UTC)
-        rows = await self.db.execute_fetchall(
-            "SELECT attempts FROM news_detail_jobs WHERE article_id=?", (article_id,)
-        )
+        if desired_source_hash is None:
+            rows = await self.db.execute_fetchall(
+                "SELECT attempts FROM news_detail_jobs WHERE article_id=?", (article_id,)
+            )
+        else:
+            rows = await self.db.execute_fetchall(
+                """SELECT attempts FROM news_detail_jobs
+                   WHERE article_id=? AND desired_source_hash=?""",
+                (article_id, desired_source_hash),
+            )
+        if not rows:
+            return
         attempts = int(rows[0]["attempts"]) + 1
         delay_minutes = (1, 5, 30, 120, 360)[min(attempts - 1, 4)]
         state = "failed" if attempts >= max_attempts else "pending"
-        await self.db.execute(
-            """UPDATE news_detail_jobs SET state=?,attempts=?,next_attempt_at=?,
-               claimed_at=NULL,last_error=? WHERE article_id=?""",
-            (
-                state,
-                attempts,
-                _iso(failed_at + timedelta(minutes=delay_minutes)),
-                type(error).__name__,
-                article_id,
-            ),
+        parameters = (
+            state,
+            attempts,
+            _iso(failed_at + timedelta(minutes=delay_minutes)),
+            type(error).__name__,
+            article_id,
         )
+        if desired_source_hash is None:
+            await self.db.execute(
+                """UPDATE news_detail_jobs SET state=?,attempts=?,next_attempt_at=?,
+                   claimed_at=NULL,last_error=? WHERE article_id=?""",
+                parameters,
+            )
+        else:
+            await self.db.execute(
+                """UPDATE news_detail_jobs SET state=?,attempts=?,next_attempt_at=?,
+                   claimed_at=NULL,last_error=?
+                   WHERE article_id=? AND desired_source_hash=?""",
+                (*parameters, desired_source_hash),
+            )
         await self.db.commit()
 
     async def detail_job_state(self, article_id: str) -> str | None:
@@ -346,6 +397,7 @@ class NewsRepository:
         )
         return bool(rows)
 
+    @_serialized_write
     async def record_snapshot(
         self,
         *,
@@ -386,6 +438,7 @@ class NewsRepository:
         )
         return [(int(row["id"]), str(row["compressed_path"])) for row in rows]
 
+    @_serialized_write
     async def delete_snapshot_records(self, snapshot_ids: list[int]) -> None:
         if not snapshot_ids:
             return
@@ -395,6 +448,7 @@ class NewsRepository:
         )
         await self.db.commit()
 
+    @_serialized_write
     async def replace_detail(self, article_id: str, detail: DetailObservation) -> None:
         observed = _iso(detail.observed_at)
         current_keys = {segment.stable_key for segment in detail.segments}
@@ -583,6 +637,7 @@ class NewsRepository:
             ),
         )
 
+    @_serialized_write
     async def claim_localized_jobs(
         self, limit: int, now: datetime | None = None
     ) -> list[LocalizedTextJob]:
@@ -594,7 +649,8 @@ class NewsRepository:
             rows = await self.db.execute_fetchall(
                 """SELECT * FROM localized_texts
                    WHERE status IN ('pending','processing')
-                     AND (status='pending' OR next_attempt_at IS NULL OR next_attempt_at<=?)
+                     AND (next_attempt_at IS NULL OR next_attempt_at<=?
+                          OR (status='pending' AND attempts=0))
                    ORDER BY CASE entity_type
                      WHEN 'article' THEN 0 WHEN 'segment' THEN 1 ELSE 2 END,
                      id LIMIT ?""",
@@ -655,6 +711,7 @@ class NewsRepository:
         )
         return str(rows[0]["value"]) if rows and rows[0]["value"] is not None else None
 
+    @_serialized_write
     async def complete_localized_job(
         self, job: LocalizedTextJob, translated_text: str, model: str
     ) -> bool:
@@ -678,6 +735,7 @@ class NewsRepository:
         await self.db.commit()
         return True
 
+    @_serialized_write
     async def fail_localized_job(
         self, job: LocalizedTextJob, error: Exception, now: datetime | None = None
     ) -> None:
@@ -727,6 +785,7 @@ class NewsRepository:
         )
         return str(rows[0]["status"]) if rows else None
 
+    @_serialized_write
     async def claim_media_jobs(
         self, limit: int, now: datetime | None = None
     ) -> list[MediaJob]:
@@ -738,8 +797,8 @@ class NewsRepository:
             rows = await self.db.execute_fetchall(
                 """SELECT id,article_id,original_url,attempts FROM news_media
                    WHERE is_current=1 AND download_state!='complete'
-                     AND (download_state='pending' OR next_attempt_at IS NULL
-                          OR next_attempt_at<=?)
+                     AND (next_attempt_at IS NULL OR next_attempt_at<=?
+                          OR (download_state='pending' AND attempts=0))
                    ORDER BY attempts,id LIMIT ?""",
                 (ready, limit),
             )
@@ -763,6 +822,7 @@ class NewsRepository:
             for row in rows
         ]
 
+    @_serialized_write
     async def complete_media_job(
         self,
         media_id: int,
@@ -778,6 +838,7 @@ class NewsRepository:
         )
         await self.db.commit()
 
+    @_serialized_write
     async def fail_media_job(
         self, media_id: int, error: Exception, now: datetime | None = None
     ) -> None:
@@ -1092,31 +1153,49 @@ class NewsRepository:
         }
 
     async def list_comments(
-        self, article_id: str | None, limit: int, before_id: str | None = None
-    ) -> tuple[list[dict[str, Any]], str | None]:
+        self,
+        article_id: str | None,
+        limit: int,
+        cursor: dict[str, Any] | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         parameters: list[Any] = []
         if article_id is None:
             source = """news_comments c JOIN news_comment_feed f
                         ON f.comment_id=c.comment_id"""
             where = "f.is_current=1"
             order = "f.rank,c.comment_id"
+            fields = "c.*,f.rank AS sort_rank"
+            if cursor:
+                where += " AND (f.rank>? OR (f.rank=? AND c.comment_id>?))"
+                parameters.extend((cursor["rank"], cursor["rank"], cursor["id"]))
         else:
             source = "news_comments c"
             where = "c.article_id=?"
             parameters.append(article_id)
-            order = "COALESCE(c.published_at,c.first_seen_at) DESC,c.comment_id DESC"
-        if before_id:
-            where += " AND c.comment_id<?"
-            parameters.append(before_id)
+            sort_value = "COALESCE(c.published_at,c.first_seen_at)"
+            order = f"{sort_value} DESC,c.comment_id DESC"
+            fields = f"c.*,{sort_value} AS sort_time"
+            if cursor:
+                where += (
+                    f" AND ({sort_value}<? OR ({sort_value}=? AND c.comment_id<?))"
+                )
+                parameters.extend((cursor["time"], cursor["time"], cursor["id"]))
         rows = await self.db.execute_fetchall(
-            f"SELECT c.* FROM {source} WHERE {where} ORDER BY {order} LIMIT ?",
+            f"SELECT {fields} FROM {source} WHERE {where} ORDER BY {order} LIMIT ?",
             (*parameters, limit + 1),
         )
         selected = [dict(row) for row in rows[:limit]]
         translations = await self._current_translations("comment", selected)
         for item in selected:
             item["text_zh"] = translations.get((str(item["comment_id"]), "text"))
-        next_cursor = str(selected[-1]["comment_id"]) if len(rows) > limit else None
+        next_cursor: dict[str, Any] | None = None
+        if len(rows) > limit and selected:
+            last = selected[-1]
+            next_cursor = (
+                {"rank": last["sort_rank"], "id": last["comment_id"]}
+                if article_id is None
+                else {"time": last["sort_time"], "id": last["comment_id"]}
+            )
         return selected, next_cursor
 
     async def status_counts(self) -> dict[str, Any]:
@@ -1134,6 +1213,14 @@ class NewsRepository:
             "SELECT value FROM runtime_state WHERE key='schema_version'"
         )
         result["schema_version"] = int(rows[0]["value"])
+        for key in (
+            "news_last_listing_success",
+            "news_last_listing_error",
+            "news_last_detail_success",
+            "news_last_detail_error",
+            "news_last_translation_success",
+        ):
+            result[key.removeprefix("news_")] = await self.get_runtime_state(key)
         return result
 
     async def list_articles(
@@ -1168,6 +1255,7 @@ class NewsRepository:
         )
         return str(rows[0]["value"]) if rows else None
 
+    @_serialized_write
     async def set_runtime_state(self, key: str, value: str) -> None:
         await self.db.execute(
             """INSERT INTO runtime_state(key,value) VALUES (?,?)

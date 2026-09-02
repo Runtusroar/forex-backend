@@ -1,4 +1,5 @@
 import base64
+import binascii
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -48,8 +49,31 @@ def _decode_cursor(cursor: str | None, section: str) -> dict[str, Any] | str | N
         if decoded["section"] != section or not isinstance(decoded["value"], (dict, str)):
             raise ValueError
         return decoded["value"]
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
+    except (
+        ValueError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+        binascii.Error,
+        UnicodeDecodeError,
+    ) as error:
         raise HTTPException(status_code=422, detail="Invalid cursor") from error
+
+
+def _require_cursor_keys(
+    value: dict[str, Any] | str | None, keys: tuple[str, ...]
+) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != set(keys):
+        raise HTTPException(status_code=422, detail="Invalid cursor")
+    if not isinstance(value.get("id"), str):
+        raise HTTPException(status_code=422, detail="Invalid cursor")
+    if "rank" in value and not isinstance(value["rank"], int):
+        raise HTTPException(status_code=422, detail="Invalid cursor")
+    if "time" in value and not isinstance(value["time"], str):
+        raise HTTPException(status_code=422, detail="Invalid cursor")
+    return value
 
 
 def _article(item: dict[str, Any]) -> dict[str, Any]:
@@ -130,9 +154,8 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         cursor: str | None = None,
     ) -> dict:
-        decoded = _decode_cursor(cursor, section)
-        if decoded is not None and not isinstance(decoded, dict):
-            raise HTTPException(status_code=422, detail="Invalid cursor")
+        keys = ("rank", "id") if section in ("latest", "hot") else ("time", "id")
+        decoded = _require_cursor_keys(_decode_cursor(cursor, section), keys)
         rows, next_value = await repo.list_section(section, impact, limit, decoded)
         return {
             "items": [_article(row) for row in rows],
@@ -146,9 +169,9 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         cursor: str | None = None,
     ) -> dict:
-        decoded = _decode_cursor(cursor, "latest-comments")
-        if decoded is not None and not isinstance(decoded, str):
-            raise HTTPException(status_code=422, detail="Invalid cursor")
+        decoded = _require_cursor_keys(
+            _decode_cursor(cursor, "latest-comments"), ("rank", "id")
+        )
         rows, next_value = await repo.list_comments(None, limit, decoded)
         return {
             "items": [_comment(row) for row in rows],
@@ -186,9 +209,9 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
     ) -> dict:
         if await repo.get_article(source_id) is None:
             raise HTTPException(status_code=404, detail="Not found")
-        decoded = _decode_cursor(cursor, f"comments:{source_id}")
-        if decoded is not None and not isinstance(decoded, str):
-            raise HTTPException(status_code=422, detail="Invalid cursor")
+        decoded = _require_cursor_keys(
+            _decode_cursor(cursor, f"comments:{source_id}"), ("time", "id")
+        )
         rows, next_value = await repo.list_comments(source_id, limit, decoded)
         return {
             "items": [_comment(row) for row in rows],

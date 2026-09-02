@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -25,6 +25,17 @@ def _clean(value: str) -> str:
 
 def _key(*values: str | None) -> str:
     return hashlib.sha256("\n".join(value or "" for value in values).encode()).hexdigest()
+
+
+def _published(source_text: str | None, zone: ZoneInfo) -> datetime | None:
+    if not source_text:
+        return None
+    for pattern in ("%b %d, %Y %I:%M%p", "%b %d, %Y, %I:%M%p"):
+        try:
+            return datetime.strptime(source_text, pattern).replace(tzinfo=zone).astimezone(UTC)
+        except ValueError:
+            continue
+    return None
 
 
 def _comment_id(node: Node) -> tuple[str, str] | None:
@@ -64,6 +75,8 @@ def parse_news_detail_v2(
             handle = article.css_first(".x-twitter-post-preview__username")
             body_link = article.css_first("a.x-twitter-post-preview__body")
             source_url = body_link.attributes.get("href") if body_link else None
+            time_node = article.css_first(".x-twitter-post-preview__datetime")
+            source_time = _clean(time_node.text(strip=True)) if time_node else None
             segment = SegmentObservation(
                 stable_key=_key("social", source_url, text),
                 position=position,
@@ -71,6 +84,8 @@ def parse_news_detail_v2(
                 text_en=text,
                 author_name=_clean(author.text(strip=True)) if author else None,
                 author_handle=_clean(handle.text(strip=True)) if handle else None,
+                published_at=_published(source_time, source_timezone),
+                published_at_source_text=source_time,
                 source_url=source_url,
             )
         else:
@@ -123,6 +138,7 @@ def parse_news_detail_v2(
             continue
         author = node.css_first(".news-comment__header-username")
         source_time = node.css_first(".news-comment__header-date")
+        source_time_text = _clean(source_time.text(strip=True)) if source_time else None
         comments.append(
             CommentObservation(
                 comment_id=identity[0],
@@ -132,9 +148,8 @@ def parse_news_detail_v2(
                 text_en=_clean(message.text(separator=" ", strip=True)),
                 permalink=identity[1],
                 observed_at=observed_at,
-                published_at_source_text=(
-                    _clean(source_time.text(strip=True)) if source_time else None
-                ),
+                published_at=_published(source_time_text, source_timezone),
+                published_at_source_text=source_time_text,
             )
         )
     return DetailObservation(

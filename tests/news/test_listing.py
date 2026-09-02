@@ -35,11 +35,14 @@ def test_all_sections_are_typed_and_duplicates_are_merged() -> None:
 def test_listing_parses_time_impact_hot_and_latest_comment() -> None:
     batch = parse_news_listing_v2(FIXTURE, NOW, ZoneInfo("Asia/Shanghai"))
     article = next(item for item in batch.articles if item.source_id == "100")
+    hot = next(item for item in batch.articles if item.source_id == "200")
 
     assert article.published_at == datetime(2026, 9, 2, 14, 42, tzinfo=UTC)
     assert article.published_at_source_text == "Sep 2, 2026, 10:42pm"
     assert article.breaking_impact == "high"
     assert article.comment_count == 16
+    assert hot.source_name == "Reuters"
+    assert hot.published_at == datetime(2026, 9, 2, 15, tzinfo=UTC)
     assert [(row.article_id, row.feed_type, row.rank) for row in batch.feeds] == [
         ("200", "hot", 0),
         ("100", "latest", 0),

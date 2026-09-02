@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import aiosqlite
@@ -62,6 +63,7 @@ INSERT OR IGNORE INTO runtime_state(key, value) VALUES ('schema_version', '1');
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.write_lock = asyncio.Lock()
         self.connection: aiosqlite.Connection | None = None
 
     async def open(self) -> None:

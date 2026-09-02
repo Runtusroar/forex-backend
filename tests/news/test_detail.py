@@ -13,6 +13,8 @@ def test_all_article_nodes_become_ordered_segments() -> None:
     assert [item.segment_type for item in detail.segments] == ["social", "social", "article"]
     assert [item.position for item in detail.segments] == [0, 1, 2]
     assert detail.segments[0].text_en == "First alert"
+    assert detail.segments[0].published_at == datetime(2026, 9, 2, 13, 27, tzinfo=UTC)
+    assert detail.segments[0].published_at_source_text == "Sep 2, 2026 9:27pm"
     assert detail.segments[2].is_excerpt is True
 
 

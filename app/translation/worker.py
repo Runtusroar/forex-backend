@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Protocol
 
 from app.domain import TranslationJob
@@ -88,6 +89,10 @@ class NewsTranslationWorker:
                 await self.repository.complete_localized_job(
                     job, translated, self.model
                 )
+            )
+        if completed:
+            await self.repository.set_runtime_state(
+                "news_last_translation_success", datetime.now(UTC).isoformat()
             )
         return TranslationRunResult(completed, failed)
 

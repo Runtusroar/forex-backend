@@ -72,7 +72,9 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             await database.initialize()
             live_repository = Repository(database)
             app.state.repository = live_repository
-            news_repository = NewsRepository(live_repository.db)
+            news_repository = NewsRepository(
+                live_repository.db, live_repository.write_lock
+            )
             app.state.news_repository = news_repository
             browser = BrowserSession(configured.cdp_url)
             calendar_collector = Collector(browser, live_repository)
@@ -134,7 +136,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     app = FastAPI(title="Forex Factory MVP", version="1.0.0", lifespan=lifespan)
     if repository is not None:
         app.state.repository = repository
-        app.state.news_repository = NewsRepository(repository.db)
+        app.state.news_repository = NewsRepository(repository.db, repository.write_lock)
 
     def repo(request: Request) -> Repository:
         return request.app.state.repository

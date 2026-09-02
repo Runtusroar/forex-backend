@@ -38,22 +38,32 @@ class NewsCollector:
     async def run_listing_cycle(self, now: datetime | None = None) -> ListingApplyResult:
         observed_at = now or datetime.now(UTC)
         async with self.listing_lock:
-            html = await self.browser.news_html()
+            html: str | None = None
             try:
+                html = await self.browser.news_html()
                 batch = parse_news_listing_v2(html, observed_at, self.source_timezone)
+                result = await self.repository.apply_listing(batch)
             except Exception as error:
-                if self.snapshot_store:
+                if html is not None and self.snapshot_store:
                     with suppress(Exception):
                         await self.snapshot_store.capture(
                             "listing", "news", html, observed_at, error
                         )
+                with suppress(Exception):
+                    await self.repository.set_runtime_state(
+                        "news_last_listing_error", type(error).__name__
+                    )
                 raise
-            result = await self.repository.apply_listing(batch)
             if self.snapshot_store:
                 with suppress(Exception):
                     await self.snapshot_store.capture(
                         "listing", "news", html, observed_at
                     )
+            with suppress(Exception):
+                await self.repository.set_runtime_state(
+                    "news_last_listing_success", observed_at.isoformat()
+                )
+                await self.repository.set_runtime_state("news_last_listing_error", "")
             return result
 
     async def run_detail_cycle(self, now: datetime | None = None) -> int:
@@ -69,7 +79,9 @@ class NewsCollector:
                 html, job.article_id, observed_at, self.source_timezone
             )
             await self.repository.replace_detail(job.article_id, detail)
-            await self.repository.complete_detail_job(job.article_id)
+            await self.repository.complete_detail_job(
+                job.article_id, job.desired_source_hash
+            )
         except Exception as error:
             if html is not None and self.snapshot_store:
                 with suppress(Exception):
@@ -77,14 +89,27 @@ class NewsCollector:
                         "detail", job.article_id, html, observed_at, error
                     )
             await self.repository.fail_detail_job(
-                job.article_id, error, observed_at, self.detail_max_attempts
+                job.article_id,
+                error,
+                observed_at,
+                self.detail_max_attempts,
+                job.desired_source_hash,
             )
+            with suppress(Exception):
+                await self.repository.set_runtime_state(
+                    "news_last_detail_error", type(error).__name__
+                )
             return 0
         if self.snapshot_store:
             with suppress(Exception):
                 await self.snapshot_store.capture(
                     "detail", job.article_id, html, observed_at
                 )
+        with suppress(Exception):
+            await self.repository.set_runtime_state(
+                "news_last_detail_success", observed_at.isoformat()
+            )
+            await self.repository.set_runtime_state("news_last_detail_error", "")
         return 1
 
     async def run_listing(self, stop: asyncio.Event, interval: int) -> None:

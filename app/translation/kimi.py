@@ -84,6 +84,10 @@ class KimiTranslator:
             content = response.json()["choices"][0]["message"]["content"]
             decoded: dict[str, Any] = json.loads(content)
             translations = decoded["translations"]
+            if not isinstance(translations, list) or not all(
+                isinstance(item, dict) for item in translations
+            ):
+                raise TypeError
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
             raise TranslationProtocolError("invalid Kimi translation response") from error
         finally:
@@ -174,6 +178,10 @@ class KimiTranslator:
             content = response.json()["choices"][0]["message"]["content"]
             decoded: dict[str, Any] = json.loads(content)
             translations = decoded["translations"]
+            if not isinstance(translations, list) or not all(
+                isinstance(item, dict) for item in translations
+            ):
+                raise TypeError
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
             raise TranslationProtocolError("invalid Kimi translation response") from error
         finally:

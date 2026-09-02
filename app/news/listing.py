@@ -45,7 +45,7 @@ def _source_id(url: str) -> str:
 
 
 def _published(node: Node, zone: ZoneInfo) -> tuple[datetime | None, str | None]:
-    time = node.css_first("span.nowrap[title]")
+    time = node.css_first("span.nowrap[title], span[title]")
     source_text = time.attributes.get("title", "").strip() if time else ""
     if not source_text:
         return None, None
@@ -138,12 +138,27 @@ def parse_news_listing_v2(
         observed_sections.add("hot")
         href = link.attributes.get("href", "")
         article_id = _source_id(href)
+        published_at, source_text = _published(node, source_timezone)
+        source_link = node.css_first(".hot-story__details a[href*='/hit']")
+        source_name = (
+            source_link.text(strip=True).removeprefix("From ").strip()
+            if source_link
+            else None
+        )
         article = ArticleObservation(
             source_id=article_id,
             ff_url=urljoin(SOURCE_ROOT, href),
             title_en=link.text(strip=True),
             observed_at=observed_at,
+            source_name=source_name or None,
+            source_url=urljoin(SOURCE_ROOT, source_link.attributes.get("href", ""))
+            if source_link
+            else None,
+            published_at=published_at,
+            published_at_source_text=source_text,
             source_timezone=source_timezone.key,
+            breaking_impact=_impact(node),
+            comment_count=_comment_count(node),
         )
         articles[article_id] = article
         feeds.append(FeedObservation(article_id, "hot", rank, observed_at))
