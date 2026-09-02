@@ -46,7 +46,8 @@ def _source_id(url: str) -> str:
 
 def _published(node: Node, zone: ZoneInfo) -> tuple[datetime | None, str | None]:
     time = node.css_first("span.nowrap[title], span[title]")
-    source_text = time.attributes.get("title", "").strip() if time else ""
+    raw_source_text = time.attributes.get("title") if time else None
+    source_text = raw_source_text.strip() if raw_source_text else ""
     if not source_text:
         return None, None
     for pattern in ("%b %d, %Y, %I:%M%p", "%b %d, %Y %I:%M%p"):

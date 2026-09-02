@@ -78,3 +78,21 @@ def test_latest_comment_can_reference_an_article_outside_story_panels() -> None:
     batch = parse_news_listing_v2(html, NOW, ZoneInfo("Asia/Shanghai"))
 
     assert {article.source_id for article in batch.articles} == {"1", "2"}
+
+
+def test_empty_title_attribute_does_not_break_live_listing_parse() -> None:
+    html = """
+    <div class="hot-stories"><div class="hot-story">
+      <a class="hot-story__title" href="/news/2-two">Two</a>
+      <span title>relative time</span>
+    </div></div>
+    <div class="news-block"><h2>News / Latest Stories</h2>
+      <div class="news-block__item"><div class="news-block__title">
+        <a href="/news/1-one">One</a></div></div>
+    </div>
+    """
+
+    batch = parse_news_listing_v2(html, NOW, ZoneInfo("Asia/Shanghai"))
+
+    hot = next(article for article in batch.articles if article.source_id == "2")
+    assert hot.published_at is None

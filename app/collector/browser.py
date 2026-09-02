@@ -44,15 +44,19 @@ class BrowserSession:
         self.browser: Browser | None = None
         self.calendar_page: Page | None = None
         self.news_page: Page | None = None
+        self._connect_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         if self.browser and self.browser.is_connected():
             return
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.connect_over_cdp(self.cdp_url)
-        context = self.browser.contexts[0]
-        self.calendar_page = await context.new_page()
-        self.news_page = await context.new_page()
+        async with self._connect_lock:
+            if self.browser and self.browser.is_connected():
+                return
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.chromium.connect_over_cdp(self.cdp_url)
+            context = self.browser.contexts[0]
+            self.calendar_page = await context.new_page()
+            self.news_page = await context.new_page()
 
     async def calendar_html(self) -> str:
         await self.connect()
