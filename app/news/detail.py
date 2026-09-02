@@ -110,7 +110,27 @@ def parse_news_detail_v2(
                 is_excerpt=full_story is not None,
             )
         segments.append(segment)
-        for media_position, attachment in enumerate(article.css("a.attachthumb")):
+        media_position = 0
+        for image in article.css("img.attach"):
+            parent = image.parent
+            if parent and "attachthumb" in parent.attributes.get("class", "").split():
+                continue
+            source = image.attributes.get("src", "")
+            if not source:
+                continue
+            caption = _clean(image.attributes.get("alt", "")) or None
+            media.append(
+                MediaObservation(
+                    stable_key=_key(segment.stable_key, source),
+                    position=media_position,
+                    media_type="image",
+                    original_url=urljoin(SOURCE_ROOT, source),
+                    segment_key=segment.stable_key,
+                    caption=caption,
+                )
+            )
+            media_position += 1
+        for attachment in article.css("a.attachthumb"):
             href = attachment.attributes.get("href", "")
             if not href:
                 continue
@@ -127,6 +147,7 @@ def parse_news_detail_v2(
                     caption=_clean(caption.text(strip=True)) if caption else None,
                 )
             )
+            media_position += 1
     if not segments:
         raise SourcePageError("news detail contains no story segments")
 

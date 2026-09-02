@@ -21,6 +21,10 @@ def test_all_article_nodes_become_ordered_segments() -> None:
 def test_content_media_and_nested_comments_are_preserved() -> None:
     detail = parse_news_detail_v2(HTML, "100", NOW, ZoneInfo("Asia/Shanghai"))
     assert [(item.media_type, item.original_url) for item in detail.media] == [
+        (
+            "image",
+            "https://assets.faireconomy.media/nfs/npd/2026/09/03/chart.png",
+        ),
         ("chart", "https://www.forexfactory.com/attachment/image/55")
     ]
     assert [item.comment_id for item in detail.comments] == ["700", "701"]
