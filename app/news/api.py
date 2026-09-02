@@ -91,6 +91,7 @@ def _article(item: dict[str, Any]) -> dict[str, Any]:
         "comment_count": item.get("comment_count", 0),
         "detail_state": item.get("detail_state"),
         "is_excerpt": bool(item.get("is_excerpt")),
+        "thumbnail_url": item.get("listing_thumbnail_url"),
         "categories": item.get("categories", []),
     }
 

@@ -48,6 +48,7 @@ async def api(tmp_path: Path):
         published_at=NOW,
         breaking_impact="high",
         comment_count=1,
+        listing_thumbnail_url="https://assets.example/yen.png",
     )
     await news.apply_listing(
         NewsListingBatch(
@@ -128,6 +129,7 @@ async def test_sections_and_latest_are_stable_and_bilingual(api: httpx.AsyncClie
         "en": "Yen rises", "zh_hans": "日元上涨"
     }
     assert listing.json()["items"][0]["breaking_impact"] == "high"
+    assert listing.json()["items"][0]["thumbnail_url"] == "https://assets.example/yen.png"
 
 
 async def test_detail_comments_and_media_contract(api: httpx.AsyncClient) -> None:
