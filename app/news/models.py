@@ -56,6 +56,7 @@ class CommentObservation:
     published_at: datetime | None = None
     published_at_source_text: str | None = None
     reaction_count: int | None = None
+    feed_rank: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
