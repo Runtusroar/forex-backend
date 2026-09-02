@@ -1264,8 +1264,11 @@ class NewsRepository:
         )
         await self.db.commit()
 
-    async def ready_detail_job_count(self) -> int:
+    async def ready_detail_job_count(self, now: datetime | None = None) -> int:
+        ready = _iso(now or datetime.now(UTC))
         rows = await self.db.execute_fetchall(
-            "SELECT count(*) AS count FROM news_detail_jobs WHERE state='pending'"
+            """SELECT count(*) AS count FROM news_detail_jobs
+               WHERE state='pending' AND next_attempt_at<=?""",
+            (ready,),
         )
         return int(rows[0]["count"])

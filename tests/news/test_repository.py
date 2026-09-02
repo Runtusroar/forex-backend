@@ -227,3 +227,14 @@ async def test_comment_count_change_requeues_completed_detail(
 
     assert result.changed_article_ids == ("1416149",)
     assert await news_repository.detail_job_state("1416149") == "pending"
+
+
+async def test_delayed_detail_retry_does_not_block_low_priority_backfill(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch())
+    job = (await news_repository.claim_detail_jobs(1, NOW))[0]
+    await news_repository.fail_detail_job(job.article_id, ValueError("bad detail"), NOW)
+
+    assert await news_repository.ready_detail_job_count(NOW) == 0
+    assert await news_repository.ready_detail_job_count(NOW + timedelta(minutes=1)) == 1
