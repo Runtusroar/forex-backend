@@ -270,7 +270,11 @@ class NewsRepository:
         await self.db.commit()
 
     async def fail_detail_job(
-        self, article_id: str, error: Exception, now: datetime | None = None
+        self,
+        article_id: str,
+        error: Exception,
+        now: datetime | None = None,
+        max_attempts: int = 8,
     ) -> None:
         failed_at = now or datetime.now(UTC)
         rows = await self.db.execute_fetchall(
@@ -278,10 +282,12 @@ class NewsRepository:
         )
         attempts = int(rows[0]["attempts"]) + 1
         delay_minutes = (1, 5, 30, 120, 360)[min(attempts - 1, 4)]
+        state = "failed" if attempts >= max_attempts else "pending"
         await self.db.execute(
-            """UPDATE news_detail_jobs SET state='pending',attempts=?,next_attempt_at=?,
+            """UPDATE news_detail_jobs SET state=?,attempts=?,next_attempt_at=?,
                claimed_at=NULL,last_error=? WHERE article_id=?""",
             (
+                state,
                 attempts,
                 _iso(failed_at + timedelta(minutes=delay_minutes)),
                 type(error).__name__,
@@ -289,6 +295,55 @@ class NewsRepository:
             ),
         )
         await self.db.commit()
+
+    async def detail_job_state(self, article_id: str) -> str | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT state FROM news_detail_jobs WHERE article_id=?", (article_id,)
+        )
+        return str(rows[0]["state"]) if rows else None
+
+    async def has_snapshot(
+        self, page_type: str, page_key: str, content_hash: str, parse_status: str
+    ) -> bool:
+        rows = await self.db.execute_fetchall(
+            """SELECT 1 FROM source_snapshots
+               WHERE page_type=? AND page_key=? AND content_hash=? AND parse_status=?""",
+            (page_type, page_key, content_hash, parse_status),
+        )
+        return bool(rows)
+
+    async def record_snapshot(
+        self,
+        *,
+        page_type: str,
+        page_key: str,
+        content_hash: str,
+        compressed_path: str,
+        captured_at: datetime,
+        parse_status: str,
+        error_type: str | None,
+    ) -> None:
+        await self.db.execute(
+            """INSERT OR IGNORE INTO source_snapshots
+               (page_type,page_key,content_hash,compressed_path,captured_at,
+                parse_status,error_type) VALUES (?,?,?,?,?,?,?)""",
+            (
+                page_type,
+                page_key,
+                content_hash,
+                compressed_path,
+                _iso(captured_at),
+                parse_status,
+                error_type,
+            ),
+        )
+        await self.db.commit()
+
+    async def snapshot_count(self) -> int:
+        rows = await self.db.execute_fetchall(
+            "SELECT count(*) AS count FROM source_snapshots"
+        )
+        return int(rows[0]["count"])
 
     async def replace_detail(self, article_id: str, detail: DetailObservation) -> None:
         observed = _iso(detail.observed_at)

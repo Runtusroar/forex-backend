@@ -1,0 +1,106 @@
+from __future__ import annotations
+
+import asyncio
+from contextlib import suppress
+from datetime import UTC, datetime
+from typing import Protocol
+from zoneinfo import ZoneInfo
+
+from app.news.detail import parse_news_detail_v2
+from app.news.listing import parse_news_listing_v2
+from app.news.models import ListingApplyResult
+from app.news.repository import NewsRepository
+from app.news.snapshots import SnapshotStore
+
+
+class NewsBrowserSource(Protocol):
+    async def news_html(self) -> str: ...
+
+    async def news_detail_html(self, url: str) -> str: ...
+
+
+class NewsCollector:
+    def __init__(
+        self,
+        browser: NewsBrowserSource,
+        repository: NewsRepository,
+        source_timezone: ZoneInfo,
+        detail_max_attempts: int = 8,
+        snapshot_store: SnapshotStore | None = None,
+    ) -> None:
+        self.browser = browser
+        self.repository = repository
+        self.source_timezone = source_timezone
+        self.detail_max_attempts = detail_max_attempts
+        self.snapshot_store = snapshot_store
+        self.listing_lock = asyncio.Lock()
+
+    async def run_listing_cycle(self, now: datetime | None = None) -> ListingApplyResult:
+        observed_at = now or datetime.now(UTC)
+        async with self.listing_lock:
+            html = await self.browser.news_html()
+            try:
+                batch = parse_news_listing_v2(html, observed_at, self.source_timezone)
+            except Exception as error:
+                if self.snapshot_store:
+                    with suppress(Exception):
+                        await self.snapshot_store.capture(
+                            "listing", "news", html, observed_at, error
+                        )
+                raise
+            result = await self.repository.apply_listing(batch)
+            if self.snapshot_store:
+                with suppress(Exception):
+                    await self.snapshot_store.capture(
+                        "listing", "news", html, observed_at
+                    )
+            return result
+
+    async def run_detail_cycle(self, now: datetime | None = None) -> int:
+        observed_at = now or datetime.now(UTC)
+        jobs = await self.repository.claim_detail_jobs(1, observed_at)
+        if not jobs:
+            return 0
+        job = jobs[0]
+        html: str | None = None
+        try:
+            html = await self.browser.news_detail_html(job.ff_url)
+            detail = parse_news_detail_v2(
+                html, job.article_id, observed_at, self.source_timezone
+            )
+            await self.repository.replace_detail(job.article_id, detail)
+            await self.repository.complete_detail_job(job.article_id)
+        except Exception as error:
+            if html is not None and self.snapshot_store:
+                with suppress(Exception):
+                    await self.snapshot_store.capture(
+                        "detail", job.article_id, html, observed_at, error
+                    )
+            await self.repository.fail_detail_job(
+                job.article_id, error, observed_at, self.detail_max_attempts
+            )
+            return 0
+        if self.snapshot_store:
+            with suppress(Exception):
+                await self.snapshot_store.capture(
+                    "detail", job.article_id, html, observed_at
+                )
+        return 1
+
+    async def run_listing(self, stop: asyncio.Event, interval: int) -> None:
+        while not stop.is_set():
+            with suppress(Exception):
+                await self.run_listing_cycle()
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+
+    async def run_details(self, stop: asyncio.Event, interval: int) -> None:
+        while not stop.is_set():
+            with suppress(Exception):
+                await self.run_detail_cycle()
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
