@@ -2,6 +2,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from app.migrations import migrate
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS calendar_events (
   source_id TEXT PRIMARY KEY,
@@ -73,6 +75,7 @@ class Database:
     async def initialize(self) -> None:
         assert self.connection is not None
         await self.connection.executescript(SCHEMA)
+        await migrate(self.connection)
         await self.connection.commit()
 
     async def close(self) -> None:
