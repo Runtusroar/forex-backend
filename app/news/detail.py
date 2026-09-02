@@ -118,7 +118,7 @@ def parse_news_detail_v2(
             source = image.attributes.get("src", "")
             if not source:
                 continue
-            caption = _clean(image.attributes.get("alt", "")) or None
+            caption = _clean(image.attributes.get("alt") or "") or None
             media.append(
                 MediaObservation(
                     stable_key=_key(segment.stable_key, source),
