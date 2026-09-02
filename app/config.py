@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     news_detail_interval_seconds: int = Field(default=2, gt=0)
     news_detail_max_attempts: int = Field(default=8, gt=0)
     news_snapshot_dir: Path = Path("data/snapshots")
+    news_snapshot_retention_days: int = Field(default=30, gt=0)
     news_media_dir: Path = Path("data/media")
     news_media_max_bytes: int = Field(default=10_485_760, gt=0)
     news_backfill_days: int = Field(default=30, gt=0)

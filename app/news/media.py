@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import tempfile
@@ -64,6 +65,15 @@ class MediaWorker:
             else:
                 completed += 1
         return completed
+
+    async def run(self, stop: asyncio.Event, interval: int = 5) -> None:
+        while not stop.is_set():
+            with suppress(Exception):
+                await self.run_once()
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
 
     async def _download(self, job: MediaJob) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)

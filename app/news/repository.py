@@ -379,6 +379,22 @@ class NewsRepository:
         )
         return int(rows[0]["count"])
 
+    async def expired_snapshots(self, cutoff: datetime) -> list[tuple[int, str]]:
+        rows = await self.db.execute_fetchall(
+            "SELECT id,compressed_path FROM source_snapshots WHERE captured_at<?",
+            (_iso(cutoff),),
+        )
+        return [(int(row["id"]), str(row["compressed_path"])) for row in rows]
+
+    async def delete_snapshot_records(self, snapshot_ids: list[int]) -> None:
+        if not snapshot_ids:
+            return
+        placeholders = ",".join("?" for _ in snapshot_ids)
+        await self.db.execute(
+            f"DELETE FROM source_snapshots WHERE id IN ({placeholders})", snapshot_ids
+        )
+        await self.db.commit()
+
     async def replace_detail(self, article_id: str, detail: DetailObservation) -> None:
         observed = _iso(detail.observed_at)
         current_keys = {segment.stable_key for segment in detail.segments}
@@ -1145,3 +1161,23 @@ class NewsRepository:
             item["title_zh"] = translations.get((article_id, "title"))
             item["teaser_zh"] = translations.get((article_id, "teaser"))
         return items
+
+    async def get_runtime_state(self, key: str) -> str | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT value FROM runtime_state WHERE key=?", (key,)
+        )
+        return str(rows[0]["value"]) if rows else None
+
+    async def set_runtime_state(self, key: str, value: str) -> None:
+        await self.db.execute(
+            """INSERT INTO runtime_state(key,value) VALUES (?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, value),
+        )
+        await self.db.commit()
+
+    async def ready_detail_job_count(self) -> int:
+        rows = await self.db.execute_fetchall(
+            "SELECT count(*) AS count FROM news_detail_jobs WHERE state='pending'"
+        )
+        return int(rows[0]["count"])

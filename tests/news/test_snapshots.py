@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from gzip import decompress
 from pathlib import Path
 
@@ -50,4 +50,20 @@ async def test_failed_snapshot_is_recorded_separately_and_key_is_sanitized(
     assert path is not None
     assert ".." not in path.name
     assert "secret" not in path.name
+    assert await snapshot_store.repository.snapshot_count() == 1
+
+
+async def test_cleanup_removes_only_expired_snapshot_files_and_metadata(
+    snapshot_store: SnapshotStore,
+) -> None:
+    expired = await snapshot_store.capture("listing", "old", "old", NOW)
+    recent = await snapshot_store.capture(
+        "listing", "recent", "recent", NOW + timedelta(days=20)
+    )
+
+    removed = await snapshot_store.cleanup(30, NOW + timedelta(days=31))
+
+    assert removed == 1
+    assert expired is not None and not expired.exists()
+    assert recent is not None and recent.exists()
     assert await snapshot_store.repository.snapshot_count() == 1

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import gzip
 import hashlib
 import os
 import re
 import tempfile
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from app.news.repository import NewsRepository
@@ -19,6 +20,12 @@ def _normalized_hash(html: str) -> str:
 
 def _safe(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-")[:80] or "page"
+
+
+def _safe_snapshot_path(directory: Path, stored_path: str) -> str | None:
+    root = os.path.realpath(directory)
+    path = os.path.realpath(stored_path)
+    return path if os.path.commonpath((root, path)) == root else None
 
 
 class SnapshotStore:
@@ -75,3 +82,32 @@ class SnapshotStore:
                     os.unlink(path)
             raise
         return destination
+
+    async def cleanup(
+        self, retention_days: int, now: datetime | None = None
+    ) -> int:
+        current = now or datetime.now(UTC)
+        expired = await self.repository.expired_snapshots(
+            current - timedelta(days=retention_days)
+        )
+        removed_ids: list[int] = []
+        for snapshot_id, stored_path in expired:
+            path = _safe_snapshot_path(self.directory, stored_path)
+            if path is None:
+                continue
+            with suppress(FileNotFoundError):
+                os.unlink(path)
+            removed_ids.append(snapshot_id)
+        await self.repository.delete_snapshot_records(removed_ids)
+        return len(removed_ids)
+
+    async def run_cleanup(
+        self, stop: asyncio.Event, retention_days: int = 30, interval: int = 3600
+    ) -> None:
+        while not stop.is_set():
+            with suppress(Exception):
+                await self.cleanup(retention_days)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue

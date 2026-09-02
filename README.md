@@ -8,7 +8,8 @@ Chinese asynchronously with Kimi. The API is consumed by the separate iPhone app
 
 The recommended deployment requires only Docker Engine with Docker Compose. Compose runs two
 containers from one image: Chromium under Xvfb and the FastAPI service. Their Chrome profile and
-SQLite database live in separate named volumes.
+application data live in separate named volumes. The application-data volume contains SQLite,
+validated news media, and compressed source snapshots.
 
 ```bash
 cp .env.example .env
@@ -40,7 +41,7 @@ Useful operations:
 # Follow logs
 docker compose logs -f
 
-# Upgrade after pulling repository changes
+# Back up first, then upgrade after pulling repository changes
 git pull
 docker compose up -d --build
 
@@ -54,17 +55,36 @@ Create a consistent SQLite backup and copy it to the current directory:
 docker compose exec -T api python -c 'import sqlite3; source=sqlite3.connect("/app/data/forex_factory.sqlite3"); backup=sqlite3.connect("/app/data/backup.sqlite3"); source.backup(backup); backup.close(); source.close()'
 docker compose cp api:/app/data/backup.sqlite3 ./forex_factory-backup.sqlite3
 docker compose exec -T api rm /app/data/backup.sqlite3
+docker compose cp api:/app/data/media ./forex-media-backup
 ```
 
-Do not run `docker compose down -v` unless the stored database and Chrome profile should be
-permanently deleted.
+Before every News V2 deployment, keep both the SQLite backup and media directory until the new
+container passes `/health` and the V2 smoke check. To roll back a migration, stop the API, restore
+the pre-migration database, restore its matching media directory, and start it again:
+
+```bash
+docker compose stop api
+docker compose cp ./forex_factory-backup.sqlite3 api:/app/data/forex_factory.sqlite3
+docker compose cp ./forex-media-backup/. api:/app/data/media
+docker compose start api
+```
+
+`docker compose down` retains all data. Do not run `docker compose down -v`: it permanently
+destroys the SQLite database, cached media, source snapshots, and Chrome profile.
 
 ## Collection behavior
 
 Playwright connects to the persistent Chromium process instead of launching a disposable browser.
-The calendar is committed before news detail enrichment begins. News listing entries are retained
-even when an individual detail page cannot be loaded. Existing story bodies are reused unless the
-listing title or summary changes.
+Calendar collection and News V2 listing collection are independent. News V2 preserves Latest, Hot,
+Fundamental, Technical, Industry, Entertainment, Educational, and Latest Comments. Canonical
+articles are committed before detail, media, or translation work, so an individual downstream
+failure cannot remove the English listing data.
+
+Detail pages are stored as ordered article/social/update segments with genuine content attachments
+and visible comment threads. Media is downloaded with type, signature, and size validation, then
+deduplicated by SHA-256. Changed/error HTML snapshots are retained for 30 days. A low-priority,
+checkpointed browser backfill follows each section's visible `More` control up to 30 days and yields
+whenever live detail work is waiting.
 
 Translation runs independently after English records are stored. A Kimi outage leaves the English
 data and collection loop intact; Chinese fields remain nullable until a later retry succeeds.
@@ -83,8 +103,19 @@ Except for `/health`, requests require the `X-API-Key` header.
 - `GET /api/v1/news/{source_id}`
 - `GET /api/v1/status`
 
+News V2 endpoints used by the new iPhone client:
+
+- `GET /api/v2/news/sections`
+- `GET /api/v2/news?section=latest&impact=high&limit=50`
+- `GET /api/v2/news/{source_id}`
+- `GET /api/v2/news/comments/latest`
+- `GET /api/v2/news/{source_id}/comments`
+- `GET /api/v2/news/media/{media_id}`
+- `GET /api/v2/status`
+
 Chinese fields can be `null` while translation is pending or unavailable. Timestamps are UTC
-ISO-8601 values.
+ISO-8601 values. V1 News remains backed by V2 compatibility serialization until the installed
+iPhone client has been migrated and verified; no V1 removal is part of this release.
 
 ## Local development
 

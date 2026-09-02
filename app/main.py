@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 
@@ -11,12 +12,16 @@ from app.config import Settings, get_settings
 from app.db import Database
 from app.domain import CalendarRecord, NewsRecord
 from app.news.api import create_news_router
+from app.news.backfill import NewsBackfill
+from app.news.collector import NewsCollector
 from app.news.compat import v1_news_detail, v1_news_list
+from app.news.media import MediaWorker
 from app.news.repository import NewsRepository
+from app.news.snapshots import SnapshotStore
 from app.repository import Repository
 from app.runtime import BackgroundRuntime
 from app.translation import KimiTranslator
-from app.translation.worker import TranslationWorker
+from app.translation.worker import NewsTranslationWorker, TranslationWorker
 
 
 def _calendar_json(item: CalendarRecord) -> dict:
@@ -59,6 +64,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         database: Database | None = None
         browser: BrowserSession | None = None
+        media_worker: MediaWorker | None = None
         runtime: BackgroundRuntime | None = None
         if repository is None:
             database = Database(configured.database_path)
@@ -66,20 +72,60 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             await database.initialize()
             live_repository = Repository(database)
             app.state.repository = live_repository
-            app.state.news_repository = NewsRepository(live_repository.db)
+            news_repository = NewsRepository(live_repository.db)
+            app.state.news_repository = news_repository
             browser = BrowserSession(configured.cdp_url)
-            collector = Collector(browser, live_repository)
-            translator = TranslationWorker(live_repository, KimiTranslator(configured))
+            calendar_collector = Collector(browser, live_repository)
+            snapshot_store = SnapshotStore(configured.news_snapshot_dir, news_repository)
+            news_collector = NewsCollector(
+                browser,
+                news_repository,
+                ZoneInfo(configured.news_source_timezone),
+                configured.news_detail_max_attempts,
+                snapshot_store,
+            )
+            media_worker = MediaWorker(
+                news_repository,
+                configured.news_media_dir,
+                configured.news_media_max_bytes,
+            )
+            kimi = KimiTranslator(configured)
+            translator = TranslationWorker(live_repository, kimi)
+            news_translator = NewsTranslationWorker(
+                news_repository, kimi, configured.kimi_model
+            )
+            backfill = NewsBackfill(
+                browser,
+                news_repository,
+                ZoneInfo(configured.news_source_timezone),
+                configured.news_backfill_days,
+            )
             runtime = BackgroundRuntime(
                 [
-                    lambda stop: collector.run(stop, configured.collect_interval_seconds),
+                    lambda stop: calendar_collector.run_calendar(
+                        stop, configured.collect_interval_seconds
+                    ),
+                    lambda stop: news_collector.run_listing(
+                        stop, configured.collect_interval_seconds
+                    ),
+                    lambda stop: news_collector.run_details(
+                        stop, configured.news_detail_interval_seconds
+                    ),
+                    media_worker.run,
                     translator.run,
+                    news_translator.run,
+                    lambda stop: snapshot_store.run_cleanup(
+                        stop, configured.news_snapshot_retention_days
+                    ),
+                    backfill.run,
                 ]
             )
             await runtime.start()
         yield
         if runtime:
             await runtime.stop()
+        if media_worker:
+            await media_worker.close()
         if browser:
             await browser.close()
         if database:

@@ -42,6 +42,19 @@ def test_api_receives_configurable_collection_interval() -> None:
     assert "COLLECT_INTERVAL_SECONDS: ${COLLECT_INTERVAL_SECONDS:-30}" in compose
 
 
+def test_api_receives_all_news_worker_settings_under_persistent_data() -> None:
+    compose = Path("compose.yaml").read_text()
+
+    assert "NEWS_SOURCE_TIMEZONE: ${NEWS_SOURCE_TIMEZONE:-Asia/Shanghai}" in compose
+    assert "NEWS_DETAIL_INTERVAL_SECONDS: ${NEWS_DETAIL_INTERVAL_SECONDS:-2}" in compose
+    assert "NEWS_DETAIL_MAX_ATTEMPTS: ${NEWS_DETAIL_MAX_ATTEMPTS:-8}" in compose
+    assert "NEWS_SNAPSHOT_DIR: /app/data/snapshots" in compose
+    assert "NEWS_SNAPSHOT_RETENTION_DAYS: ${NEWS_SNAPSHOT_RETENTION_DAYS:-30}" in compose
+    assert "NEWS_MEDIA_DIR: /app/data/media" in compose
+    assert "NEWS_MEDIA_MAX_BYTES: ${NEWS_MEDIA_MAX_BYTES:-10485760}" in compose
+    assert "NEWS_BACKFILL_DAYS: ${NEWS_BACKFILL_DAYS:-30}" in compose
+
+
 def test_api_has_a_healthcheck() -> None:
     compose = Path("compose.yaml").read_text()
 

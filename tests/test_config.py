@@ -23,6 +23,7 @@ def test_settings_have_mvp_defaults(tmp_path: Path) -> None:
     assert settings.news_detail_interval_seconds == 2
     assert settings.news_detail_max_attempts == 8
     assert settings.news_snapshot_dir == Path("data/snapshots")
+    assert settings.news_snapshot_retention_days == 30
     assert settings.news_media_dir == Path("data/media")
     assert settings.news_media_max_bytes == 10_485_760
     assert settings.news_backfill_days == 30

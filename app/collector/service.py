@@ -29,6 +29,13 @@ class Collector:
         self.repository = repository
         self.lock = asyncio.Lock()
 
+    async def run_calendar_cycle(self, now: datetime | None = None) -> int:
+        async with self.lock:
+            observed_at = now or datetime.now(UTC)
+            calendar = parse_calendar(await self.browser.calendar_html(), observed_at)
+            await self.repository.upsert_calendar(calendar)
+            return len(calendar)
+
     async def run_cycle(self, now: datetime | None = None) -> CollectionResult:
         async with self.lock:
             observed_at = now or datetime.now(UTC)
@@ -74,6 +81,15 @@ class Collector:
         while not stop.is_set():
             with suppress(Exception):
                 await self.run_cycle()
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=interval)
+            except TimeoutError:
+                continue
+
+    async def run_calendar(self, stop: asyncio.Event, interval: int) -> None:
+        while not stop.is_set():
+            with suppress(Exception):
+                await self.run_calendar_cycle()
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except TimeoutError:
