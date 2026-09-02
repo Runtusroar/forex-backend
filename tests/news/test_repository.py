@@ -9,6 +9,7 @@ from app.news.models import (
     CategoryObservation,
     DetailObservation,
     FeedObservation,
+    MediaObservation,
     NewsListingBatch,
     SegmentObservation,
 )
@@ -140,3 +141,43 @@ async def test_complete_detail_reorders_without_duplicating_segments(
 
     assert await news_repository.current_segment_keys("1416149") == ("second", "first")
     assert await news_repository.segment_count("1416149") == 2
+
+
+async def test_detail_persists_media_and_comments(news_repository: NewsRepository) -> None:
+    from app.news.models import CommentObservation
+
+    await news_repository.apply_listing(batch())
+    segment = SegmentObservation("body", 0, "article", text_en="Body")
+    detail = DetailObservation(
+        "1416149",
+        NOW,
+        "detail-1",
+        segments=(segment,),
+        media=(
+            MediaObservation(
+                "chart-1",
+                0,
+                "chart",
+                "https://assets.example/chart.png",
+                segment_key="body",
+            ),
+        ),
+        comments=(
+            CommentObservation(
+                "comment-1",
+                "1416149",
+                "Alice",
+                "Useful",
+                "https://www.forexfactory.com/comment/1",
+                NOW,
+            ),
+        ),
+    )
+
+    await news_repository.replace_detail("1416149", detail)
+
+    jobs = await news_repository.claim_media_jobs(2, NOW)
+    assert [(job.article_id, job.original_url) for job in jobs] == [
+        ("1416149", "https://assets.example/chart.png")
+    ]
+    assert await news_repository.comment_count("1416149") == 1

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Literal
 
 BreakingImpact = Literal["high", "medium", "low"]
@@ -121,6 +122,23 @@ class DetailJob:
     priority: int
     attempts: int
     claimed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class MediaJob:
+    media_id: int
+    article_id: str
+    original_url: str
+    attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class CachedMedia:
+    media_id: int
+    path: Path
+    mime_type: str
+    byte_size: int
+    sha256: str
 
 
 @dataclass(frozen=True, slots=True)

@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import aiosqlite
 
 from app.news.models import (
     ArticleObservation,
     ArticleRecord,
+    CachedMedia,
+    CommentObservation,
     DetailJob,
     DetailObservation,
     FeedType,
     ListingApplyResult,
+    MediaJob,
     NewsListingBatch,
 )
 
@@ -67,6 +71,24 @@ class NewsRepository:
                          last_seen_at=excluded.last_seen_at""",
                     (category.article_id, category.category, observed, observed),
                 )
+
+            for comment in batch.comments:
+                await self._upsert_comment(comment)
+                if comment.feed_rank is not None:
+                    await self.db.execute(
+                        """INSERT INTO news_comment_feed
+                           (comment_id,rank,first_seen_at,last_seen_at,is_current)
+                           VALUES (?,?,?,?,1)
+                           ON CONFLICT(comment_id) DO UPDATE SET
+                             rank=excluded.rank,last_seen_at=excluded.last_seen_at,
+                             is_current=1""",
+                        (
+                            comment.comment_id,
+                            comment.feed_rank,
+                            _iso(comment.observed_at),
+                            _iso(comment.observed_at),
+                        ),
+                    )
 
             for feed_type in ("latest", "hot"):
                 if feed_type in batch.observed_sections:
@@ -405,6 +427,54 @@ class NewsRepository:
                     await self.db.execute(
                         "UPDATE news_segments SET is_current=0 WHERE article_id=?", (article_id,)
                     )
+            segment_rows = await self.db.execute_fetchall(
+                "SELECT id,stable_key FROM news_segments WHERE article_id=?",
+                (article_id,),
+            )
+            segment_ids = {str(row["stable_key"]): int(row["id"]) for row in segment_rows}
+            current_media_keys = {item.stable_key for item in detail.media}
+            for item in detail.media:
+                await self.db.execute(
+                    """INSERT INTO news_media
+                       (article_id,segment_id,stable_key,position,media_type,original_url,
+                        caption,download_state,next_attempt_at,is_current)
+                       VALUES (?,?,?,?,?,?,?,'pending',?,1)
+                       ON CONFLICT(article_id,stable_key) DO UPDATE SET
+                         segment_id=excluded.segment_id,position=excluded.position,
+                         media_type=excluded.media_type,original_url=excluded.original_url,
+                         caption=excluded.caption,is_current=1,
+                         download_state=CASE
+                           WHEN news_media.original_url=excluded.original_url
+                           THEN news_media.download_state ELSE 'pending' END,
+                         next_attempt_at=CASE
+                           WHEN news_media.original_url=excluded.original_url
+                           THEN news_media.next_attempt_at ELSE excluded.next_attempt_at END""",
+                    (
+                        article_id,
+                        segment_ids.get(item.segment_key or ""),
+                        item.stable_key,
+                        item.position,
+                        item.media_type,
+                        item.original_url,
+                        item.caption,
+                        observed,
+                    ),
+                )
+            if detail.is_complete:
+                if current_media_keys:
+                    placeholders = ",".join("?" for _ in current_media_keys)
+                    await self.db.execute(
+                        f"""UPDATE news_media SET is_current=0
+                            WHERE article_id=? AND stable_key NOT IN ({placeholders})""",
+                        (article_id, *sorted(current_media_keys)),
+                    )
+                else:
+                    await self.db.execute(
+                        "UPDATE news_media SET is_current=0 WHERE article_id=?",
+                        (article_id,),
+                    )
+            for comment in detail.comments:
+                await self._upsert_comment(comment)
             await self.db.execute(
                 """UPDATE news_articles SET detail_state=?,updated_at=? WHERE source_id=?""",
                 ("complete" if detail.is_complete else "partial", observed, article_id),
@@ -413,6 +483,150 @@ class NewsRepository:
         except Exception:
             await self.db.rollback()
             raise
+
+    async def _upsert_comment(self, comment: CommentObservation) -> None:
+        observed = _iso(comment.observed_at)
+        source_hash = hashlib.sha256(comment.text_en.encode()).hexdigest()
+        await self.db.execute(
+            """INSERT INTO news_comments
+               (comment_id,article_id,parent_comment_id,author_name,published_at,
+                published_at_source_text,text_en,permalink,reaction_count,source_hash,
+                first_seen_at,last_seen_at,updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(comment_id) DO UPDATE SET
+                 parent_comment_id=excluded.parent_comment_id,
+                 author_name=excluded.author_name,published_at=excluded.published_at,
+                 published_at_source_text=excluded.published_at_source_text,
+                 text_en=excluded.text_en,permalink=excluded.permalink,
+                 reaction_count=excluded.reaction_count,source_hash=excluded.source_hash,
+                 last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at""",
+            (
+                comment.comment_id,
+                comment.article_id,
+                comment.parent_comment_id,
+                comment.author_name,
+                _iso(comment.published_at),
+                comment.published_at_source_text,
+                comment.text_en,
+                comment.permalink,
+                comment.reaction_count,
+                source_hash,
+                observed,
+                observed,
+                observed,
+            ),
+        )
+
+    async def claim_media_jobs(
+        self, limit: int, now: datetime | None = None
+    ) -> list[MediaJob]:
+        claimed = now or datetime.now(UTC)
+        ready = _iso(claimed)
+        lease = _iso(claimed + timedelta(minutes=5))
+        await self.db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = await self.db.execute_fetchall(
+                """SELECT id,article_id,original_url,attempts FROM news_media
+                   WHERE is_current=1 AND download_state!='complete'
+                     AND (download_state='pending' OR next_attempt_at IS NULL
+                          OR next_attempt_at<=?)
+                   ORDER BY attempts,id LIMIT ?""",
+                (ready, limit),
+            )
+            if rows:
+                await self.db.executemany(
+                    """UPDATE news_media SET download_state='processing',next_attempt_at=?
+                       WHERE id=?""",
+                    [(lease, row["id"]) for row in rows],
+                )
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            raise
+        return [
+            MediaJob(
+                media_id=int(row["id"]),
+                article_id=str(row["article_id"]),
+                original_url=str(row["original_url"]),
+                attempts=int(row["attempts"]),
+            )
+            for row in rows
+        ]
+
+    async def complete_media_job(
+        self,
+        media_id: int,
+        local_path: str,
+        mime_type: str,
+        byte_size: int,
+        sha256: str,
+    ) -> None:
+        await self.db.execute(
+            """UPDATE news_media SET local_path=?,mime_type=?,byte_size=?,sha256=?,
+               download_state='complete',next_attempt_at=NULL,last_error=NULL WHERE id=?""",
+            (local_path, mime_type, byte_size, sha256, media_id),
+        )
+        await self.db.commit()
+
+    async def fail_media_job(
+        self, media_id: int, error: Exception, now: datetime | None = None
+    ) -> None:
+        failed = now or datetime.now(UTC)
+        rows = await self.db.execute_fetchall(
+            "SELECT attempts FROM news_media WHERE id=?", (media_id,)
+        )
+        attempts = int(rows[0]["attempts"]) + 1
+        delay = (1, 5, 30, 120, 360)[min(attempts - 1, 4)]
+        await self.db.execute(
+            """UPDATE news_media SET download_state='failed',attempts=?,
+               next_attempt_at=?,last_error=? WHERE id=?""",
+            (
+                attempts,
+                _iso(failed + timedelta(minutes=delay)),
+                type(error).__name__,
+                media_id,
+            ),
+        )
+        await self.db.commit()
+
+    async def completed_media_by_hash(self, sha256: str) -> CachedMedia | None:
+        rows = await self.db.execute_fetchall(
+            """SELECT id,local_path,mime_type,byte_size,sha256 FROM news_media
+               WHERE download_state='complete' AND sha256=? AND local_path IS NOT NULL
+               ORDER BY id LIMIT 1""",
+            (sha256,),
+        )
+        return self._cached_media(rows[0]) if rows else None
+
+    async def resolve_media_path(self, media_id: int) -> CachedMedia | None:
+        rows = await self.db.execute_fetchall(
+            """SELECT id,local_path,mime_type,byte_size,sha256 FROM news_media
+               WHERE id=? AND download_state='complete' AND is_current=1""",
+            (media_id,),
+        )
+        return self._cached_media(rows[0]) if rows else None
+
+    @staticmethod
+    def _cached_media(row) -> CachedMedia:
+        return CachedMedia(
+            media_id=int(row["id"]),
+            path=Path(str(row["local_path"])),
+            mime_type=str(row["mime_type"]),
+            byte_size=int(row["byte_size"]),
+            sha256=str(row["sha256"]),
+        )
+
+    async def media_state(self, media_id: int) -> str | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT download_state FROM news_media WHERE id=?", (media_id,)
+        )
+        return str(rows[0]["download_state"]) if rows else None
+
+    async def comment_count(self, article_id: str) -> int:
+        rows = await self.db.execute_fetchall(
+            "SELECT count(*) AS count FROM news_comments WHERE article_id=?", (article_id,)
+        )
+        return int(rows[0]["count"])
 
     async def current_segment_keys(self, article_id: str) -> tuple[str, ...]:
         rows = await self.db.execute_fetchall(
