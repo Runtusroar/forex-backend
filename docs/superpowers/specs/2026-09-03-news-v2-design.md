@@ -286,6 +286,12 @@ The existing translation-job mechanism is migrated to reference these V2 entitie
 
 Listing snapshots are retained for 30 days. Detail snapshots are written on first observation, meaningful source change, or parse failure and retained for 30 days. Snapshot cleanup never deletes normalized article, segment, comment, or media data.
 
+### 6.11 Persistent work queues and checkpoints
+
+`news_detail_jobs` stores one current detail job per article with priority, state, attempt count, next-attempt time, source-listing hash, and sanitized last error. A newer listing observation raises priority or replaces the desired source hash without creating duplicate work.
+
+Media work is represented by `news_media.download_state` and retry metadata. Translation work remains in the translation job tables. Backfill progress is checkpointed in `runtime_state` by section, continuation count, oldest observed publication time, and completion state. All three kinds of work survive process and container restarts.
+
 ## 7. Timing and Priorities
 
 - Main News listing: every 30 seconds.
