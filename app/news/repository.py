@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import aiosqlite
 
@@ -73,6 +74,10 @@ class NewsRepository:
                     (category.article_id, category.category, observed, observed),
                 )
 
+            if "latest_comments" in batch.observed_sections:
+                await self.db.execute(
+                    "UPDATE news_comment_feed SET is_current=0 WHERE is_current=1"
+                )
             for comment in batch.comments:
                 await self._upsert_comment(comment)
                 if comment.feed_rank is not None:
@@ -880,3 +885,263 @@ class NewsRepository:
             (article_id, feed_type),
         )
         return tuple(str(row["event_type"]) for row in rows)
+
+    async def section_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for feed_type in ("latest", "hot"):
+            rows = await self.db.execute_fetchall(
+                """SELECT count(*) AS count FROM news_feed_placements
+                   WHERE feed_type=? AND is_current=1""",
+                (feed_type,),
+            )
+            counts[feed_type] = int(rows[0]["count"])
+        for category in (
+            "fundamental",
+            "technical",
+            "industry",
+            "entertainment",
+            "educational",
+        ):
+            rows = await self.db.execute_fetchall(
+                "SELECT count(*) AS count FROM news_category_memberships WHERE category=?",
+                (category,),
+            )
+            counts[category] = int(rows[0]["count"])
+        rows = await self.db.execute_fetchall(
+            "SELECT count(*) AS count FROM news_comment_feed WHERE is_current=1"
+        )
+        counts["latest-comments"] = int(rows[0]["count"])
+        return counts
+
+    async def list_section(
+        self,
+        section: str,
+        impact: str | None,
+        limit: int,
+        cursor: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+        parameters: list[Any] = []
+        impact_sql = ""
+        if impact:
+            impact_sql = " AND a.breaking_impact=?"
+            parameters.append(impact)
+        if section in ("latest", "hot"):
+            cursor_sql = ""
+            if cursor:
+                cursor_sql = " AND (p.rank>? OR (p.rank=? AND a.source_id>?))"
+                parameters.extend((cursor["rank"], cursor["rank"], cursor["id"]))
+            rows = await self.db.execute_fetchall(
+                f"""SELECT a.*,p.rank AS sort_rank FROM news_articles a
+                    JOIN news_feed_placements p ON p.article_id=a.source_id
+                    WHERE p.feed_type=? AND p.is_current=1{impact_sql}{cursor_sql}
+                    ORDER BY p.rank,a.source_id LIMIT ?""",
+                (section, *parameters, limit + 1),
+            )
+        else:
+            sort_value = "COALESCE(a.published_at,a.first_seen_at)"
+            cursor_sql = ""
+            if cursor:
+                cursor_sql = (
+                    f" AND ({sort_value}<? OR ({sort_value}=? AND a.source_id<?))"
+                )
+                parameters.extend((cursor["time"], cursor["time"], cursor["id"]))
+            rows = await self.db.execute_fetchall(
+                f"""SELECT a.*,{sort_value} AS sort_time FROM news_articles a
+                    JOIN news_category_memberships c ON c.article_id=a.source_id
+                    WHERE c.category=?{impact_sql}{cursor_sql}
+                    ORDER BY sort_time DESC,a.source_id DESC LIMIT ?""",
+                (section, *parameters, limit + 1),
+            )
+        has_more = len(rows) > limit
+        selected = rows[:limit]
+        items = [dict(row) for row in selected]
+        translations = await self._current_translations("article", items)
+        categories = await self._categories_for(
+            [str(item["source_id"]) for item in items]
+        )
+        for item in items:
+            item["title_zh"] = translations.get((item["source_id"], "title"))
+            item["teaser_zh"] = translations.get((item["source_id"], "teaser"))
+            item["categories"] = categories.get(str(item["source_id"]), [])
+        next_cursor: dict[str, Any] | None = None
+        if has_more and items:
+            last = items[-1]
+            next_cursor = (
+                {"rank": last["sort_rank"], "id": last["source_id"]}
+                if section in ("latest", "hot")
+                else {"time": last["sort_time"], "id": last["source_id"]}
+            )
+        return items, next_cursor
+
+    async def _article_categories(self, article_id: str) -> list[str]:
+        rows = await self.db.execute_fetchall(
+            """SELECT category FROM news_category_memberships
+               WHERE article_id=? ORDER BY category""",
+            (article_id,),
+        )
+        return [str(row["category"]) for row in rows]
+
+    async def _categories_for(self, article_ids: list[str]) -> dict[str, list[str]]:
+        if not article_ids:
+            return {}
+        placeholders = ",".join("?" for _ in article_ids)
+        rows = await self.db.execute_fetchall(
+            f"""SELECT article_id,category FROM news_category_memberships
+                WHERE article_id IN ({placeholders}) ORDER BY article_id,category""",
+            article_ids,
+        )
+        result: dict[str, list[str]] = {article_id: [] for article_id in article_ids}
+        for row in rows:
+            result[str(row["article_id"])].append(str(row["category"]))
+        return result
+
+    async def _current_translations(
+        self, entity_type: str, entities: list[dict[str, Any]]
+    ) -> dict[tuple[str, str], str]:
+        if not entities:
+            return {}
+        identity_key = {
+            "article": "source_id",
+            "segment": "id",
+            "comment": "comment_id",
+        }[entity_type]
+        identities = [str(item[identity_key]) for item in entities]
+        placeholders = ",".join("?" for _ in identities)
+        rows = await self.db.execute_fetchall(
+            f"""SELECT entity_id,field_name,source_hash,translated_text
+                FROM localized_texts WHERE entity_type=? AND entity_id IN ({placeholders})
+                  AND language='zh-Hans' AND status='done' ORDER BY id DESC""",
+            (entity_type, *identities),
+        )
+        sources: dict[tuple[str, str], str | None] = {}
+        for item in entities:
+            identity = str(item[identity_key])
+            if entity_type == "article":
+                sources[(identity, "title")] = item.get("title_en")
+                sources[(identity, "teaser")] = item.get("teaser_en")
+            else:
+                sources[(identity, "text")] = item.get("text_en")
+        result: dict[tuple[str, str], str] = {}
+        for row in rows:
+            key = (str(row["entity_id"]), str(row["field_name"]))
+            source = sources.get(key)
+            if source is None or key in result:
+                continue
+            source_hash = hashlib.sha256(source.strip().encode()).hexdigest()
+            if source_hash == row["source_hash"] and row["translated_text"]:
+                result[key] = str(row["translated_text"])
+        return result
+
+    async def detail_data(self, article_id: str) -> dict[str, Any] | None:
+        article_rows = await self.db.execute_fetchall(
+            "SELECT * FROM news_articles WHERE source_id=?", (article_id,)
+        )
+        if not article_rows:
+            return None
+        article = dict(article_rows[0])
+        article["categories"] = await self._article_categories(article_id)
+        article_translations = await self._current_translations("article", [article])
+        article["title_zh"] = article_translations.get((article_id, "title"))
+        article["teaser_zh"] = article_translations.get((article_id, "teaser"))
+        segment_rows = await self.db.execute_fetchall(
+            """SELECT * FROM news_segments WHERE article_id=? AND is_current=1
+               ORDER BY position,id""",
+            (article_id,),
+        )
+        segments = [dict(row) for row in segment_rows]
+        segment_translations = await self._current_translations("segment", segments)
+        media_rows = await self.db.execute_fetchall(
+            """SELECT * FROM news_media WHERE article_id=? AND is_current=1
+               ORDER BY position,id""",
+            (article_id,),
+        )
+        media_by_segment: dict[int | None, list[dict[str, Any]]] = {}
+        for row in media_rows:
+            media_by_segment.setdefault(row["segment_id"], []).append(dict(row))
+        for segment in segments:
+            identity = str(segment["id"])
+            segment["text_zh"] = segment_translations.get((identity, "text"))
+            segment["media"] = media_by_segment.get(segment["id"], [])
+        feed_rows = await self.db.execute_fetchall(
+            """SELECT feed_type,rank FROM news_feed_placements
+               WHERE article_id=? AND is_current=1 ORDER BY feed_type""",
+            (article_id,),
+        )
+        comments = await self.comment_count(article_id)
+        return {
+            "article": article,
+            "segments": segments,
+            "feeds": [dict(row) for row in feed_rows],
+            "comment_count_collected": comments,
+        }
+
+    async def list_comments(
+        self, article_id: str | None, limit: int, before_id: str | None = None
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        parameters: list[Any] = []
+        if article_id is None:
+            source = """news_comments c JOIN news_comment_feed f
+                        ON f.comment_id=c.comment_id"""
+            where = "f.is_current=1"
+            order = "f.rank,c.comment_id"
+        else:
+            source = "news_comments c"
+            where = "c.article_id=?"
+            parameters.append(article_id)
+            order = "COALESCE(c.published_at,c.first_seen_at) DESC,c.comment_id DESC"
+        if before_id:
+            where += " AND c.comment_id<?"
+            parameters.append(before_id)
+        rows = await self.db.execute_fetchall(
+            f"SELECT c.* FROM {source} WHERE {where} ORDER BY {order} LIMIT ?",
+            (*parameters, limit + 1),
+        )
+        selected = [dict(row) for row in rows[:limit]]
+        translations = await self._current_translations("comment", selected)
+        for item in selected:
+            item["text_zh"] = translations.get((str(item["comment_id"]), "text"))
+        next_cursor = str(selected[-1]["comment_id"]) if len(rows) > limit else None
+        return selected, next_cursor
+
+    async def status_counts(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"sections": await self.section_counts()}
+        for table, column, key in (
+            ("news_detail_jobs", "state", "detail_jobs"),
+            ("news_media", "download_state", "media_jobs"),
+            ("localized_texts", "status", "translation_jobs"),
+        ):
+            rows = await self.db.execute_fetchall(
+                f"SELECT {column} AS state,count(*) AS count FROM {table} GROUP BY {column}"
+            )
+            result[key] = {str(row["state"]): int(row["count"]) for row in rows}
+        rows = await self.db.execute_fetchall(
+            "SELECT value FROM runtime_state WHERE key='schema_version'"
+        )
+        result["schema_version"] = int(rows[0]["value"])
+        return result
+
+    async def list_articles(
+        self, limit: int, before: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        if before:
+            rows = await self.db.execute_fetchall(
+                """SELECT * FROM news_articles
+                   WHERE COALESCE(published_at,first_seen_at)<?
+                   ORDER BY COALESCE(published_at,first_seen_at) DESC,source_id DESC
+                   LIMIT ?""",
+                (_iso(before), limit),
+            )
+        else:
+            rows = await self.db.execute_fetchall(
+                """SELECT * FROM news_articles
+                   ORDER BY COALESCE(published_at,first_seen_at) DESC,source_id DESC
+                   LIMIT ?""",
+                (limit,),
+            )
+        items = [dict(row) for row in rows]
+        translations = await self._current_translations("article", items)
+        for item in items:
+            article_id = str(item["source_id"])
+            item["title_zh"] = translations.get((article_id, "title"))
+            item["teaser_zh"] = translations.get((article_id, "teaser"))
+        return items

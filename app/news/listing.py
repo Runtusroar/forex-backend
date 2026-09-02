@@ -164,10 +164,20 @@ def parse_news_listing_v2(
                 comment_match = re.search(r"/comment/(\d+)", link.attributes.get("href", ""))
                 if not comment_match:
                     continue
+                article_href = article_link.attributes.get("href", "")
+                article_id = _source_id(article_href)
+                if article_id not in articles:
+                    articles[article_id] = ArticleObservation(
+                        source_id=article_id,
+                        ff_url=urljoin(SOURCE_ROOT, article_href),
+                        title_en=re.sub(r"\s+", " ", article_link.text(strip=True)).strip(),
+                        observed_at=observed_at,
+                        source_timezone=source_timezone.key,
+                    )
                 comments.append(
                     CommentObservation(
                         comment_id=comment_match.group(1),
-                        article_id=_source_id(article_link.attributes.get("href", "")),
+                        article_id=article_id,
                         author_name=_text(node, ".news-block__comment-author") or "Unknown",
                         text_en=_text(node, ".news-block__comment-message") or "",
                         permalink=urljoin(SOURCE_ROOT, link.attributes.get("href", "")),

@@ -54,3 +54,24 @@ def test_listing_never_uses_interface_icons_as_content_media() -> None:
     batch = parse_news_listing_v2(FIXTURE, NOW, ZoneInfo("Asia/Shanghai"))
     article = next(item for item in batch.articles if item.source_id == "100")
     assert "story.svg" not in (article.listing_thumbnail_url or "")
+
+
+def test_latest_comment_can_reference_an_article_outside_story_panels() -> None:
+    html = """
+    <div class="news-block"><h2>News / Latest Stories</h2>
+      <div class="news-block__item"><div class="news-block__title">
+        <a href="/news/1-one">One</a></div></div>
+    </div>
+    <div class="news-block"><h2>News / Latest Comments</h2>
+      <div class="news-block__item news-block__item--comment">
+        <a class="news-block__comment-author">Alice</a>
+        <span class="news-block__comment-message">Useful</span>
+        <a href="/news/2-two/comment/20">comment</a>
+        <a class="news-block__title" href="/news/2-two">Two</a>
+      </div>
+    </div>
+    """
+
+    batch = parse_news_listing_v2(html, NOW, ZoneInfo("Asia/Shanghai"))
+
+    assert {article.source_id for article in batch.articles} == {"1", "2"}

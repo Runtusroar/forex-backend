@@ -10,6 +10,9 @@ from app.collector import BrowserSession, Collector
 from app.config import Settings, get_settings
 from app.db import Database
 from app.domain import CalendarRecord, NewsRecord
+from app.news.api import create_news_router
+from app.news.compat import v1_news_detail, v1_news_list
+from app.news.repository import NewsRepository
 from app.repository import Repository
 from app.runtime import BackgroundRuntime
 from app.translation import KimiTranslator
@@ -63,6 +66,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             await database.initialize()
             live_repository = Repository(database)
             app.state.repository = live_repository
+            app.state.news_repository = NewsRepository(live_repository.db)
             browser = BrowserSession(configured.cdp_url)
             collector = Collector(browser, live_repository)
             translator = TranslationWorker(live_repository, KimiTranslator(configured))
@@ -84,6 +88,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     app = FastAPI(title="Forex Factory MVP", version="1.0.0", lifespan=lifespan)
     if repository is not None:
         app.state.repository = repository
+        app.state.news_repository = NewsRepository(repository.db)
 
     def repo(request: Request) -> Repository:
         return request.app.state.repository
@@ -114,14 +119,25 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     @app.get("/api/v1/news", dependencies=[Depends(authorize)])
     async def news(
         repository: Annotated[Repository, Depends(repo)],
+        request: Request,
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         before: datetime | None = None,
     ) -> dict:
+        v2_items = await v1_news_list(request.app.state.news_repository, limit, before)
+        if v2_items:
+            return {"items": v2_items, "generated_at": datetime.now(UTC)}
         items = await repository.list_news(limit, before)
         return {"items": [_news_json(item) for item in items], "generated_at": datetime.now(UTC)}
 
     @app.get("/api/v1/news/{source_id}", dependencies=[Depends(authorize)])
-    async def news_detail(source_id: str, repository: Annotated[Repository, Depends(repo)]) -> dict:
+    async def news_detail(
+        source_id: str,
+        repository: Annotated[Repository, Depends(repo)],
+        request: Request,
+    ) -> dict:
+        v2_item = await v1_news_detail(request.app.state.news_repository, source_id)
+        if v2_item is not None:
+            return v2_item
         item = await repository.get_news(source_id)
         if item is None:
             raise HTTPException(status_code=404, detail="Not found")
@@ -130,5 +146,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     @app.get("/api/v1/status", dependencies=[Depends(authorize)])
     async def status() -> dict[str, str]:
         return {"status": "ok", "model": configured.kimi_model}
+
+    app.include_router(create_news_router(configured, authorize))
 
     return app
