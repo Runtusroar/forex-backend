@@ -150,6 +150,9 @@ CREATE TABLE IF NOT EXISTS localized_texts (
   model TEXT,
   status TEXT NOT NULL DEFAULT 'pending'
     CHECK (status IN ('pending','processing','done','failed','stale')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  last_error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   UNIQUE(entity_type, entity_id, field_name, language, source_hash)

@@ -15,6 +15,7 @@ from app.news.models import (
     DetailObservation,
     FeedType,
     ListingApplyResult,
+    LocalizedTextJob,
     MediaJob,
     NewsListingBatch,
 )
@@ -162,6 +163,12 @@ class NewsRepository:
                 observed,
                 observed,
             ),
+        )
+        await self._enqueue_localized(
+            "article", article.source_id, "title", article.title_en, observed
+        )
+        await self._enqueue_localized(
+            "article", article.source_id, "teaser", article.teaser_en, observed
         )
 
     async def _apply_feed(self, batch: NewsListingBatch, feed_type: FeedType) -> None:
@@ -432,6 +439,14 @@ class NewsRepository:
                 (article_id,),
             )
             segment_ids = {str(row["stable_key"]): int(row["id"]) for row in segment_rows}
+            for segment in detail.segments:
+                await self._enqueue_localized(
+                    "segment",
+                    str(segment_ids[segment.stable_key]),
+                    "text",
+                    segment.text_en,
+                    observed,
+                )
             current_media_keys = {item.stable_key for item in detail.media}
             for item in detail.media:
                 await self.db.execute(
@@ -516,6 +531,180 @@ class NewsRepository:
                 observed,
             ),
         )
+        await self._enqueue_localized(
+            "comment", comment.comment_id, "text", comment.text_en, observed
+        )
+
+    async def _enqueue_localized(
+        self,
+        entity_type: str,
+        entity_id: str,
+        field_name: str,
+        source_text: str | None,
+        observed: str | None,
+    ) -> None:
+        if not source_text:
+            return
+        source_hash = hashlib.sha256(source_text.strip().encode()).hexdigest()
+        await self.db.execute(
+            """INSERT OR IGNORE INTO localized_texts
+               (entity_type,entity_id,field_name,language,source_hash,status,
+                attempts,next_attempt_at,created_at,updated_at)
+               VALUES (?,?,?,'zh-Hans',?,'pending',0,?,?,?)""",
+            (
+                entity_type,
+                entity_id,
+                field_name,
+                source_hash,
+                observed,
+                observed,
+                observed,
+            ),
+        )
+
+    async def claim_localized_jobs(
+        self, limit: int, now: datetime | None = None
+    ) -> list[LocalizedTextJob]:
+        claimed = now or datetime.now(UTC)
+        ready = _iso(claimed)
+        lease = _iso(claimed + timedelta(minutes=5))
+        await self.db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = await self.db.execute_fetchall(
+                """SELECT * FROM localized_texts
+                   WHERE status IN ('pending','processing')
+                     AND (status='pending' OR next_attempt_at IS NULL OR next_attempt_at<=?)
+                   ORDER BY CASE entity_type
+                     WHEN 'article' THEN 0 WHEN 'segment' THEN 1 ELSE 2 END,
+                     id LIMIT ?""",
+                (ready, limit),
+            )
+            jobs: list[LocalizedTextJob] = []
+            for row in rows:
+                source_text = await self._localized_source_text(
+                    str(row["entity_type"]),
+                    str(row["entity_id"]),
+                    str(row["field_name"]),
+                )
+                if source_text is None:
+                    await self.db.execute(
+                        "UPDATE localized_texts SET status='stale',updated_at=? WHERE id=?",
+                        (ready, row["id"]),
+                    )
+                    continue
+                jobs.append(
+                    LocalizedTextJob(
+                        id=int(row["id"]),
+                        entity_type=str(row["entity_type"]),
+                        entity_id=str(row["entity_id"]),
+                        field_name=str(row["field_name"]),
+                        source_text=source_text,
+                        source_hash=str(row["source_hash"]),
+                        attempts=int(row["attempts"]),
+                    )
+                )
+            if jobs:
+                await self.db.executemany(
+                    """UPDATE localized_texts SET status='processing',next_attempt_at=?,
+                       updated_at=? WHERE id=?""",
+                    [(lease, ready, job.id) for job in jobs],
+                )
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            raise
+        return jobs
+
+    async def _localized_source_text(
+        self, entity_type: str, entity_id: str, field_name: str
+    ) -> str | None:
+        fields = {
+            ("article", "title"): ("news_articles", "source_id", "title_en"),
+            ("article", "teaser"): ("news_articles", "source_id", "teaser_en"),
+            ("segment", "text"): ("news_segments", "id", "text_en"),
+            ("comment", "text"): ("news_comments", "comment_id", "text_en"),
+        }
+        target = fields.get((entity_type, field_name))
+        if target is None:
+            return None
+        table, identity_column, value_column = target
+        rows = await self.db.execute_fetchall(
+            f"SELECT {value_column} AS value FROM {table} WHERE {identity_column}=?",
+            (entity_id,),
+        )
+        return str(rows[0]["value"]) if rows and rows[0]["value"] is not None else None
+
+    async def complete_localized_job(
+        self, job: LocalizedTextJob, translated_text: str, model: str
+    ) -> bool:
+        current = await self._localized_source_text(
+            job.entity_type, job.entity_id, job.field_name
+        )
+        current_hash = hashlib.sha256((current or "").strip().encode()).hexdigest()
+        now = _iso(datetime.now(UTC))
+        if current is None or current_hash != job.source_hash:
+            await self.db.execute(
+                "UPDATE localized_texts SET status='stale',updated_at=? WHERE id=?",
+                (now, job.id),
+            )
+            await self.db.commit()
+            return False
+        await self.db.execute(
+            """UPDATE localized_texts SET translated_text=?,model=?,status='done',
+               next_attempt_at=NULL,last_error=NULL,updated_at=? WHERE id=?""",
+            (translated_text.strip(), model, now, job.id),
+        )
+        await self.db.commit()
+        return True
+
+    async def fail_localized_job(
+        self, job: LocalizedTextJob, error: Exception, now: datetime | None = None
+    ) -> None:
+        failed = now or datetime.now(UTC)
+        delay = (1, 5, 30, 120, 360)[min(job.attempts, 4)]
+        await self.db.execute(
+            """UPDATE localized_texts SET status='pending',attempts=attempts+1,
+               next_attempt_at=?,last_error=?,updated_at=? WHERE id=?""",
+            (
+                _iso(failed + timedelta(minutes=delay)),
+                type(error).__name__,
+                _iso(failed),
+                job.id,
+            ),
+        )
+        await self.db.commit()
+
+    async def localized_text(
+        self, entity_type: str, entity_id: str, field_name: str
+    ) -> str | None:
+        source_text = await self._localized_source_text(entity_type, entity_id, field_name)
+        if source_text is None:
+            return None
+        source_hash = hashlib.sha256(source_text.strip().encode()).hexdigest()
+        rows = await self.db.execute_fetchall(
+            """SELECT translated_text FROM localized_texts
+               WHERE entity_type=? AND entity_id=? AND field_name=? AND language='zh-Hans'
+                 AND source_hash=? AND status='done'""",
+            (entity_type, entity_id, field_name, source_hash),
+        )
+        return str(rows[0]["translated_text"]) if rows else None
+
+    async def localized_status(
+        self, entity_type: str, entity_id: str, field_name: str
+    ) -> str | None:
+        rows = await self.db.execute_fetchall(
+            """SELECT status FROM localized_texts
+               WHERE entity_type=? AND entity_id=? AND field_name=?
+               ORDER BY id DESC LIMIT 1""",
+            (entity_type, entity_id, field_name),
+        )
+        return str(rows[0]["status"]) if rows else None
+
+    async def localized_status_by_id(self, job_id: int) -> str | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT status FROM localized_texts WHERE id=?", (job_id,)
+        )
+        return str(rows[0]["status"]) if rows else None
 
     async def claim_media_jobs(
         self, limit: int, now: datetime | None = None

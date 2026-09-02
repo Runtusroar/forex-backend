@@ -5,6 +5,7 @@ import httpx
 
 from app.config import Settings
 from app.domain import TranslationJob
+from app.news.models import LocalizedTextJob
 
 
 class TranslationProtocolError(ValueError):
@@ -99,3 +100,91 @@ class KimiTranslator:
                 raise TranslationProtocolError("Kimi returned an empty translation")
             result[int(item["job_id"])] = translated
         return result
+
+    async def translate_fields(self, jobs: list[LocalizedTextJob]) -> dict[int, str]:
+        if not jobs:
+            return {}
+        request = {
+            "model": self.settings.kimi_model,
+            "reasoning_effort": "low",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Translate each English Forex Factory field faithfully into Simplified "
+                        "Chinese. Preserve all numbers, currency codes, names, and paragraph "
+                        "structure. Add no commentary. Return only the required JSON."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        [
+                            {
+                                "job_id": job.id,
+                                "entity_type": job.entity_type,
+                                "field_name": job.field_name,
+                                "source_text": job.source_text,
+                            }
+                            for job in jobs
+                        ],
+                        ensure_ascii=False,
+                    ),
+                },
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "news_field_translations",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "translations": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "job_id": {"type": "integer"},
+                                        "translated_text": {"type": "string"},
+                                    },
+                                    "required": ["job_id", "translated_text"],
+                                    "additionalProperties": False,
+                                },
+                            }
+                        },
+                        "required": ["translations"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        }
+        owns_client = self.client is None
+        client = self.client or httpx.AsyncClient(timeout=self.settings.kimi_timeout_seconds)
+        try:
+            response = await client.post(
+                f"{self.settings.kimi_base_url.rstrip('/')}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.settings.moonshot_api_key.get_secret_value()}",
+                    "Content-Type": "application/json",
+                },
+                json=request,
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            decoded: dict[str, Any] = json.loads(content)
+            translations = decoded["translations"]
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
+            raise TranslationProtocolError("invalid Kimi translation response") from error
+        finally:
+            if owns_client:
+                await client.aclose()
+        expected = {job.id for job in jobs}
+        received_ids = [item.get("job_id") for item in translations]
+        if len(received_ids) != len(set(received_ids)) or not set(received_ids) <= expected:
+            raise TranslationProtocolError("Kimi returned unknown or duplicate translation IDs")
+        return {
+            int(item["job_id"]): value.strip()
+            for item in translations
+            if isinstance((value := item.get("translated_text")), str) and value.strip()
+        }

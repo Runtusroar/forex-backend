@@ -142,6 +142,17 @@ class CachedMedia:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalizedTextJob:
+    id: int
+    entity_type: str
+    entity_id: str
+    field_name: str
+    source_text: str
+    source_hash: str
+    attempts: int
+
+
+@dataclass(frozen=True, slots=True)
 class ArticleRecord:
     source_id: str
     ff_url: str
