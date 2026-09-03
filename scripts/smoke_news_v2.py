@@ -67,6 +67,27 @@ def validate_contract(
     if positions != sorted(positions) or len(positions) != len(set(positions)):
         raise ContractError("detail segments are out of order or duplicated")
     for segment in segments:
+        presentation = segment.get("presentation")
+        if not isinstance(presentation, dict):
+            raise ContractError("detail segment presentation is missing")
+        mode = presentation.get("mode")
+        if mode not in {"full", "clamped"}:
+            raise ContractError("detail segment presentation mode is invalid")
+        if mode == "clamped":
+            if not isinstance(presentation.get("max_lines"), int) or not isinstance(
+                presentation.get("action_label"), str
+            ):
+                raise ContractError("clamped detail segment action is invalid")
+        links = segment.get("links")
+        if not isinstance(links, list):
+            raise ContractError("detail segment links must be an array")
+        for link in links:
+            if "source_document" in link:
+                raise ContractError("detail exposes a publisher document")
+            if link.get("kind") != "full_story" or not str(link.get("url", "")).startswith(
+                ("http://", "https://")
+            ):
+                raise ContractError("detail contains an invalid external link")
         for media in segment.get("media", []):
             media_url = media.get("url")
             if media_url is not None and not str(media_url).startswith(

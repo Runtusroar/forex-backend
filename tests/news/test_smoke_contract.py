@@ -35,10 +35,31 @@ def valid_payloads():
     detail = {
         "source_id": "100",
         "segments": [
-            {"position": 0, "media": []},
+            {
+                "position": 0,
+                "media": [],
+                "presentation": {
+                    "mode": "full",
+                    "max_lines": None,
+                    "action_label": None,
+                },
+                "links": [],
+            },
             {
                 "position": 1,
                 "media": [{"url": "/api/v2/news/media/1"}],
+                "presentation": {
+                    "mode": "clamped",
+                    "max_lines": 10,
+                    "action_label": "Show More",
+                },
+                "links": [
+                    {
+                        "kind": "full_story",
+                        "label": "full story",
+                        "url": "https://publisher.example/story",
+                    }
+                ],
             },
         ],
     }
@@ -58,6 +79,8 @@ def test_valid_contract_passes() -> None:
         "invalid_impact",
         "unordered_segments",
         "unsafe_media_url",
+        "missing_presentation",
+        "publisher_document_leak",
     ],
 )
 def test_contract_rejects_semantic_corruption(corruption: str) -> None:
@@ -72,8 +95,12 @@ def test_contract_rejects_semantic_corruption(corruption: str) -> None:
         listing["items"][0]["breaking_impact"] = "critical"
     elif corruption == "unordered_segments":
         detail["segments"][0]["position"] = 2
-    else:
+    elif corruption == "unsafe_media_url":
         detail["segments"][1]["media"][0]["url"] = "file:///app/data/media/x.png"
+    elif corruption == "missing_presentation":
+        detail["segments"][1].pop("presentation")
+    else:
+        detail["segments"][1]["links"][0]["source_document"] = {"id": 7}
 
     with pytest.raises(ContractError):
         validate_contract(sections, listing, detail)
