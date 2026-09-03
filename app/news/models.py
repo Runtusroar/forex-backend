@@ -9,6 +9,7 @@ BreakingImpact = Literal["high", "medium", "low"]
 CategorySlug = Literal["fundamental", "technical", "industry", "entertainment", "educational"]
 FeedType = Literal["latest", "hot"]
 SegmentType = Literal["article", "social", "update", "quote", "link"]
+SegmentLinkType = Literal["full_story"]
 MediaType = Literal["image", "chart", "attachment"]
 
 
@@ -75,6 +76,16 @@ class SegmentObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class SegmentLinkObservation:
+    stable_key: str
+    segment_key: str
+    position: int
+    kind: SegmentLinkType
+    label: str
+    url: str
+
+
+@dataclass(frozen=True, slots=True)
 class MediaObservation:
     stable_key: str
     position: int
@@ -90,6 +101,7 @@ class DetailObservation:
     observed_at: datetime
     source_hash: str
     segments: tuple[SegmentObservation, ...] = ()
+    links: tuple[SegmentLinkObservation, ...] = ()
     media: tuple[MediaObservation, ...] = ()
     comments: tuple[CommentObservation, ...] = ()
     is_complete: bool = True

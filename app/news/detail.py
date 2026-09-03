@@ -12,6 +12,7 @@ from app.news.models import (
     CommentObservation,
     DetailObservation,
     MediaObservation,
+    SegmentLinkObservation,
     SegmentObservation,
 )
 from app.parsers.errors import SourcePageError, reject_challenge
@@ -21,6 +22,10 @@ SOURCE_ROOT = "https://www.forexfactory.com"
 
 def _clean(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
+
+
+def _clean_excerpt(value: str) -> str:
+    return re.sub(r"(?:\s*(?:\.{3}|…))+\s*$", "", _clean(value)).rstrip()
 
 
 def _key(*values: str | None) -> str:
@@ -66,8 +71,11 @@ def parse_news_detail_v2(
     reject_challenge(html)
     tree = HTMLParser(html)
     segments: list[SegmentObservation] = []
+    links: list[SegmentLinkObservation] = []
     media: list[MediaObservation] = []
     for position, article in enumerate(tree.css(".news__article")):
+        full_story = None
+        link_label = None
         social = article.css_first(".x-twitter-post-preview__text")
         if social:
             text = _clean(social.text(separator=" ", strip=True))
@@ -92,15 +100,19 @@ def parse_news_detail_v2(
             copy = article.css_first(".news__copy")
             if not copy:
                 continue
-            paragraphs = [_clean(node.text(separator=" ", strip=True)) for node in copy.css("p")]
-            text = "\n\n".join(value for value in paragraphs if value) or _clean(
-                copy.text(separator=" ", strip=True)
-            )
             full_story = next(
                 (link for link in copy.css("a") if "full story" in link.text(strip=True).lower()),
                 None,
             )
-            source_url = full_story.attributes.get("href") if full_story else None
+            source_href = full_story.attributes.get("href") if full_story else None
+            source_url = urljoin(SOURCE_ROOT, source_href) if source_href else None
+            link_label = _clean(full_story.text(separator=" ", strip=True)) if full_story else None
+            if full_story:
+                full_story.decompose()
+            paragraphs = [_clean_excerpt(node.text(separator=" ", strip=True)) for node in copy.css("p")]
+            text = "\n\n".join(value for value in paragraphs if value) or _clean_excerpt(
+                copy.text(separator=" ", strip=True)
+            )
             segment = SegmentObservation(
                 stable_key=_key("article", source_url, text),
                 position=position,
@@ -110,6 +122,17 @@ def parse_news_detail_v2(
                 is_excerpt=full_story is not None,
             )
         segments.append(segment)
+        if source_url and link_label and full_story:
+            links.append(
+                SegmentLinkObservation(
+                    stable_key=_key(segment.stable_key, "full_story", source_url),
+                    segment_key=segment.stable_key,
+                    position=0,
+                    kind="full_story",
+                    label=link_label.strip("() ").lower(),
+                    url=source_url,
+                )
+            )
         media_position = 0
         for image in article.css("img.attach"):
             parent = image.parent
@@ -178,6 +201,7 @@ def parse_news_detail_v2(
         observed_at=observed_at,
         source_hash=hashlib.sha256(html.encode()).hexdigest(),
         segments=tuple(segments),
+        links=tuple(links),
         media=tuple(media),
         comments=tuple(comments),
         is_complete=True,

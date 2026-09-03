@@ -18,6 +18,24 @@ def test_all_article_nodes_become_ordered_segments() -> None:
     assert detail.segments[2].is_excerpt is True
 
 
+def test_full_story_anchor_is_structured_and_not_flattened_into_prose() -> None:
+    detail = parse_news_detail_v2(HTML, "100", NOW, ZoneInfo("Asia/Shanghai"))
+
+    assert detail.segments[2].text_en == "Full Forex Factory excerpt"
+    assert [
+        (link.kind, link.label, link.url, link.segment_key, link.position)
+        for link in detail.links
+    ] == [
+        (
+            "full_story",
+            "full story",
+            "https://publisher.example/story",
+            detail.segments[2].stable_key,
+            0,
+        )
+    ]
+
+
 def test_content_media_and_nested_comments_are_preserved() -> None:
     detail = parse_news_detail_v2(HTML, "100", NOW, ZoneInfo("Asia/Shanghai"))
     assert [(item.media_type, item.original_url) for item in detail.media] == [
