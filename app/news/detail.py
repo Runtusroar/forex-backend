@@ -144,6 +144,10 @@ def parse_news_detail_v2(
             text = "\n\n".join(value for value in paragraphs if value) or _clean(
                 copy.text(separator=" ", strip=True)
             )
+            if full_story:
+                # Forex Factory currently renders the parentheses around the anchor,
+                # so removing only the anchor leaves a trailing empty "( )" behind.
+                text = re.sub(r"\s*\(\s*\)\s*$", "", text).rstrip()
             segment = SegmentObservation(
                 stable_key=_key("article", source_url, text),
                 position=position,
