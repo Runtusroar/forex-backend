@@ -127,6 +127,24 @@ async def test_late_translation_is_stale_after_source_changes(
     assert await news_repository.localized_status_by_id(jobs[0].id) == "stale"
 
 
+async def test_removed_source_document_translation_is_marked_stale(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.db.execute(
+        """INSERT INTO localized_texts
+           (entity_type,entity_id,field_name,language,source_hash,status,attempts,
+            created_at,updated_at)
+           VALUES ('source_document','7','body','zh-Hans','old','pending',0,?,?)""",
+        (NOW.isoformat(), NOW.isoformat()),
+    )
+    await news_repository.db.commit()
+
+    jobs = await news_repository.claim_localized_jobs(10, NOW)
+
+    assert jobs == []
+    assert await news_repository.localized_status_by_id(1) == "stale"
+
+
 @respx.mock
 async def test_kimi_field_payload_accepts_partial_valid_results(tmp_path: Path) -> None:
     route = respx.post("https://api.kimi.com/coding/v1/chat/completions").mock(

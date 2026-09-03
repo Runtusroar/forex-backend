@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
@@ -22,8 +21,6 @@ from app.news.models import (
     LocalizedTextJob,
     MediaJob,
     NewsListingBatch,
-    SourceDocumentJob,
-    SourceDocumentObservation,
 )
 
 
@@ -390,136 +387,6 @@ class NewsRepository:
         )
         return str(rows[0]["state"]) if rows else None
 
-    @_serialized_write
-    async def claim_source_document_jobs(
-        self, limit: int, now: datetime | None = None
-    ) -> list[SourceDocumentJob]:
-        claimed = now or datetime.now(UTC)
-        ready = _iso(claimed)
-        expired_lease = _iso(claimed - timedelta(minutes=5))
-        await self.db.execute("BEGIN IMMEDIATE")
-        try:
-            rows = await self.db.execute_fetchall(
-                """SELECT id,original_url,attempts FROM news_source_documents
-                   WHERE (fetch_state='pending' AND next_attempt_at<=?)
-                      OR (fetch_state='processing' AND claimed_at<?)
-                   ORDER BY attempts,id LIMIT ?""",
-                (ready, expired_lease, limit),
-            )
-            if rows:
-                await self.db.executemany(
-                    """UPDATE news_source_documents
-                       SET fetch_state='processing',claimed_at=?,updated_at=? WHERE id=?""",
-                    [(ready, ready, row["id"]) for row in rows],
-                )
-            await self.db.commit()
-        except Exception:
-            await self.db.rollback()
-            raise
-        return [
-            SourceDocumentJob(
-                document_id=int(row["id"]),
-                original_url=str(row["original_url"]),
-                attempts=int(row["attempts"]),
-            )
-            for row in rows
-        ]
-
-    @_serialized_write
-    async def complete_source_document(
-        self, document_id: int, document: SourceDocumentObservation
-    ) -> None:
-        observed = _iso(document.fetched_at)
-        content_hash = hashlib.sha256(
-            "\n".join((document.final_url, document.title_en, document.body_en)).encode()
-        ).hexdigest()
-        await self.db.execute("BEGIN IMMEDIATE")
-        try:
-            await self.db.execute(
-                """UPDATE news_source_documents SET
-                   final_url=?,source_host=?,title_en=?,author_name=?,
-                   published_at_source_text=?,lead_image_url=?,paragraphs_json=?,body_en=?,
-                   extraction_method=?,content_hash=?,fetch_state='complete',attempts=attempts+1,
-                   next_attempt_at=?,claimed_at=NULL,http_status=?,last_error=NULL,
-                   last_fetched_at=?,updated_at=? WHERE id=?""",
-                (
-                    document.final_url,
-                    document.source_host,
-                    document.title_en,
-                    document.author_name,
-                    document.published_at_source_text,
-                    document.lead_image_url,
-                    json.dumps(document.paragraphs, ensure_ascii=False),
-                    document.body_en,
-                    document.extraction_method,
-                    content_hash,
-                    _iso(document.fetched_at + timedelta(days=1)),
-                    document.http_status,
-                    observed,
-                    observed,
-                    document_id,
-                ),
-            )
-            await self._enqueue_localized(
-                "source_document", str(document_id), "title", document.title_en, observed
-            )
-            await self._enqueue_localized(
-                "source_document", str(document_id), "body", document.body_en, observed
-            )
-            await self.db.commit()
-        except Exception:
-            await self.db.rollback()
-            raise
-
-    @_serialized_write
-    async def fail_source_document(
-        self,
-        document_id: int,
-        error: Exception,
-        now: datetime | None = None,
-        max_attempts: int = 5,
-        *,
-        blocked: bool = False,
-        http_status: int | None = None,
-    ) -> None:
-        failed = now or datetime.now(UTC)
-        rows = await self.db.execute_fetchall(
-            "SELECT attempts FROM news_source_documents WHERE id=?", (document_id,)
-        )
-        if not rows:
-            return
-        attempts = int(rows[0]["attempts"]) + 1
-        delay = (5, 30, 120, 360, 1440)[min(attempts - 1, 4)]
-        state = "blocked" if blocked else ("failed" if attempts >= max_attempts else "pending")
-        await self.db.execute(
-            """UPDATE news_source_documents SET fetch_state=?,attempts=?,next_attempt_at=?,
-               claimed_at=NULL,http_status=?,last_error=?,last_fetched_at=?,updated_at=?
-               WHERE id=?""",
-            (
-                state,
-                attempts,
-                _iso(failed + timedelta(minutes=delay)),
-                http_status,
-                type(error).__name__,
-                _iso(failed),
-                _iso(failed),
-                document_id,
-            ),
-        )
-        await self.db.commit()
-
-    @_serialized_write
-    async def schedule_source_document_refresh(
-        self, document_id: int, now: datetime | None = None
-    ) -> None:
-        scheduled = _iso(now or datetime.now(UTC))
-        await self.db.execute(
-            """UPDATE news_source_documents SET fetch_state='pending',next_attempt_at=?,
-               claimed_at=NULL,updated_at=? WHERE id=?""",
-            (scheduled, scheduled, document_id),
-        )
-        await self.db.commit()
-
     async def has_snapshot(
         self, page_type: str, page_key: str, content_hash: str, parse_status: str
     ) -> bool:
@@ -602,15 +469,19 @@ class NewsRepository:
                     """INSERT INTO news_segments
                        (article_id,stable_key,position,segment_type,author_name,author_handle,
                         published_at,published_at_source_text,text_en,source_url,is_excerpt,
-                        source_hash,is_current,first_seen_at,last_seen_at,updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)
+                        display_mode,max_lines,external_action_label,source_hash,is_current,
+                        first_seen_at,last_seen_at,updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?,?)
                        ON CONFLICT(article_id,stable_key) DO UPDATE SET
                          position=excluded.position,segment_type=excluded.segment_type,
                          author_name=excluded.author_name,author_handle=excluded.author_handle,
                          published_at=excluded.published_at,
                          published_at_source_text=excluded.published_at_source_text,
                          text_en=excluded.text_en,source_url=excluded.source_url,
-                         is_excerpt=excluded.is_excerpt,source_hash=excluded.source_hash,
+                         is_excerpt=excluded.is_excerpt,
+                         display_mode=excluded.display_mode,max_lines=excluded.max_lines,
+                         external_action_label=excluded.external_action_label,
+                         source_hash=excluded.source_hash,
                          is_current=1,last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at""",
                     (
                         article_id,
@@ -624,6 +495,9 @@ class NewsRepository:
                         segment.text_en,
                         segment.source_url,
                         int(segment.is_excerpt),
+                        segment.display_mode,
+                        segment.max_lines,
+                        segment.external_action_label,
                         source_hash,
                         observed,
                         observed,
@@ -658,30 +532,18 @@ class NewsRepository:
             current_link_keys = {item.stable_key for item in detail.links}
             for item in detail.links:
                 await self.db.execute(
-                    """INSERT INTO news_source_documents
-                       (original_url,fetch_state,attempts,next_attempt_at,first_seen_at,updated_at)
-                       VALUES (?,'pending',0,?,?,?)
-                       ON CONFLICT(original_url) DO UPDATE SET updated_at=excluded.updated_at""",
-                    (item.url, observed, observed, observed),
-                )
-                document_rows = await self.db.execute_fetchall(
-                    "SELECT id FROM news_source_documents WHERE original_url=?", (item.url,)
-                )
-                await self.db.execute(
                     """INSERT INTO news_segment_links
-                       (article_id,segment_id,source_document_id,stable_key,position,link_type,
-                        label,original_url,is_current,first_seen_at,last_seen_at)
-                       VALUES (?,?,?,?,?,?,?,?,1,?,?)
+                       (article_id,segment_id,stable_key,position,link_type,label,original_url,
+                        is_current,first_seen_at,last_seen_at)
+                       VALUES (?,?,?,?,?,?,?,1,?,?)
                        ON CONFLICT(article_id,stable_key) DO UPDATE SET
                          segment_id=excluded.segment_id,
-                         source_document_id=excluded.source_document_id,
                          position=excluded.position,link_type=excluded.link_type,
                          label=excluded.label,original_url=excluded.original_url,
                          is_current=1,last_seen_at=excluded.last_seen_at""",
                     (
                         article_id,
                         segment_ids[item.segment_key],
-                        document_rows[0]["id"],
                         item.stable_key,
                         item.position,
                         item.kind,
@@ -841,7 +703,7 @@ class NewsRepository:
                           OR (status='pending' AND attempts=0))
                    ORDER BY CASE entity_type
                      WHEN 'article' THEN 0 WHEN 'segment' THEN 1
-                     WHEN 'source_document' THEN 2 ELSE 3 END,
+                     WHEN 'comment' THEN 2 ELSE 3 END,
                      id LIMIT ?""",
                 (ready, limit),
             )
@@ -889,8 +751,6 @@ class NewsRepository:
             ("article", "teaser"): ("news_articles", "source_id", "teaser_en"),
             ("segment", "text"): ("news_segments", "id", "text_en"),
             ("comment", "text"): ("news_comments", "comment_id", "text_en"),
-            ("source_document", "title"): ("news_source_documents", "id", "title_en"),
-            ("source_document", "body"): ("news_source_documents", "id", "body_en"),
         }
         target = fields.get((entity_type, field_name))
         if target is None:
@@ -1327,14 +1187,9 @@ class NewsRepository:
         for row in media_rows:
             media_by_segment.setdefault(row["segment_id"], []).append(dict(row))
         link_rows = await self.db.execute_fetchall(
-            """SELECT l.*,d.fetch_state,d.title_en AS source_title_en,
-                      d.author_name AS source_author_name,d.source_host,
-                      d.published_at_source_text AS source_published_at_source_text,
-                      d.lead_image_url AS source_lead_image_url
-               FROM news_segment_links l
-               JOIN news_source_documents d ON d.id=l.source_document_id
-               WHERE l.article_id=? AND l.is_current=1
-               ORDER BY l.segment_id,l.position,l.id""",
+            """SELECT * FROM news_segment_links
+               WHERE article_id=? AND is_current=1
+               ORDER BY segment_id,position,id""",
             (article_id,),
         )
         links_by_segment: dict[int, list[dict[str, Any]]] = {}
@@ -1357,25 +1212,6 @@ class NewsRepository:
             "feeds": [dict(row) for row in feed_rows],
             "comment_count_collected": comments,
         }
-
-    async def source_document_data(self, document_id: int) -> dict[str, Any] | None:
-        rows = await self.db.execute_fetchall(
-            "SELECT * FROM news_source_documents WHERE id=?", (document_id,)
-        )
-        if not rows:
-            return None
-        item = dict(rows[0])
-        item["title_zh"] = await self.localized_text(
-            "source_document", str(document_id), "title"
-        )
-        item["body_zh"] = await self.localized_text(
-            "source_document", str(document_id), "body"
-        )
-        try:
-            item["paragraphs"] = json.loads(item.get("paragraphs_json") or "[]")
-        except json.JSONDecodeError:
-            item["paragraphs"] = []
-        return item
 
     async def list_comments(
         self,
@@ -1428,7 +1264,6 @@ class NewsRepository:
         for table, column, key in (
             ("news_detail_jobs", "state", "detail_jobs"),
             ("news_media", "download_state", "media_jobs"),
-            ("news_source_documents", "fetch_state", "source_documents"),
             ("localized_texts", "status", "translation_jobs"),
         ):
             rows = await self.db.execute_fetchall(
@@ -1444,8 +1279,6 @@ class NewsRepository:
             "news_last_listing_error",
             "news_last_detail_success",
             "news_last_detail_error",
-            "news_last_source_success",
-            "news_last_source_error",
             "news_last_translation_success",
         ):
             result[key.removeprefix("news_")] = await self.get_runtime_state(key)
