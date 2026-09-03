@@ -73,11 +73,12 @@ def validate_contract(
         mode = presentation.get("mode")
         if mode not in {"full", "clamped"}:
             raise ContractError("detail segment presentation mode is invalid")
-        if mode == "clamped":
-            if not isinstance(presentation.get("max_lines"), int) or not isinstance(
+        if mode == "clamped" and (
+            not isinstance(presentation.get("max_lines"), int) or not isinstance(
                 presentation.get("action_label"), str
-            ):
-                raise ContractError("clamped detail segment action is invalid")
+            )
+        ):
+            raise ContractError("clamped detail segment action is invalid")
         links = segment.get("links")
         if not isinstance(links, list):
             raise ContractError("detail segment links must be an array")
