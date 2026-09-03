@@ -87,6 +87,14 @@ deduplicated by SHA-256. Changed/error HTML snapshots are retained for 30 days. 
 checkpointed browser backfill follows each section's visible `More` control up to 30 days and yields
 whenever live detail work is waiting.
 
+Forex Factory `full story` anchors are stored as structured segment links, not flattened into
+paragraph text. A separate low-concurrency worker attempts to fetch the linked publisher page,
+stores its raw HTML snapshot, extracts a readable title/body with provenance, and queues it for
+translation. Publisher content never overwrites the Forex Factory excerpt. Every URL and redirect
+is checked against public DNS, response type/size and redirect count are bounded, and 401/403/451
+responses are recorded as blocked. The service does not bypass logins, paywalls, CAPTCHAs, or
+publisher restrictions.
+
 Translation runs independently after English records are stored. A Kimi outage leaves the English
 data and collection loop intact; Chinese fields remain nullable until a later retry succeeds.
 
@@ -112,6 +120,7 @@ News V2 endpoints used by the new iPhone client:
 - `GET /api/v2/news/comments/latest`
 - `GET /api/v2/news/{source_id}/comments`
 - `GET /api/v2/news/media/{media_id}`
+- `GET /api/v2/news/source-documents/{document_id}`
 - `GET /api/v2/status`
 
 Chinese fields can be `null` while translation is pending or unavailable. Timestamps are UTC

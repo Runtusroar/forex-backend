@@ -1428,6 +1428,7 @@ class NewsRepository:
         for table, column, key in (
             ("news_detail_jobs", "state", "detail_jobs"),
             ("news_media", "download_state", "media_jobs"),
+            ("news_source_documents", "fetch_state", "source_documents"),
             ("localized_texts", "status", "translation_jobs"),
         ):
             rows = await self.db.execute_fetchall(
@@ -1443,6 +1444,8 @@ class NewsRepository:
             "news_last_listing_error",
             "news_last_detail_success",
             "news_last_detail_error",
+            "news_last_source_success",
+            "news_last_source_error",
             "news_last_translation_success",
         ):
             result[key.removeprefix("news_")] = await self.get_runtime_state(key)

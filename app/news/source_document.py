@@ -4,7 +4,6 @@ import asyncio
 import ipaddress
 import json
 import re
-import socket
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import replace
@@ -210,9 +209,21 @@ def _candidate_score(node: Node) -> int:
 
 
 async def default_resolver(host: str) -> tuple[str, ...]:
-    loop = asyncio.get_running_loop()
-    records = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    return tuple(sorted({str(record[4][0]) for record in records}))
+    addresses: set[str] = set()
+    async with httpx.AsyncClient(timeout=10) as client:
+        for record_type in ("A", "AAAA"):
+            response = await client.get(
+                "https://cloudflare-dns.com/dns-query",
+                params={"name": host, "type": record_type},
+                headers={"Accept": "application/dns-json"},
+            )
+            response.raise_for_status()
+            for answer in response.json().get("Answer", []):
+                value = str(answer.get("data", ""))
+                with suppress(ValueError):
+                    ipaddress.ip_address(value)
+                    addresses.add(value)
+    return tuple(sorted(addresses))
 
 
 async def validate_public_url(url: str, resolver: Resolver = default_resolver) -> str:
@@ -341,12 +352,25 @@ class SourceDocumentWorker:
                     blocked=True,
                     http_status=error.status_code,
                 )
+                with suppress(Exception):
+                    await self.repository.set_runtime_state(
+                        "news_last_source_error", type(error).__name__
+                    )
             except Exception as error:
                 await self.repository.fail_source_document(
                     job.document_id, error, observed, self.max_attempts
                 )
+                with suppress(Exception):
+                    await self.repository.set_runtime_state(
+                        "news_last_source_error", type(error).__name__
+                    )
             else:
                 completed += 1
+                with suppress(Exception):
+                    await self.repository.set_runtime_state(
+                        "news_last_source_success", observed.isoformat()
+                    )
+                    await self.repository.set_runtime_state("news_last_source_error", "")
             if html is not None and self.snapshot_store:
                 with suppress(Exception):
                     await self.snapshot_store.capture(

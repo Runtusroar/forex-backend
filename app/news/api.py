@@ -1,6 +1,7 @@
 import base64
 import binascii
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
@@ -125,6 +126,50 @@ def _comment(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _clean_segment_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return re.sub(
+        r"\s*(?:\.{3}|…)?\s*\(\s*full\s+story\s*\)\s*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).rstrip()
+
+
+def _source_summary(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item["source_document_id"],
+        "state": item["fetch_state"],
+        "title": {"en": item.get("source_title_en"), "zh_hans": None},
+        "author_name": item.get("source_author_name"),
+        "source_host": item.get("source_host"),
+        "published_at_source_text": item.get("source_published_at_source_text"),
+        "lead_image_url": item.get("source_lead_image_url"),
+        "has_native_content": bool(
+            item.get("fetch_state") == "complete" and item.get("source_title_en")
+        ),
+    }
+
+
+def _source_document(item: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": item["id"],
+        "state": item["fetch_state"],
+        "original_url": item["original_url"],
+        "final_url": item.get("final_url"),
+        "source_host": item.get("source_host"),
+        "title": {"en": item.get("title_en"), "zh_hans": item.get("title_zh")},
+        "author_name": item.get("author_name"),
+        "published_at_source_text": item.get("published_at_source_text"),
+        "lead_image_url": item.get("lead_image_url"),
+        "body": {"en": item.get("body_en"), "zh_hans": item.get("body_zh")},
+        "paragraphs": item.get("paragraphs", []),
+        "extraction_method": item.get("extraction_method"),
+        "last_fetched_at": item.get("last_fetched_at"),
+    }
+
+
 def create_news_router(settings: Settings, authorize: Callable[..., None]) -> APIRouter:
     router = APIRouter(prefix="/api/v2", dependencies=[Depends(authorize)])
 
@@ -201,6 +246,15 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
             },
         )
 
+    @router.get("/news/source-documents/{document_id}")
+    async def source_document(
+        document_id: int, repo: Annotated[NewsRepository, Depends(repository)]
+    ) -> dict:
+        item = await repo.source_document_data(document_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="Not found")
+        return _source_document(item)
+
     @router.get("/news/{source_id}/comments")
     async def article_comments(
         source_id: str,
@@ -245,12 +299,23 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
                             "published_at_source_text"
                         ),
                         "text": {
-                            "en": segment.get("text_en"),
+                            "en": _clean_segment_text(segment.get("text_en")),
                             "zh_hans": segment.get("text_zh"),
                         },
                         "source_url": segment.get("source_url"),
                         "is_excerpt": bool(segment.get("is_excerpt")),
                         "media": [_media(item) for item in segment["media"]],
+                        "links": [
+                            {
+                                "id": link["id"],
+                                "position": link["position"],
+                                "kind": link["link_type"],
+                                "label": link["label"],
+                                "url": link["original_url"],
+                                "source_document": _source_summary(link),
+                            }
+                            for link in segment["links"]
+                        ],
                     }
                     for segment in data["segments"]
                 ],

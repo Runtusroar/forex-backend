@@ -109,7 +109,10 @@ def parse_news_detail_v2(
             link_label = _clean(full_story.text(separator=" ", strip=True)) if full_story else None
             if full_story:
                 full_story.decompose()
-            paragraphs = [_clean_excerpt(node.text(separator=" ", strip=True)) for node in copy.css("p")]
+            paragraphs = [
+                _clean_excerpt(node.text(separator=" ", strip=True))
+                for node in copy.css("p")
+            ]
             text = "\n\n".join(value for value in paragraphs if value) or _clean_excerpt(
                 copy.text(separator=" ", strip=True)
             )

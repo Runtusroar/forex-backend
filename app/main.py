@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 
 from app.collector import BrowserSession, Collector
@@ -18,6 +19,7 @@ from app.news.compat import v1_news_detail, v1_news_list
 from app.news.media import MediaWorker
 from app.news.repository import NewsRepository
 from app.news.snapshots import SnapshotStore
+from app.news.source_document import SourceDocumentFetcher, SourceDocumentWorker
 from app.repository import Repository
 from app.runtime import BackgroundRuntime
 from app.translation import KimiTranslator
@@ -65,6 +67,7 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         database: Database | None = None
         browser: BrowserSession | None = None
         media_worker: MediaWorker | None = None
+        source_client: httpx.AsyncClient | None = None
         runtime: BackgroundRuntime | None = None
         if repository is None:
             database = Database(configured.database_path)
@@ -91,6 +94,20 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                 configured.news_media_dir,
                 configured.news_media_max_bytes,
             )
+            source_client = httpx.AsyncClient(
+                timeout=configured.news_source_timeout_seconds,
+                follow_redirects=False,
+            )
+            source_worker = SourceDocumentWorker(
+                news_repository,
+                SourceDocumentFetcher(
+                    source_client,
+                    max_bytes=configured.news_source_max_bytes,
+                    max_redirects=configured.news_source_max_redirects,
+                ),
+                max_attempts=configured.news_source_max_attempts,
+                snapshot_store=snapshot_store,
+            )
             kimi = KimiTranslator(configured)
             translator = TranslationWorker(live_repository, kimi)
             news_translator = NewsTranslationWorker(
@@ -114,6 +131,9 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
                         stop, configured.news_detail_interval_seconds
                     ),
                     media_worker.run,
+                    lambda stop: source_worker.run(
+                        stop, configured.news_source_interval_seconds
+                    ),
                     translator.run,
                     news_translator.run,
                     lambda stop: snapshot_store.run_cleanup(
@@ -128,6 +148,8 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             await runtime.stop()
         if media_worker:
             await media_worker.close()
+        if source_client:
+            await source_client.aclose()
         if browser:
             await browser.close()
         if database:

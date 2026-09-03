@@ -17,7 +17,9 @@ from app.news.models import (
     FeedObservation,
     MediaObservation,
     NewsListingBatch,
+    SegmentLinkObservation,
     SegmentObservation,
+    SourceDocumentObservation,
 )
 from app.news.repository import NewsRepository
 from app.repository import Repository
@@ -69,7 +71,15 @@ async def api(tmp_path: Path):
             "detail",
             segments=(
                 SegmentObservation("alert", 0, "social", text_en="First alert"),
-                SegmentObservation("body", 1, "article", text_en="Full story"),
+                SegmentObservation(
+                    "body", 1, "article", text_en="Publisher excerpt", is_excerpt=True
+                ),
+            ),
+            links=(
+                SegmentLinkObservation(
+                    "source-link", "body", 0, "full_story", "full story",
+                    "https://publisher.example/story",
+                ),
             ),
             media=(
                 MediaObservation(
@@ -97,6 +107,23 @@ async def api(tmp_path: Path):
     media_path.write_bytes(b"\x89PNG\r\n\x1a\nimage")
     await news.complete_media_job(
         media_job.media_id, str(media_path), "image/png", media_path.stat().st_size, "abc"
+    )
+    source_job = (await news.claim_source_document_jobs(1, NOW))[0]
+    await news.complete_source_document(
+        source_job.document_id,
+        SourceDocumentObservation(
+            original_url=source_job.original_url,
+            final_url="https://publisher.example/story-final",
+            source_host="publisher.example",
+            title_en="Publisher headline",
+            body_en="First paragraph.\n\nSecond paragraph.",
+            paragraphs=("First paragraph.", "Second paragraph."),
+            fetched_at=NOW,
+            extraction_method="json_ld",
+            author_name="Alex Smith",
+            published_at_source_text="2026-09-03T10:00:00Z",
+            lead_image_url="https://publisher.example/lead.jpg",
+        ),
     )
     app = create_app(settings, repository=legacy)
     client = httpx.AsyncClient(
@@ -141,12 +168,27 @@ async def test_detail_comments_and_media_contract(api: httpx.AsyncClient) -> Non
     media = await api.get(f"/api/v2/news/media/{media_id}", headers=headers)
 
     assert [segment["position"] for segment in detail.json()["segments"]] == [0, 1]
+    source_link = detail.json()["segments"][1]["links"][0]
+    assert source_link["kind"] == "full_story"
+    assert source_link["url"] == "https://publisher.example/story"
+    assert source_link["source_document"]["state"] == "complete"
+    assert "full story" not in detail.json()["segments"][1]["text"]["en"].lower()
     assert "local_path" not in detail.text
     assert detail.json()["comments_complete"] is False
     assert comments.json()["items"][0]["parent_comment_id"] is None
     assert media.status_code == 200
     assert media.headers["content-type"] == "image/png"
     assert media.headers["etag"] == '"abc"'
+
+    source = await api.get(
+        f"/api/v2/news/source-documents/{source_link['source_document']['id']}",
+        headers=headers,
+    )
+    assert source.status_code == 200
+    assert source.json()["title"] == {"en": "Publisher headline", "zh_hans": None}
+    assert source.json()["body"]["en"] == "First paragraph.\n\nSecond paragraph."
+    assert source.json()["original_url"] == "https://publisher.example/story"
+    assert "paragraphs_json" not in source.text
 
 
 async def test_invalid_section_cursor_and_missing_article(api: httpx.AsyncClient) -> None:
@@ -171,9 +213,9 @@ async def test_v1_news_is_derived_from_v2_during_client_migration(
     detail = await api.get("/api/v1/news/100", headers=headers)
 
     assert listing.json()["items"][0]["title_en"] == "Yen rises"
-    assert listing.json()["items"][0]["body_en"] == "First alert\n\nFull story"
+    assert listing.json()["items"][0]["body_en"] == "First alert\n\nPublisher excerpt"
     assert detail.json()["title_zh"] == "日元上涨"
-    assert detail.json()["body_en"] == "First alert\n\nFull story"
+    assert detail.json()["body_en"] == "First alert\n\nPublisher excerpt"
     assert "local_path" not in detail.text
 
 
@@ -185,6 +227,7 @@ async def test_status_exposes_schema_queues_and_sanitized_collector_state(
     )
 
     assert response.status_code == 200
-    assert response.json()["schema_version"] == 2
+    assert response.json()["schema_version"] == 3
     assert "detail_jobs" in response.json()
+    assert response.json()["source_documents"] == {"complete": 1}
     assert response.json()["last_listing_error"] is None
