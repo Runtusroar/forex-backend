@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from app.db import Database
+from app.db import SCHEMA, Database
+from app.migrations import MIGRATION_2, MIGRATION_3
 
 
 async def _table_names(database: Database) -> set[str]:
@@ -30,7 +31,6 @@ async def test_migration_creates_news_v2_without_losing_calendar(tmp_path: Path)
         "news_feed_events",
         "news_segments",
         "news_segment_links",
-        "news_source_documents",
         "news_media",
         "news_comments",
         "news_comment_feed",
@@ -38,22 +38,27 @@ async def test_migration_creates_news_v2_without_losing_calendar(tmp_path: Path)
         "news_detail_jobs",
         "source_snapshots",
     } <= names
-    assert version[0]["value"] == "3"
+    assert "news_source_documents" not in names
+    assert version[0]["value"] == "4"
+    columns = await database.connection.execute_fetchall("PRAGMA table_info(news_segments)")
+    assert {row["name"] for row in columns} >= {
+        "display_mode",
+        "max_lines",
+        "external_action_label",
+    }
     await database.close()
 
 
-async def test_v3_migration_seeds_full_story_documents_from_v2_segments(
+async def test_v2_upgrade_preserves_full_story_link_without_publisher_document(
     tmp_path: Path,
 ) -> None:
     database = Database(tmp_path / "db.sqlite3")
     await database.open()
-    await database.initialize()
     assert database.connection is not None
+    await database.connection.executescript(SCHEMA)
+    await database.connection.executescript(MIGRATION_2)
     await database.connection.executescript(
         """
-        DROP TABLE news_segment_links;
-        DROP TABLE news_source_documents;
-        UPDATE runtime_state SET value='2' WHERE key='schema_version';
         INSERT INTO news_articles (
           source_id,ff_url,title_en,source_hash,first_seen_at,last_seen_at,updated_at
         ) VALUES (
@@ -74,18 +79,91 @@ async def test_v3_migration_seeds_full_story_documents_from_v2_segments(
 
     await database.initialize()
 
-    documents = await database.connection.execute_fetchall(
-        "SELECT original_url,fetch_state FROM news_source_documents"
+    names = await _table_names(database)
+    links = await database.connection.execute_fetchall(
+        "SELECT link_type,label,original_url FROM news_segment_links"
+    )
+    assert "news_source_documents" not in names
+    assert [tuple(row) for row in links] == [
+        ("full_story", "full story", "https://publisher.example/story")
+    ]
+    await database.close()
+
+
+async def test_v3_upgrade_removes_source_documents_and_their_translations(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    await database.open()
+    assert database.connection is not None
+    await database.connection.executescript(SCHEMA)
+    await database.connection.executescript(MIGRATION_2)
+    await database.connection.executescript(MIGRATION_3)
+    await database.connection.executescript(
+        """
+        INSERT INTO news_articles (
+          source_id,ff_url,title_en,source_hash,first_seen_at,last_seen_at,updated_at
+        ) VALUES (
+          '9003','https://www.forexfactory.com/news/9003','Title','article-hash',
+          '2026-09-03T00:00:00Z','2026-09-03T00:00:00Z','2026-09-03T00:00:00Z'
+        );
+        INSERT INTO news_segments (
+          article_id,stable_key,position,segment_type,text_en,source_url,is_excerpt,
+          source_hash,first_seen_at,last_seen_at,updated_at
+        ) VALUES (
+          '9003','body',0,'article','Forex Factory excerpt...',
+          'https://publisher.example/story',1,'segment-hash',
+          '2026-09-03T00:00:00Z','2026-09-03T00:00:00Z','2026-09-03T00:00:00Z'
+        );
+        INSERT INTO news_source_documents (
+          original_url,title_en,body_en,fetch_state,attempts,next_attempt_at,
+          first_seen_at,updated_at
+        ) VALUES (
+          'https://publisher.example/story','Publisher title','Publisher body','complete',0,
+          '2026-09-03T00:00:00Z','2026-09-03T00:00:00Z','2026-09-03T00:00:00Z'
+        );
+        INSERT INTO news_segment_links (
+          article_id,segment_id,source_document_id,stable_key,position,link_type,label,
+          original_url,is_current,first_seen_at,last_seen_at
+        ) SELECT '9003',s.id,d.id,'full-story',0,'full_story','full story',
+                 d.original_url,1,'2026-09-03T00:00:00Z','2026-09-03T00:00:00Z'
+          FROM news_segments s, news_source_documents d
+          WHERE s.article_id='9003';
+        INSERT INTO localized_texts (
+          entity_type,entity_id,field_name,language,source_hash,translated_text,
+          status,attempts,created_at,updated_at
+        ) VALUES (
+          'source_document','1','body','zh-Hans','publisher-hash','来源站全文','done',0,
+          '2026-09-03T00:00:00Z','2026-09-03T00:00:00Z'
+        );
+        """
+    )
+
+    await database.initialize()
+
+    names = await _table_names(database)
+    version = await database.connection.execute_fetchall(
+        "SELECT value FROM runtime_state WHERE key='schema_version'"
+    )
+    segment = await database.connection.execute_fetchall(
+        """SELECT text_en,display_mode,max_lines,external_action_label
+           FROM news_segments WHERE article_id='9003'"""
     )
     links = await database.connection.execute_fetchall(
         "SELECT link_type,label,original_url FROM news_segment_links"
     )
-    assert [tuple(row) for row in documents] == [
-        ("https://publisher.example/story", "pending")
+    source_translations = await database.connection.execute_fetchall(
+        "SELECT id FROM localized_texts WHERE entity_type='source_document'"
+    )
+    assert version[0]["value"] == "4"
+    assert "news_source_documents" not in names
+    assert [tuple(row) for row in segment] == [
+        ("Forex Factory excerpt...", "full", None, None)
     ]
     assert [tuple(row) for row in links] == [
         ("full_story", "full story", "https://publisher.example/story")
     ]
+    assert source_translations == []
     await database.close()
 
 

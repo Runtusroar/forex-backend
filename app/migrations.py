@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import aiosqlite
 
-LATEST_SCHEMA_VERSION = 3
+LATEST_SCHEMA_VERSION = 4
 
 MIGRATION_2 = """
 BEGIN IMMEDIATE;
@@ -277,6 +277,53 @@ ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 COMMIT;
 """
 
+MIGRATION_4 = """
+BEGIN IMMEDIATE;
+
+ALTER TABLE news_segments
+  ADD COLUMN display_mode TEXT NOT NULL DEFAULT 'full'
+    CHECK (display_mode IN ('full','clamped'));
+ALTER TABLE news_segments ADD COLUMN max_lines INTEGER CHECK (max_lines > 0);
+ALTER TABLE news_segments ADD COLUMN external_action_label TEXT;
+
+CREATE TABLE news_segment_links_v4 (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  article_id TEXT NOT NULL REFERENCES news_articles(source_id) ON DELETE CASCADE,
+  segment_id INTEGER NOT NULL REFERENCES news_segments(id) ON DELETE CASCADE,
+  stable_key TEXT NOT NULL,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  link_type TEXT NOT NULL CHECK (link_type IN ('full_story')),
+  label TEXT NOT NULL,
+  original_url TEXT NOT NULL,
+  is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0,1)),
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(article_id,stable_key)
+);
+
+INSERT INTO news_segment_links_v4 (
+  id,article_id,segment_id,stable_key,position,link_type,label,original_url,
+  is_current,first_seen_at,last_seen_at
+)
+SELECT id,article_id,segment_id,stable_key,position,link_type,label,original_url,
+       is_current,first_seen_at,last_seen_at
+FROM news_segment_links;
+
+DROP TABLE news_segment_links;
+ALTER TABLE news_segment_links_v4 RENAME TO news_segment_links;
+CREATE INDEX idx_news_segment_links_order
+  ON news_segment_links(segment_id,is_current,position,id);
+
+DELETE FROM localized_texts WHERE entity_type='source_document';
+DELETE FROM source_snapshots WHERE page_type='source';
+DROP TABLE news_source_documents;
+
+INSERT INTO runtime_state(key,value) VALUES ('schema_version','4')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+COMMIT;
+"""
+
 
 async def migrate(connection: aiosqlite.Connection) -> None:
     rows = await connection.execute_fetchall(
@@ -288,3 +335,6 @@ async def migrate(connection: aiosqlite.Connection) -> None:
         version = 2
     if version < 3:
         await connection.executescript(MIGRATION_3)
+        version = 3
+    if version < 4:
+        await connection.executescript(MIGRATION_4)
