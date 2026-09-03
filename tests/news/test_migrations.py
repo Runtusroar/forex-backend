@@ -29,6 +29,8 @@ async def test_migration_creates_news_v2_without_losing_calendar(tmp_path: Path)
         "news_feed_placements",
         "news_feed_events",
         "news_segments",
+        "news_segment_links",
+        "news_source_documents",
         "news_media",
         "news_comments",
         "news_comment_feed",
@@ -36,7 +38,54 @@ async def test_migration_creates_news_v2_without_losing_calendar(tmp_path: Path)
         "news_detail_jobs",
         "source_snapshots",
     } <= names
-    assert version[0]["value"] == "2"
+    assert version[0]["value"] == "3"
+    await database.close()
+
+
+async def test_v3_migration_seeds_full_story_documents_from_v2_segments(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "db.sqlite3")
+    await database.open()
+    await database.initialize()
+    assert database.connection is not None
+    await database.connection.executescript(
+        """
+        DROP TABLE news_segment_links;
+        DROP TABLE news_source_documents;
+        UPDATE runtime_state SET value='2' WHERE key='schema_version';
+        INSERT INTO news_articles (
+          source_id,ff_url,title_en,source_hash,first_seen_at,last_seen_at,updated_at
+        ) VALUES (
+          '9002','https://www.forexfactory.com/news/9002','A title','article-hash',
+          '2026-09-03T00:00:00Z','2026-09-03T00:00:00Z','2026-09-03T00:00:00Z'
+        );
+        INSERT INTO news_segments (
+          article_id,stable_key,position,segment_type,text_en,source_url,is_excerpt,
+          source_hash,first_seen_at,last_seen_at,updated_at
+        ) VALUES (
+          '9002','body',0,'article','Excerpt ... ( full story )',
+          'https://publisher.example/story',1,'segment-hash',
+          '2026-09-03T00:00:00Z','2026-09-03T00:00:00Z','2026-09-03T00:00:00Z'
+        );
+        """
+    )
+    await database.connection.commit()
+
+    await database.initialize()
+
+    documents = await database.connection.execute_fetchall(
+        "SELECT original_url,fetch_state FROM news_source_documents"
+    )
+    links = await database.connection.execute_fetchall(
+        "SELECT link_type,label,original_url FROM news_segment_links"
+    )
+    assert [tuple(row) for row in documents] == [
+        ("https://publisher.example/story", "pending")
+    ]
+    assert [tuple(row) for row in links] == [
+        ("full_story", "full story", "https://publisher.example/story")
+    ]
     await database.close()
 
 

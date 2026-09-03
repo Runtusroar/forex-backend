@@ -12,7 +12,9 @@ from app.news.models import (
     FeedObservation,
     MediaObservation,
     NewsListingBatch,
+    SegmentLinkObservation,
     SegmentObservation,
+    SourceDocumentObservation,
 )
 from app.news.repository import NewsRepository
 
@@ -182,6 +184,93 @@ async def test_detail_persists_media_and_comments(news_repository: NewsRepositor
         ("1416149", "https://assets.example/chart.png")
     ]
     assert await news_repository.comment_count("1416149") == 1
+
+
+async def test_detail_link_enqueues_and_keeps_publisher_document_separate(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch())
+    segment = SegmentObservation(
+        "body", 0, "article", text_en="Forex Factory excerpt", is_excerpt=True
+    )
+    link = SegmentLinkObservation(
+        "full-story", "body", 0, "full_story", "full story",
+        "https://publisher.example/story",
+    )
+    await news_repository.replace_detail(
+        "1416149",
+        DetailObservation(
+            "1416149", NOW, "detail-1", segments=(segment,), links=(link,)
+        ),
+    )
+
+    jobs = await news_repository.claim_source_document_jobs(1, NOW)
+    assert [(job.original_url, job.attempts) for job in jobs] == [
+        ("https://publisher.example/story", 0)
+    ]
+    await news_repository.complete_source_document(
+        jobs[0].document_id,
+        SourceDocumentObservation(
+            original_url=jobs[0].original_url,
+            final_url="https://publisher.example/story-final",
+            source_host="publisher.example",
+            title_en="Publisher headline",
+            body_en="First paragraph.\n\nSecond paragraph.",
+            paragraphs=("First paragraph.", "Second paragraph."),
+            fetched_at=NOW,
+            extraction_method="json_ld",
+        ),
+    )
+
+    detail = await news_repository.detail_data("1416149")
+    assert detail is not None
+    assert detail["segments"][0]["text_en"] == "Forex Factory excerpt"
+    assert detail["segments"][0]["links"][0]["original_url"] == (
+        "https://publisher.example/story"
+    )
+    document = await news_repository.source_document_data(jobs[0].document_id)
+    assert document is not None
+    assert document["body_en"] == "First paragraph.\n\nSecond paragraph."
+    assert document["fetch_state"] == "complete"
+
+
+async def test_source_document_failure_retries_without_erasing_good_content(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch())
+    segment = SegmentObservation("body", 0, "article", text_en="Excerpt", is_excerpt=True)
+    link = SegmentLinkObservation(
+        "full-story", "body", 0, "full_story", "full story",
+        "https://publisher.example/story",
+    )
+    await news_repository.replace_detail(
+        "1416149",
+        DetailObservation("1416149", NOW, "detail", segments=(segment,), links=(link,)),
+    )
+    first = (await news_repository.claim_source_document_jobs(1, NOW))[0]
+    await news_repository.complete_source_document(
+        first.document_id,
+        SourceDocumentObservation(
+            original_url=first.original_url,
+            final_url=first.original_url,
+            source_host="publisher.example",
+            title_en="Good",
+            body_en="Good body that must remain available.",
+            paragraphs=("Good body that must remain available.",),
+            fetched_at=NOW,
+            extraction_method="dom",
+        ),
+    )
+    await news_repository.schedule_source_document_refresh(first.document_id, NOW)
+    refreshed = (await news_repository.claim_source_document_jobs(1, NOW))[0]
+    await news_repository.fail_source_document(
+        refreshed.document_id, TimeoutError("publisher unavailable"), NOW, max_attempts=3
+    )
+
+    stored = await news_repository.source_document_data(first.document_id)
+    assert stored is not None
+    assert stored["body_en"] == "Good body that must remain available."
+    assert stored["fetch_state"] == "pending"
 
 
 async def test_concurrent_listing_transactions_are_serialized(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import aiosqlite
 
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 MIGRATION_2 = """
 BEGIN IMMEDIATE;
@@ -205,11 +205,86 @@ ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 COMMIT;
 """
 
+MIGRATION_3 = """
+BEGIN IMMEDIATE;
+
+CREATE TABLE IF NOT EXISTS news_source_documents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  original_url TEXT NOT NULL UNIQUE,
+  final_url TEXT,
+  source_host TEXT,
+  title_en TEXT,
+  author_name TEXT,
+  published_at_source_text TEXT,
+  lead_image_url TEXT,
+  paragraphs_json TEXT,
+  body_en TEXT,
+  extraction_method TEXT,
+  content_hash TEXT,
+  fetch_state TEXT NOT NULL DEFAULT 'pending'
+    CHECK (fetch_state IN ('pending','processing','complete','blocked','failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL,
+  claimed_at TEXT,
+  http_status INTEGER,
+  last_error TEXT,
+  first_seen_at TEXT NOT NULL,
+  last_fetched_at TEXT,
+  updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_news_source_documents_ready
+  ON news_source_documents(fetch_state,next_attempt_at,id);
+
+CREATE TABLE IF NOT EXISTS news_segment_links (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  article_id TEXT NOT NULL REFERENCES news_articles(source_id) ON DELETE CASCADE,
+  segment_id INTEGER NOT NULL REFERENCES news_segments(id) ON DELETE CASCADE,
+  source_document_id INTEGER NOT NULL
+    REFERENCES news_source_documents(id) ON DELETE RESTRICT,
+  stable_key TEXT NOT NULL,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  link_type TEXT NOT NULL CHECK (link_type IN ('full_story')),
+  label TEXT NOT NULL,
+  original_url TEXT NOT NULL,
+  is_current INTEGER NOT NULL DEFAULT 1 CHECK (is_current IN (0,1)),
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  UNIQUE(article_id,stable_key)
+);
+CREATE INDEX IF NOT EXISTS idx_news_segment_links_order
+  ON news_segment_links(segment_id,is_current,position,id);
+
+INSERT OR IGNORE INTO news_source_documents (
+  original_url,fetch_state,attempts,next_attempt_at,first_seen_at,updated_at
+)
+SELECT DISTINCT source_url,'pending',0,first_seen_at,first_seen_at,updated_at
+FROM news_segments
+WHERE is_excerpt=1 AND source_url IS NOT NULL AND source_url!='';
+
+INSERT OR IGNORE INTO news_segment_links (
+  article_id,segment_id,source_document_id,stable_key,position,link_type,label,
+  original_url,is_current,first_seen_at,last_seen_at
+)
+SELECT s.article_id,s.id,d.id,'legacy-' || s.id,0,'full_story','full story',
+       s.source_url,s.is_current,s.first_seen_at,s.last_seen_at
+FROM news_segments s
+JOIN news_source_documents d ON d.original_url=s.source_url
+WHERE s.is_excerpt=1 AND s.source_url IS NOT NULL AND s.source_url!='';
+
+INSERT INTO runtime_state(key,value) VALUES ('schema_version','3')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+COMMIT;
+"""
+
 
 async def migrate(connection: aiosqlite.Connection) -> None:
     rows = await connection.execute_fetchall(
         "SELECT value FROM runtime_state WHERE key='schema_version'"
     )
     version = int(rows[0]["value"]) if rows else 1
-    if version < LATEST_SCHEMA_VERSION:
+    if version < 2:
         await connection.executescript(MIGRATION_2)
+        version = 2
+    if version < 3:
+        await connection.executescript(MIGRATION_3)

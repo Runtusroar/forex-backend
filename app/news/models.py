@@ -145,6 +145,29 @@ class MediaJob:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceDocumentJob:
+    document_id: int
+    original_url: str
+    attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class SourceDocumentObservation:
+    original_url: str
+    final_url: str
+    source_host: str
+    title_en: str
+    body_en: str
+    paragraphs: tuple[str, ...]
+    fetched_at: datetime
+    extraction_method: str
+    author_name: str | None = None
+    published_at_source_text: str | None = None
+    lead_image_url: str | None = None
+    http_status: int = 200
+
+
+@dataclass(frozen=True, slots=True)
 class CachedMedia:
     media_id: int
     path: Path
