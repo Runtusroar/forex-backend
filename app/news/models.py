@@ -10,6 +10,7 @@ CategorySlug = Literal["fundamental", "technical", "industry", "entertainment", 
 FeedType = Literal["latest", "hot"]
 SegmentType = Literal["article", "social", "update", "quote", "link"]
 SegmentLinkType = Literal["full_story"]
+SegmentDisplayMode = Literal["full", "clamped"]
 MediaType = Literal["image", "chart", "attachment"]
 
 
@@ -73,6 +74,9 @@ class SegmentObservation:
     published_at_source_text: str | None = None
     source_url: str | None = None
     is_excerpt: bool = False
+    display_mode: SegmentDisplayMode = "full"
+    max_lines: int | None = None
+    external_action_label: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

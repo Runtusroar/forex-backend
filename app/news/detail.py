@@ -24,10 +24,6 @@ def _clean(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _clean_excerpt(value: str) -> str:
-    return re.sub(r"(?:\s*(?:\.{3}|…))+\s*$", "", _clean(value)).rstrip()
-
-
 def _key(*values: str | None) -> str:
     return hashlib.sha256("\n".join(value or "" for value in values).encode()).hexdigest()
 
@@ -77,6 +73,7 @@ def parse_news_detail_v2(
         full_story = None
         link_label = None
         social = article.css_first(".x-twitter-post-preview__text")
+        truth_social = article.css_first(".truthsocial-post__content")
         if social:
             text = _clean(social.text(separator=" ", strip=True))
             author = article.css_first(".x-twitter-post-preview__name")
@@ -96,6 +93,37 @@ def parse_news_detail_v2(
                 published_at_source_text=source_time,
                 source_url=source_url,
             )
+        elif truth_social:
+            text = _clean(truth_social.text(separator=" ", strip=True))
+            author = article.css_first(".truthsocial-post__display-name")
+            username = article.css_first(".truthsocial-post__username")
+            handle = None
+            if username:
+                handle = _clean(username.text(separator=" ", strip=True)).split("·", 1)[0].strip()
+            body_link = article.css_first(".truthsocial-post > a[href]")
+            source_url = body_link.attributes.get("href") if body_link else None
+            time_node = article.css_first(".truthsocial-post__username span[title]")
+            source_time = time_node.attributes.get("title") if time_node else None
+            classes = article.css_first(".truthsocial-post")
+            is_clamped = bool(
+                classes
+                and "truthsocial-post--show-more"
+                in classes.attributes.get("class", "").split()
+            )
+            segment = SegmentObservation(
+                stable_key=_key("social", source_url, text),
+                position=position,
+                segment_type="social",
+                text_en=text,
+                author_name=_clean(author.text(strip=True)) if author else None,
+                author_handle=handle or None,
+                published_at=_published(source_time, source_timezone),
+                published_at_source_text=source_time,
+                source_url=source_url,
+                display_mode="clamped" if is_clamped else "full",
+                max_lines=10 if is_clamped else None,
+                external_action_label="Show More" if is_clamped else None,
+            )
         else:
             copy = article.css_first(".news__copy")
             if not copy:
@@ -110,10 +138,10 @@ def parse_news_detail_v2(
             if full_story:
                 full_story.decompose()
             paragraphs = [
-                _clean_excerpt(node.text(separator=" ", strip=True))
+                _clean(node.text(separator=" ", strip=True))
                 for node in copy.css("p")
             ]
-            text = "\n\n".join(value for value in paragraphs if value) or _clean_excerpt(
+            text = "\n\n".join(value for value in paragraphs if value) or _clean(
                 copy.text(separator=" ", strip=True)
             )
             segment = SegmentObservation(

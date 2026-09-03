@@ -5,6 +5,9 @@ from zoneinfo import ZoneInfo
 from app.news.detail import parse_news_detail_v2
 
 HTML = (Path(__file__).parents[1] / "fixtures/news_v2/detail_alloy.html").read_text()
+TRUTH_SOCIAL_HTML = (
+    Path(__file__).parents[1] / "fixtures/news_v2/detail_truth_social.html"
+).read_text()
 NOW = datetime(2026, 9, 3, tzinfo=UTC)
 
 
@@ -21,7 +24,7 @@ def test_all_article_nodes_become_ordered_segments() -> None:
 def test_full_story_anchor_is_structured_and_not_flattened_into_prose() -> None:
     detail = parse_news_detail_v2(HTML, "100", NOW, ZoneInfo("Asia/Shanghai"))
 
-    assert detail.segments[2].text_en == "Full Forex Factory excerpt"
+    assert detail.segments[2].text_en == "Full Forex Factory excerpt..."
     assert [
         (link.kind, link.label, link.url, link.segment_key, link.position)
         for link in detail.links
@@ -34,6 +37,29 @@ def test_full_story_anchor_is_structured_and_not_flattened_into_prose() -> None:
             0,
         )
     ]
+
+
+def test_truth_social_show_more_preserves_ff_text_and_presentation() -> None:
+    detail = parse_news_detail_v2(
+        TRUTH_SOCIAL_HTML, "101", NOW, ZoneInfo("Asia/Shanghai")
+    )
+
+    assert len(detail.segments) == 2
+    social = detail.segments[1]
+    assert social.segment_type == "social"
+    assert social.author_name == "Donald J. Trump"
+    assert social.author_handle == "@realDonaldTrump"
+    assert social.published_at_source_text == "Sep 3, 2026 10:56pm"
+    assert social.source_url == (
+        "https://truthsocial.com/@realDonaldTrump/117207687594983323"
+    )
+    assert social.text_en == (
+        "For the treasonous SCUM that refuses to accurately report on our Military "
+        "Operation in Iran, we have virtually unlimited amounts of ammunition."
+    )
+    assert social.display_mode == "clamped"
+    assert social.max_lines == 10
+    assert social.external_action_label == "Show More"
 
 
 def test_content_media_and_nested_comments_are_preserved() -> None:
