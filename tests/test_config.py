@@ -27,6 +27,11 @@ def test_settings_have_mvp_defaults(tmp_path: Path) -> None:
     assert settings.news_media_dir == Path("data/media")
     assert settings.news_media_max_bytes == 10_485_760
     assert settings.news_backfill_days == 30
+    assert not hasattr(settings, "news_source_interval_seconds")
+    assert not hasattr(settings, "news_source_timeout_seconds")
+    assert not hasattr(settings, "news_source_max_bytes")
+    assert not hasattr(settings, "news_source_max_redirects")
+    assert not hasattr(settings, "news_source_max_attempts")
 
 
 def test_interval_must_be_positive(tmp_path: Path) -> None:

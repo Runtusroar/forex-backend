@@ -14,11 +14,6 @@ class Settings(BaseSettings):
     news_source_timezone: str = "Asia/Shanghai"
     news_detail_interval_seconds: int = Field(default=2, gt=0)
     news_detail_max_attempts: int = Field(default=8, gt=0)
-    news_source_interval_seconds: int = Field(default=5, gt=0)
-    news_source_timeout_seconds: float = Field(default=20, gt=0)
-    news_source_max_bytes: int = Field(default=2_000_000, gt=0)
-    news_source_max_redirects: int = Field(default=5, ge=0, le=10)
-    news_source_max_attempts: int = Field(default=5, gt=0)
     news_snapshot_dir: Path = Path("data/snapshots")
     news_snapshot_retention_days: int = Field(default=30, gt=0)
     news_media_dir: Path = Path("data/media")

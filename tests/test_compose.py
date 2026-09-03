@@ -48,11 +48,11 @@ def test_api_receives_all_news_worker_settings_under_persistent_data() -> None:
     assert "NEWS_SOURCE_TIMEZONE: ${NEWS_SOURCE_TIMEZONE:-Asia/Shanghai}" in compose
     assert "NEWS_DETAIL_INTERVAL_SECONDS: ${NEWS_DETAIL_INTERVAL_SECONDS:-2}" in compose
     assert "NEWS_DETAIL_MAX_ATTEMPTS: ${NEWS_DETAIL_MAX_ATTEMPTS:-8}" in compose
-    assert "NEWS_SOURCE_INTERVAL_SECONDS: ${NEWS_SOURCE_INTERVAL_SECONDS:-5}" in compose
-    assert "NEWS_SOURCE_TIMEOUT_SECONDS: ${NEWS_SOURCE_TIMEOUT_SECONDS:-20}" in compose
-    assert "NEWS_SOURCE_MAX_BYTES: ${NEWS_SOURCE_MAX_BYTES:-2000000}" in compose
-    assert "NEWS_SOURCE_MAX_REDIRECTS: ${NEWS_SOURCE_MAX_REDIRECTS:-5}" in compose
-    assert "NEWS_SOURCE_MAX_ATTEMPTS: ${NEWS_SOURCE_MAX_ATTEMPTS:-5}" in compose
+    assert "NEWS_SOURCE_INTERVAL_SECONDS" not in compose
+    assert "NEWS_SOURCE_TIMEOUT_SECONDS" not in compose
+    assert "NEWS_SOURCE_MAX_BYTES" not in compose
+    assert "NEWS_SOURCE_MAX_REDIRECTS" not in compose
+    assert "NEWS_SOURCE_MAX_ATTEMPTS" not in compose
     assert "NEWS_SNAPSHOT_DIR: /app/data/snapshots" in compose
     assert "NEWS_SNAPSHOT_RETENTION_DAYS: ${NEWS_SNAPSHOT_RETENTION_DAYS:-30}" in compose
     assert "NEWS_MEDIA_DIR: /app/data/media" in compose
