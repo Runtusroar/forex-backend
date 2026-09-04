@@ -158,6 +158,23 @@ def test_calendar_detail_accepts_history_values_with_empty_class() -> None:
     assert detail.history[1].actual_state == "better"
 
 
+def test_calendar_detail_accepts_empty_class_inside_impact_cell() -> None:
+    html = fixture("calendar_detail.html").replace(
+        '<span title="Low Impact Expected" class="icon icon--ff-impact-yel"></span>',
+        '<span class=""></span>'
+        '<span title="Low Impact Expected" class="icon icon--ff-impact-yel"></span>',
+        1,
+    )
+
+    detail = parse_calendar_detail(
+        html,
+        "149673",
+        datetime(2026, 8, 31, 12, tzinfo=UTC),
+    )
+
+    assert detail.impact == "low"
+
+
 def test_news_relative_age_does_not_change_translatable_data() -> None:
     html = fixture("news.html")
     now = datetime(2026, 9, 1, 12, tzinfo=UTC)

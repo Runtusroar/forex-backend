@@ -36,7 +36,9 @@ def _absolute_url(value: str | None) -> str | None:
 
 def _impact(node: Node) -> str:
     impact = node.css_first(".calendar__impact")
-    classes = " ".join(child.attributes.get("class", "") for child in impact.css("*") if impact)
+    classes = " ".join(
+        child.attributes.get("class") or "" for child in impact.css("*") if impact
+    )
     if "red" in classes:
         return "high"
     if "ora" in classes:
