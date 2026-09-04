@@ -131,6 +131,7 @@ async def test_top_contracts_keeps_usdt_perpetuals_ranked_by_quote_volume() -> N
     assert contracts[0].volume == 50_000.0
     assert contracts[0].volatility_percent == 15.0
     assert contracts[0].contract_type == "PERPETUAL"
+    assert contracts[0].market_type == "crypto"
     assert contracts[0].status == "TRADING"
     assert contracts[0].base_asset == "ETH"
     assert contracts[0].quote_asset == "USDT"

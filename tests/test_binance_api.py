@@ -21,6 +21,7 @@ class StubBinanceMarket:
                 symbol="BTCUSDT",
                 pair="BTCUSDT",
                 contract_type="PERPETUAL",
+                market_type="crypto",
                 status="TRADING",
                 base_asset="BTC",
                 quote_asset="USDT",
@@ -71,6 +72,7 @@ async def test_top_contracts_endpoint_returns_binance_contracts(tmp_path: Path) 
                 "symbol": "BTCUSDT",
                 "pair": "BTCUSDT",
                 "contract_type": "PERPETUAL",
+                "market_type": "crypto",
                 "status": "TRADING",
                 "base_asset": "BTC",
                 "quote_asset": "USDT",
@@ -91,6 +93,34 @@ async def test_top_contracts_endpoint_returns_binance_contracts(tmp_path: Path) 
         ],
         "generated_at": response.json()["generated_at"],
     }
+
+
+async def test_top_contracts_endpoint_filters_traditional_market_type(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_path=tmp_path / "api.sqlite3",
+        app_api_key="api-secret",
+        moonshot_api_key="kimi-secret",
+    )
+    database = Database(settings.database_path)
+    await database.open()
+    await database.initialize()
+    market = StubBinanceMarket()
+    transport = httpx.ASGITransport(
+        app=create_app(settings, repository=Repository(database), binance_market=market)
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/api/v1/binance/futures/top-contracts?limit=20&market_type=traditional",
+            headers={"X-API-Key": "api-secret"},
+        )
+    await database.close()
+
+    assert response.status_code == 200, response.text
+    assert response.json()["items"] == []
 
 
 async def test_top_contracts_endpoint_requires_api_key(tmp_path: Path) -> None:

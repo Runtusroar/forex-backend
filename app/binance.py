@@ -19,6 +19,7 @@ class BinanceFuturesContract:
     symbol: str
     pair: str
     contract_type: str
+    market_type: str
     status: str
     base_asset: str
     quote_asset: str
@@ -130,6 +131,7 @@ class BinanceFuturesMarket:
             symbol=symbol,
             pair=str(meta.get("pair") or symbol),
             contract_type=str(meta.get("contractType") or ""),
+            market_type="crypto",
             status=str(meta.get("status") or ""),
             base_asset=str(meta.get("baseAsset") or ""),
             quote_asset=str(meta.get("quoteAsset") or ""),
