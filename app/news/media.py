@@ -24,16 +24,16 @@ class MediaDownloadError(Exception):
     pass
 
 
-def _matches_signature(mime_type: str, header: bytes) -> bool:
-    if mime_type == "image/png":
-        return header.startswith(b"\x89PNG\r\n\x1a\n")
-    if mime_type == "image/jpeg":
-        return header.startswith(b"\xff\xd8\xff")
-    if mime_type == "image/webp":
-        return header.startswith(b"RIFF") and header[8:12] == b"WEBP"
-    if mime_type == "image/gif":
-        return header.startswith((b"GIF87a", b"GIF89a"))
-    return False
+def _mime_type_from_signature(header: bytes) -> str | None:
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if header.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return "image/webp"
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    return None
 
 
 class MediaWorker:
@@ -81,8 +81,8 @@ class MediaWorker:
         try:
             async with self.client.stream("GET", job.original_url) as response:
                 response.raise_for_status()
-                mime_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-                if mime_type not in ALLOWED_TYPES:
+                declared_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                if declared_type not in ALLOWED_TYPES:
                     raise MediaDownloadError("unsupported response content type")
                 content_length = response.headers.get("content-length")
                 if content_length:
@@ -110,8 +110,9 @@ class MediaWorker:
                         output.write(chunk)
                     output.flush()
                     os.fsync(output.fileno())
-                if not byte_size or not _matches_signature(mime_type, bytes(header)):
-                    raise MediaDownloadError("response bytes do not match content type")
+                mime_type = _mime_type_from_signature(bytes(header))
+                if not byte_size or mime_type not in ALLOWED_TYPES:
+                    raise MediaDownloadError("response bytes do not match supported image type")
 
             sha256 = digest.hexdigest()
             existing = await self.repository.completed_media_by_hash(sha256)

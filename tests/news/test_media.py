@@ -20,6 +20,7 @@ from app.news.repository import NewsRepository
 
 NOW = datetime(2026, 9, 3, tzinfo=UTC)
 PNG = b"\x89PNG\r\n\x1a\n" + b"image bytes"
+WEBP = b"RIFF\x10\x00\x00\x00WEBP" + b"image bytes"
 
 
 class ChunkStream(httpx.AsyncByteStream):
@@ -83,6 +84,29 @@ async def test_valid_image_is_cached_with_content_hash_name(
     assert cached is not None
     assert cached.path.read_bytes() == PNG
     assert cached.path.name == f"{cached.sha256}.png"
+
+
+@respx.mock
+async def test_mislabeled_forex_factory_asset_is_cached_by_byte_signature(
+    media_repository: NewsRepository, tmp_path: Path
+) -> None:
+    url = "https://assets.faireconomy.media/nfs/public/5/2/3/4/7/7/2/5234772.png"
+    await add_media(media_repository, url)
+    respx.get(url).mock(
+        return_value=httpx.Response(
+            200,
+            content=WEBP,
+            headers={"content-type": "image/png"},
+        )
+    )
+    worker = MediaWorker(media_repository, tmp_path / "files", max_bytes=1024)
+
+    assert await worker.run_once() == 1
+    cached = await media_repository.resolve_media_path(1)
+    assert cached is not None
+    assert cached.path.read_bytes() == WEBP
+    assert cached.path.name == f"{cached.sha256}.webp"
+    assert cached.mime_type == "image/webp"
 
 
 @respx.mock
