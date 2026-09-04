@@ -52,7 +52,7 @@ def _value_state(node: Node | None) -> str | None:
     if node is None:
         return None
     classes = " ".join(
-        child.attributes.get("class", "") for child in [node, *node.css("*")]
+        child.attributes.get("class") or "" for child in [node, *node.css("*")]
     )
     if "better" in classes:
         return "better"

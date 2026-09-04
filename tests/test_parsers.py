@@ -138,6 +138,26 @@ def test_calendar_detail_reads_specs_history_and_related_stories() -> None:
     assert detail.related_stories[0].source_name == "meti.go.jp"
 
 
+def test_calendar_detail_accepts_history_values_with_empty_class() -> None:
+    html = fixture("calendar_detail.html").replace(
+        '<td class="calendarhistory__row calendarhistory__row--actual">'
+        '<span class="better">0.1%</span></td>',
+        '<td class="calendarhistory__row calendarhistory__row--actual">'
+        '<span class="">0.1%</span></td>',
+        1,
+    )
+
+    detail = parse_calendar_detail(
+        html,
+        "149673",
+        datetime(2026, 8, 31, 12, tzinfo=UTC),
+    )
+
+    assert detail.history[0].actual == "0.1%"
+    assert detail.history[0].actual_state is None
+    assert detail.history[1].actual_state == "better"
+
+
 def test_news_relative_age_does_not_change_translatable_data() -> None:
     html = fixture("news.html")
     now = datetime(2026, 9, 1, 12, tzinfo=UTC)
