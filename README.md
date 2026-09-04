@@ -111,6 +111,7 @@ Except for `/health`, requests require the `X-API-Key` header.
 - `GET /api/v1/calendar?from=<ISO8601>&to=<ISO8601>`
 - `GET /api/v1/news?limit=50`
 - `GET /api/v1/news/{source_id}`
+- `GET /api/v1/binance/futures/top-contracts?limit=20`
 - `GET /api/v1/status`
 
 News V2 endpoints used by the new iPhone client:

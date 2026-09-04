@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     kimi_base_url: str = "https://api.kimi.com/coding/v1"
     kimi_model: str = "k3-256k"
     kimi_timeout_seconds: float = Field(default=120, gt=0)
+    binance_base_url: str = "https://fapi.binance.com"
+    binance_timeout_seconds: float = Field(default=10, gt=0)
+    binance_cache_ttl_seconds: float = Field(default=3, ge=0)
 
 
 @lru_cache(maxsize=1)

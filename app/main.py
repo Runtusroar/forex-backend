@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 
+from app.binance import BinanceFuturesContract, BinanceFuturesMarket, BinanceMarketError
 from app.collector import BrowserSession, Collector
 from app.config import Settings, get_settings
 from app.db import Database
@@ -59,6 +60,34 @@ def _news_json(item: NewsRecord) -> dict:
     }
 
 
+def _binance_contract_json(item: BinanceFuturesContract) -> dict:
+    return {
+        "symbol": item.symbol,
+        "pair": item.pair,
+        "contract_type": item.contract_type,
+        "status": item.status,
+        "base_asset": item.base_asset,
+        "quote_asset": item.quote_asset,
+        "margin_asset": item.margin_asset,
+        "last_price": item.last_price,
+        "weighted_avg_price": item.weighted_avg_price,
+        "price_change": item.price_change,
+        "price_change_percent": item.price_change_percent,
+        "high_price": item.high_price,
+        "low_price": item.low_price,
+        "open_price": item.open_price,
+        "volume": item.volume,
+        "quote_volume": item.quote_volume,
+        "count": item.count,
+        "volatility_percent": item.volatility_percent,
+        "updated_at": _iso_z(item.updated_at),
+    }
+
+
+def _iso_z(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
 def _calendar_default_range(
     now: datetime, source_timezone: tzinfo, horizon_days: int
 ) -> tuple[datetime, datetime]:
@@ -69,7 +98,11 @@ def _calendar_default_range(
     return start, start + timedelta(days=horizon_days)
 
 
-def create_app(settings: Settings | None = None, repository: Repository | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    repository: Repository | None = None,
+    binance_market: BinanceFuturesMarket | None = None,
+) -> FastAPI:
     configured = settings or get_settings()
 
     @asynccontextmanager
@@ -155,9 +188,17 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
     if repository is not None:
         app.state.repository = repository
         app.state.news_repository = NewsRepository(repository.db, repository.write_lock)
+    app.state.binance_market = binance_market or BinanceFuturesMarket(
+        base_url=configured.binance_base_url,
+        timeout_seconds=configured.binance_timeout_seconds,
+        cache_ttl_seconds=configured.binance_cache_ttl_seconds,
+    )
 
     def repo(request: Request) -> Repository:
         return request.app.state.repository
+
+    def market(request: Request) -> BinanceFuturesMarket:
+        return request.app.state.binance_market
 
     def authorize(x_api_key: Annotated[str | None, Header()] = None) -> None:
         expected = configured.app_api_key.get_secret_value()
@@ -216,6 +257,20 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         if item is None:
             raise HTTPException(status_code=404, detail="Not found")
         return _news_json(item)
+
+    @app.get("/api/v1/binance/futures/top-contracts", dependencies=[Depends(authorize)])
+    async def binance_top_contracts(
+        binance: Annotated[BinanceFuturesMarket, Depends(market)],
+        limit: Annotated[int, Query(ge=1, le=50)] = 20,
+    ) -> dict:
+        try:
+            items = await binance.top_contracts(limit)
+        except BinanceMarketError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return {
+            "items": [_binance_contract_json(item) for item in items],
+            "generated_at": _iso_z(datetime.now(UTC)),
+        }
 
     @app.get("/api/v1/status", dependencies=[Depends(authorize)])
     async def status(repository: Annotated[Repository, Depends(repo)]) -> dict:
