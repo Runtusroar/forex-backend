@@ -103,3 +103,37 @@ async def test_calendar_api_reports_last_successful_snapshot_time(tmp_path: Path
         "last_count": 14,
         "last_error": None,
     }
+
+
+async def test_calendar_api_exposes_forex_factory_time_label_and_order(
+    tmp_path: Path,
+) -> None:
+    client, repository, database = await make_client(tmp_path)
+    event_at = datetime(2026, 9, 8, 16, tzinfo=UTC)
+    await repository.upsert_calendar(
+        [
+            CalendarObservation(
+                "151045",
+                event_at,
+                "USD",
+                "low",
+                "ADP Weekly Employment Change",
+                None,
+                None,
+                "11.8K",
+                source_time_text="Aug 23rd",
+                source_position=9,
+            )
+        ]
+    )
+
+    async with client:
+        response = await client.get(
+            "/api/v1/calendar?from=2026-09-08T00:00:00Z&to=2026-09-09T00:00:00Z",
+            headers={"X-API-Key": "api-secret"},
+        )
+    await database.close()
+
+    item = response.json()["items"][0]
+    assert item["source_time_text"] == "Aug 23rd"
+    assert item["source_position"] == 9

@@ -14,6 +14,8 @@ class CalendarObservation:
     actual: str | None
     forecast: str | None
     previous: str | None
+    source_time_text: str | None = None
+    source_position: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +31,7 @@ class NewsObservation:
     image_url: str | None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, kw_only=True)
 class CalendarRecord(CalendarObservation):
     title_zh: str | None
     source_hash: str

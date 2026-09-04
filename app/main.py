@@ -35,6 +35,8 @@ def _calendar_json(item: CalendarRecord) -> dict:
         "actual": item.actual,
         "forecast": item.forecast,
         "previous": item.previous,
+        "source_time_text": item.source_time_text,
+        "source_position": item.source_position,
         "updated_at": item.updated_at,
     }
 

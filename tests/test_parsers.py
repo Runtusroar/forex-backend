@@ -70,6 +70,40 @@ def test_calendar_rejects_a_page_without_the_requested_day() -> None:
         )
 
 
+def test_calendar_preserves_non_clock_source_labels() -> None:
+    rows = parse_calendar(
+        """
+        <table>
+          <tr class="calendar__row calendar__row--day-breaker"><td>Wed Sep 9</td></tr>
+          <tr class="calendar__row" data-event-id="153363">
+            <td class="calendar__date">Wed Sep 9</td>
+            <td class="calendar__time">8:15pm</td>
+            <td class="calendar__currency">USD</td>
+            <td class="calendar__impact"><span class="icon--ff-impact-yel"></span></td>
+            <td class="calendar__event">ADP Weekly Employment Change</td>
+          </tr>
+          <tr class="calendar__row" data-event-id="151045">
+            <td class="calendar__date"></td>
+            <td class="calendar__time">Aug 23rd</td>
+            <td class="calendar__currency">USD</td>
+            <td class="calendar__impact"><span class="icon--ff-impact-yel"></span></td>
+            <td class="calendar__event">ADP Weekly Employment Change</td>
+            <td class="calendar__previous">11.8K</td>
+          </tr>
+        </table>
+        """,
+        datetime(2026, 9, 4, tzinfo=UTC),
+        source_timezone=timezone(timedelta(hours=8)),
+        expected_date=date(2026, 9, 9),
+    )
+
+    assert rows[0].source_time_text is None
+    assert rows[0].source_position == 0
+    assert rows[1].source_time_text == "Aug 23rd"
+    assert rows[1].source_position == 1
+    assert rows[1].event_at == datetime(2026, 9, 8, 16, tzinfo=UTC)
+
+
 def test_news_relative_age_does_not_change_translatable_data() -> None:
     html = fixture("news.html")
     now = datetime(2026, 9, 1, 12, tzinfo=UTC)

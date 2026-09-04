@@ -39,7 +39,14 @@ async def test_migration_creates_news_v2_without_losing_calendar(tmp_path: Path)
         "source_snapshots",
     } <= names
     assert "news_source_documents" not in names
-    assert version[0]["value"] == "4"
+    assert version[0]["value"] == "5"
+    calendar_columns = await database.connection.execute_fetchall(
+        "PRAGMA table_info(calendar_events)"
+    )
+    assert {row["name"] for row in calendar_columns} >= {
+        "source_time_text",
+        "source_position",
+    }
     columns = await database.connection.execute_fetchall("PRAGMA table_info(news_segments)")
     assert {row["name"] for row in columns} >= {
         "display_mode",
@@ -155,7 +162,7 @@ async def test_v3_upgrade_removes_source_documents_and_their_translations(
     source_translations = await database.connection.execute_fetchall(
         "SELECT id FROM localized_texts WHERE entity_type='source_document'"
     )
-    assert version[0]["value"] == "4"
+    assert version[0]["value"] == "5"
     assert "news_source_documents" not in names
     assert [tuple(row) for row in segment] == [
         ("Forex Factory excerpt...", "full", None, None)

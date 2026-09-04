@@ -6,6 +6,8 @@ from selectolax.parser import HTMLParser, Node
 from app.domain import CalendarObservation
 from app.parsers.errors import SourcePageError, reject_challenge
 
+CLOCK_PATTERN = re.compile(r"\d{1,2}:\d{2}(?:am|pm)", re.IGNORECASE)
+
 
 def _text(node: Node, selector: str) -> str | None:
     found = node.css_first(selector)
@@ -47,7 +49,7 @@ def _event_time(
     date_text = _source_date(date_text)
     if not date_text or not time_text:
         raise SourcePageError("calendar row has no timestamp")
-    clock = "12:00am" if re.fullmatch(r"(?:Day \d+|All Day|Tentative)", time_text) else time_text
+    clock = time_text if CLOCK_PATTERN.fullmatch(time_text) else "12:00am"
     parsed = datetime.strptime(f"{date_text} {now.year} {clock}", "%b %d %Y %I:%M%p")
     parsed = parsed.replace(tzinfo=source_timezone)
     local_now = now.astimezone(source_timezone)
@@ -72,6 +74,7 @@ def parse_calendar(
     last_time: str | None = None
     expected_marker = f"{expected_date:%b} {expected_date.day}" if expected_date else None
     requested_day_seen = False
+    source_position = 0
     for row in tree.css("tr.calendar__row"):
         source_id = row.attributes.get("data-event-id", "").strip()
         if not source_id:
@@ -82,7 +85,8 @@ def parse_calendar(
                 requested_day_seen |= _source_date(structural_date) == expected_marker
             continue
         last_date = _text(row, ".calendar__date") or last_date
-        last_time = _text(row, ".calendar__time") or last_time
+        row_time = _text(row, ".calendar__time")
+        last_time = row_time or last_time
         requested_day_seen |= _source_date(last_date) == expected_marker
         title = _text(row, ".calendar__event")
         currency = _text(row, ".calendar__currency")
@@ -98,8 +102,15 @@ def parse_calendar(
                 actual=_text(row, ".calendar__actual"),
                 forecast=_text(row, ".calendar__forecast"),
                 previous=_text(row, ".calendar__previous"),
+                source_time_text=(
+                    row_time
+                    if row_time is not None and not CLOCK_PATTERN.fullmatch(row_time)
+                    else None
+                ),
+                source_position=source_position,
             )
         )
+        source_position += 1
     if expected_date and not requested_day_seen:
         raise SourcePageError("calendar page does not contain requested day")
     if not results and expected_date is None:

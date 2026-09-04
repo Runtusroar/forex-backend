@@ -85,6 +85,27 @@ async def test_replace_calendar_window_removes_only_stale_rows_inside_window(
     assert [row.source_id for row in rows] == ["fresh", "outside"]
 
 
+async def test_calendar_round_trips_source_time_text_and_position(
+    repository: Repository,
+) -> None:
+    item = replace(
+        calendar_item(),
+        source_time_text="Tentative",
+        source_position=7,
+    )
+
+    await repository.upsert_calendar([item])
+
+    stored = (
+        await repository.list_calendar(
+            item.event_at - timedelta(seconds=1),
+            item.event_at + timedelta(seconds=1),
+        )
+    )[0]
+    assert stored.source_time_text == "Tentative"
+    assert stored.source_position == 7
+
+
 async def test_stale_translation_cannot_overwrite_changed_source(
     repository: Repository,
 ) -> None:

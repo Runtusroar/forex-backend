@@ -58,12 +58,14 @@ class Repository:
             changed = not current or current[0]["source_hash"] != source_hash
             await self.db.execute(
                 """INSERT INTO calendar_events
-                   (source_id,event_at,currency,impact,title_en,actual,forecast,previous,source_hash,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)
+                   (source_id,event_at,currency,impact,title_en,actual,forecast,previous,
+                    source_time_text,source_position,source_hash,updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(source_id) DO UPDATE SET
                      event_at=excluded.event_at,currency=excluded.currency,impact=excluded.impact,
                      title_en=excluded.title_en,actual=excluded.actual,forecast=excluded.forecast,
-                     previous=excluded.previous,source_hash=excluded.source_hash,
+                     previous=excluded.previous,source_time_text=excluded.source_time_text,
+                     source_position=excluded.source_position,source_hash=excluded.source_hash,
                      title_zh=CASE WHEN calendar_events.source_hash=excluded.source_hash
                                    THEN calendar_events.title_zh ELSE NULL END,
                      updated_at=excluded.updated_at""",
@@ -76,6 +78,8 @@ class Repository:
                     item.actual,
                     item.forecast,
                     item.previous,
+                    item.source_time_text,
+                    item.source_position,
                     source_hash,
                     now,
                 ),
@@ -318,6 +322,8 @@ class Repository:
             actual=row["actual"],
             forecast=row["forecast"],
             previous=row["previous"],
+            source_time_text=row["source_time_text"],
+            source_position=row["source_position"],
             title_zh=row["title_zh"],
             source_hash=row["source_hash"],
             updated_at=_dt(row["updated_at"]),
