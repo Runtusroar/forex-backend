@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from datetime import date
 
 from playwright.async_api import Browser, Locator, Page, Playwright, async_playwright
 
@@ -58,14 +59,18 @@ class BrowserSession:
             self.calendar_page = await context.new_page()
             self.news_page = await context.new_page()
 
-    async def calendar_html(self) -> str:
+    async def calendar_html(self, day: date) -> str:
         await self.connect()
         assert self.calendar_page is not None
+        slug = f"{day:%b}{day.day}.{day.year}".lower()
         await self.calendar_page.goto(
-            "https://www.forexfactory.com/calendar?week=this", wait_until="domcontentloaded"
+            f"https://www.forexfactory.com/calendar?day={slug}",
+            wait_until="domcontentloaded",
         )
         await self.calendar_page.wait_for_selector(
-            "tr.calendar__row", state="attached", timeout=20_000
+            ".calendar__row--day-breaker, tr.calendar__row[data-event-id]",
+            state="attached",
+            timeout=20_000,
         )
         return await self.calendar_page.content()
 

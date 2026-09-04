@@ -42,6 +42,17 @@ def test_api_receives_configurable_collection_interval() -> None:
     assert "COLLECT_INTERVAL_SECONDS: ${COLLECT_INTERVAL_SECONDS:-30}" in compose
 
 
+def test_api_receives_calendar_source_and_schedule_settings() -> None:
+    compose = Path("compose.yaml").read_text()
+
+    assert "CALENDAR_SOURCE_TIMEZONE: ${CALENDAR_SOURCE_TIMEZONE:-Asia/Singapore}" in compose
+    assert "CALENDAR_HORIZON_DAYS: ${CALENDAR_HORIZON_DAYS:-8}" in compose
+    assert (
+        "CALENDAR_SCHEDULE_INTERVAL_SECONDS: ${CALENDAR_SCHEDULE_INTERVAL_SECONDS:-600}"
+        in compose
+    )
+
+
 def test_api_receives_all_news_worker_settings_under_persistent_data() -> None:
     compose = Path("compose.yaml").read_text()
 

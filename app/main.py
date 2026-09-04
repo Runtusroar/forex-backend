@@ -1,7 +1,7 @@
 import hmac
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta, tzinfo
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
@@ -57,6 +57,16 @@ def _news_json(item: NewsRecord) -> dict:
     }
 
 
+def _calendar_default_range(
+    now: datetime, source_timezone: tzinfo, horizon_days: int
+) -> tuple[datetime, datetime]:
+    local_day = now.astimezone(source_timezone).date()
+    start = datetime.combine(
+        local_day, time.min, tzinfo=source_timezone
+    ).astimezone(UTC)
+    return start, start + timedelta(days=horizon_days)
+
+
 def create_app(settings: Settings | None = None, repository: Repository | None = None) -> FastAPI:
     configured = settings or get_settings()
 
@@ -77,7 +87,13 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
             )
             app.state.news_repository = news_repository
             browser = BrowserSession(configured.cdp_url)
-            calendar_collector = Collector(browser, live_repository)
+            calendar_collector = Collector(
+                browser,
+                live_repository,
+                ZoneInfo(configured.calendar_source_timezone),
+                configured.calendar_horizon_days,
+                configured.calendar_schedule_interval_seconds,
+            )
             snapshot_store = SnapshotStore(configured.news_snapshot_dir, news_repository)
             news_collector = NewsCollector(
                 browser,
@@ -157,12 +173,20 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         end: Annotated[datetime | None, Query(alias="to")] = None,
     ) -> dict:
         now = datetime.now(UTC)
-        start = start or now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = end or start + timedelta(days=7)
+        default_start, default_end = _calendar_default_range(
+            now,
+            ZoneInfo(configured.calendar_source_timezone),
+            configured.calendar_horizon_days,
+        )
+        start = start or default_start
+        end = end or (
+            default_end if start == default_start else start + timedelta(days=7)
+        )
         if end <= start or end - start > timedelta(days=31):
             raise HTTPException(status_code=422, detail="Invalid date range")
         items = await repository.list_calendar(start, end)
-        return {"items": [_calendar_json(item) for item in items], "generated_at": now}
+        generated_at = await repository.get_runtime_state("calendar_last_success") or now
+        return {"items": [_calendar_json(item) for item in items], "generated_at": generated_at}
 
     @app.get("/api/v1/news", dependencies=[Depends(authorize)])
     async def news(
@@ -192,8 +216,19 @@ def create_app(settings: Settings | None = None, repository: Repository | None =
         return _news_json(item)
 
     @app.get("/api/v1/status", dependencies=[Depends(authorize)])
-    async def status() -> dict[str, str]:
-        return {"status": "ok", "model": configured.kimi_model}
+    async def status(repository: Annotated[Repository, Depends(repo)]) -> dict:
+        last_success = await repository.get_runtime_state("calendar_last_success")
+        last_count = await repository.get_runtime_state("calendar_last_count")
+        last_error = await repository.get_runtime_state("calendar_last_error")
+        return {
+            "status": "degraded" if last_error else "ok",
+            "model": configured.kimi_model,
+            "calendar": {
+                "last_success": last_success,
+                "last_count": int(last_count) if last_count is not None else None,
+                "last_error": last_error or None,
+            },
+        }
 
     app.include_router(create_news_router(configured, authorize))
 

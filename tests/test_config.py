@@ -16,6 +16,9 @@ def test_settings_have_mvp_defaults(tmp_path: Path) -> None:
 
     assert settings.cdp_url == "http://127.0.0.1:9222"
     assert settings.collect_interval_seconds == 30
+    assert settings.calendar_source_timezone == "Asia/Singapore"
+    assert settings.calendar_horizon_days == 8
+    assert settings.calendar_schedule_interval_seconds == 600
     assert settings.kimi_base_url == "https://api.kimi.com/coding/v1"
     assert settings.kimi_model == "k3-256k"
     assert settings.kimi_timeout_seconds == 120

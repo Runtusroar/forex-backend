@@ -151,6 +151,9 @@ Backend environment:
 - `DATABASE_PATH=./data/forex_factory.sqlite3`
 - `CDP_URL=http://127.0.0.1:9222`
 - `COLLECT_INTERVAL_SECONDS=30`
+- `CALENDAR_SOURCE_TIMEZONE=Asia/Singapore`
+- `CALENDAR_HORIZON_DAYS=8`
+- `CALENDAR_SCHEDULE_INTERVAL_SECONDS=600`
 - `APP_API_KEY=<random secret>`
 - `MOONSHOT_API_KEY=<Kimi server-side secret>`
 - `KIMI_BASE_URL=https://api.kimi.com/coding/v1`

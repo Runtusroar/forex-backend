@@ -49,9 +49,7 @@ class Repository:
         self.db = database.connection
         self.write_lock = database.write_lock
 
-    @_serialized_write
-    async def upsert_calendar(self, items: list[CalendarObservation]) -> None:
-        now = _iso(_now())
+    async def _upsert_calendar(self, items: list[CalendarObservation], now: str) -> None:
         for item in items:
             source_hash = _hash([item.title_en])
             current = await self.db.execute_fetchall(
@@ -86,6 +84,66 @@ class Repository:
                 await self._enqueue(
                     "calendar", item.source_id, source_hash, {"title": item.title_en}
                 )
+
+    @_serialized_write
+    async def upsert_calendar(self, items: list[CalendarObservation]) -> None:
+        now = _iso(_now())
+        assert now is not None
+        await self._upsert_calendar(items, now)
+        await self.db.commit()
+
+    @_serialized_write
+    async def replace_calendar_window(
+        self,
+        items: list[CalendarObservation],
+        start: datetime,
+        end: datetime,
+    ) -> None:
+        if end <= start:
+            raise ValueError("calendar window end must be after start")
+        if any(item.event_at < start or item.event_at >= end for item in items):
+            raise ValueError("calendar item is outside replacement window")
+
+        now = _iso(_now())
+        assert now is not None
+        await self._upsert_calendar(items, now)
+        source_ids = [item.source_id for item in items]
+        if source_ids:
+            placeholders = ",".join("?" for _ in source_ids)
+            await self.db.execute(
+                f"""DELETE FROM calendar_events
+                    WHERE event_at >= ? AND event_at < ?
+                      AND source_id NOT IN ({placeholders})""",
+                (_iso(start), _iso(end), *source_ids),
+            )
+        else:
+            await self.db.execute(
+                "DELETE FROM calendar_events WHERE event_at >= ? AND event_at < ?",
+                (_iso(start), _iso(end)),
+            )
+        await self.db.execute(
+            """DELETE FROM translation_jobs
+               WHERE entity_type='calendar'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM calendar_events
+                   WHERE calendar_events.source_id=translation_jobs.entity_id
+                 )"""
+        )
+        await self.db.commit()
+
+    async def get_runtime_state(self, key: str) -> str | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT value FROM runtime_state WHERE key=?", (key,)
+        )
+        return str(rows[0]["value"]) if rows else None
+
+    @_serialized_write
+    async def set_runtime_state(self, key: str, value: str) -> None:
+        await self.db.execute(
+            """INSERT INTO runtime_state(key,value) VALUES (?,?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, value),
+        )
         await self.db.commit()
 
     @_serialized_write

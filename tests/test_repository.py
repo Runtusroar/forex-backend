@@ -69,6 +69,22 @@ async def test_unchanged_content_does_not_duplicate_job(repository: Repository) 
     assert await repository.translation_job_count() == 1
 
 
+async def test_replace_calendar_window_removes_only_stale_rows_inside_window(
+    repository: Repository,
+) -> None:
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    end = start + timedelta(days=1)
+    stale = replace(calendar_item(), source_id="stale", event_at=start + timedelta(hours=1))
+    outside = replace(calendar_item(), source_id="outside", event_at=end + timedelta(hours=1))
+    fresh = replace(calendar_item(), source_id="fresh", event_at=start + timedelta(hours=2))
+    await repository.upsert_calendar([stale, outside])
+
+    await repository.replace_calendar_window([fresh], start, end)
+
+    rows = await repository.list_calendar(start, end + timedelta(days=1))
+    assert [row.source_id for row in rows] == ["fresh", "outside"]
+
+
 async def test_stale_translation_cannot_overwrite_changed_source(
     repository: Repository,
 ) -> None:

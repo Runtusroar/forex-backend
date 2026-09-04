@@ -1,9 +1,15 @@
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
-from app.parsers import ChallengePageError, parse_calendar, parse_news_detail, parse_news_listing
+from app.parsers import (
+    ChallengePageError,
+    SourcePageError,
+    parse_calendar,
+    parse_news_detail,
+    parse_news_listing,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -33,6 +39,35 @@ def test_calendar_skips_current_day_breakers_and_converts_source_timezone() -> N
     assert rows[0].source_id == "149673"
     assert rows[0].event_at == datetime(2026, 8, 30, 23, 50, tzinfo=UTC)
     assert rows[0].title_en == "Prelim Industrial Production m/m"
+
+
+def test_calendar_accepts_a_validated_empty_requested_day() -> None:
+    rows = parse_calendar(
+        """
+        <table><tr class="calendar__row calendar__row--day-breaker">
+          <td>Sun <span>Sep 6</span></td>
+        </tr></table>
+        """,
+        datetime(2026, 9, 4, tzinfo=UTC),
+        source_timezone=timezone(timedelta(hours=8)),
+        expected_date=date(2026, 9, 6),
+    )
+
+    assert rows == []
+
+
+def test_calendar_rejects_a_page_without_the_requested_day() -> None:
+    with pytest.raises(SourcePageError, match="requested day"):
+        parse_calendar(
+            """
+            <table><tr class="calendar__row calendar__row--day-breaker">
+              <td>Sun <span>Sep 6</span></td>
+            </tr></table>
+            """,
+            datetime(2026, 9, 4, tzinfo=UTC),
+            source_timezone=timezone(timedelta(hours=8)),
+            expected_date=date(2026, 9, 7),
+        )
 
 
 def test_news_relative_age_does_not_change_translatable_data() -> None:

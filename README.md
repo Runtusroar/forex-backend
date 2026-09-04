@@ -76,7 +76,10 @@ destroys the SQLite database, cached media, source snapshots, and Chrome profile
 ## Collection behavior
 
 Playwright connects to the persistent Chromium process instead of launching a disposable browser.
-Calendar collection and News V2 listing collection are independent. News V2 preserves Latest, Hot,
+Calendar collection uses explicit daily pages: the current UTC+8 day refreshes on the normal
+collection interval, while the complete eight-day schedule refreshes every ten minutes. Only a
+fully validated set of daily pages replaces its database window, so an incomplete page keeps the
+last complete snapshot. Calendar collection and News V2 listing collection are independent. News V2 preserves Latest, Hot,
 Fundamental, Technical, Industry, Entertainment, Educational, and Latest Comments. Canonical
 articles are committed before detail, media, or translation work, so an individual downstream
 failure cannot remove the English listing data.
@@ -95,9 +98,10 @@ article. Social blocks retain Forex Factory's full/clamped display mode and exte
 Translation runs independently after English records are stored. A Kimi outage leaves the English
 data and collection loop intact; Chinese fields remain nullable until a later retry succeeds.
 
-Keep the server operating-system timezone aligned with the timezone shown by Forex Factory in the
-persistent Chrome profile. Calendar rows show wall-clock time, so the parser converts that source
-time to UTC before storing it. Singapore and China are both UTC+8.
+Calendar rows show wall-clock time, so the parser converts the explicitly configured
+`CALENDAR_SOURCE_TIMEZONE` (default `Asia/Singapore`) to UTC before storing it. This is independent
+of the server operating-system timezone and proxy exit IP. Singapore and China are both UTC+8.
+`CALENDAR_HORIZON_DAYS` defaults to `8`, and `CALENDAR_SCHEDULE_INTERVAL_SECONDS` defaults to `600`.
 
 ## API
 

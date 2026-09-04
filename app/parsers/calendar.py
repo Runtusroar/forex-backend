@@ -1,5 +1,5 @@
 import re
-from datetime import UTC, datetime, timedelta, tzinfo
+from datetime import UTC, date, datetime, timedelta, tzinfo
 
 from selectolax.parser import HTMLParser, Node
 
@@ -62,6 +62,7 @@ def parse_calendar(
     html: str,
     now: datetime,
     source_timezone: tzinfo | None = None,
+    expected_date: date | None = None,
 ) -> list[CalendarObservation]:
     reject_challenge(html)
     tree = HTMLParser(html)
@@ -69,6 +70,8 @@ def parse_calendar(
     source_timezone = source_timezone or datetime.now().astimezone().tzinfo or UTC
     last_date: str | None = None
     last_time: str | None = None
+    expected_marker = f"{expected_date:%b} {expected_date.day}" if expected_date else None
+    requested_day_seen = False
     for row in tree.css("tr.calendar__row"):
         source_id = row.attributes.get("data-event-id", "").strip()
         if not source_id:
@@ -76,9 +79,11 @@ def parse_calendar(
             if _source_date(structural_date):
                 last_date = structural_date
                 last_time = None
+                requested_day_seen |= _source_date(structural_date) == expected_marker
             continue
         last_date = _text(row, ".calendar__date") or last_date
         last_time = _text(row, ".calendar__time") or last_time
+        requested_day_seen |= _source_date(last_date) == expected_marker
         title = _text(row, ".calendar__event")
         currency = _text(row, ".calendar__currency")
         if not title or not currency:
@@ -95,6 +100,8 @@ def parse_calendar(
                 previous=_text(row, ".calendar__previous"),
             )
         )
-    if not results:
+    if expected_date and not requested_day_seen:
+        raise SourcePageError("calendar page does not contain requested day")
+    if not results and expected_date is None:
         raise SourcePageError("calendar page contains no event rows")
     return results
