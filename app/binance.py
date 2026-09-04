@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 
@@ -20,6 +20,8 @@ class BinanceFuturesContract:
     pair: str
     contract_type: str
     market_type: str
+    underlying_type: str
+    underlying_subtypes: tuple[str, ...]
     status: str
     base_asset: str
     quote_asset: str
@@ -39,6 +41,10 @@ class BinanceFuturesContract:
 
 
 class BinanceFuturesMarket:
+    tradable_contract_types: ClassVar[frozenset[str]] = frozenset(
+        {"PERPETUAL", "TRADIFI_PERPETUAL"}
+    )
+
     def __init__(
         self,
         *,
@@ -113,7 +119,7 @@ class BinanceFuturesMarket:
             if isinstance(item, dict)
             and item.get("symbol")
             and item.get("quoteAsset") == "USDT"
-            and item.get("contractType") == "PERPETUAL"
+            and item.get("contractType") in self.tradable_contract_types
             and item.get("status") == "TRADING"
         }
 
@@ -131,7 +137,9 @@ class BinanceFuturesMarket:
             symbol=symbol,
             pair=str(meta.get("pair") or symbol),
             contract_type=str(meta.get("contractType") or ""),
-            market_type="crypto",
+            market_type=_market_type(meta),
+            underlying_type=str(meta.get("underlyingType") or ""),
+            underlying_subtypes=_underlying_subtypes(meta),
             status=str(meta.get("status") or ""),
             base_asset=str(meta.get("baseAsset") or ""),
             quote_asset=str(meta.get("quoteAsset") or ""),
@@ -167,6 +175,27 @@ def _int(value: Any) -> int:
 
 def _datetime_from_millis(value: Any) -> datetime:
     return datetime.fromtimestamp(_int(value) / 1000, tz=UTC)
+
+
+def _market_type(meta: dict[str, Any]) -> str:
+    subtypes = meta.get("underlyingSubType")
+    if isinstance(subtypes, list) and any(
+        str(item).lower() == "tradfi" for item in subtypes
+    ):
+        return "traditional"
+    if str(meta.get("contractType") or "").upper().startswith("TRADIFI_"):
+        return "traditional"
+    underlying_type = str(meta.get("underlyingType") or "").upper()
+    if underlying_type and underlying_type != "COIN":
+        return "traditional"
+    return "crypto"
+
+
+def _underlying_subtypes(meta: dict[str, Any]) -> tuple[str, ...]:
+    subtypes = meta.get("underlyingSubType")
+    if not isinstance(subtypes, list):
+        return ()
+    return tuple(str(item) for item in subtypes)
 
 
 def _volatility_percent(open_price: float, high_price: float, low_price: float) -> float | None:

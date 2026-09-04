@@ -66,6 +66,8 @@ def _binance_contract_json(item: BinanceFuturesContract) -> dict:
         "pair": item.pair,
         "contract_type": item.contract_type,
         "market_type": item.market_type,
+        "underlying_type": item.underlying_type,
+        "underlying_subtypes": list(item.underlying_subtypes),
         "status": item.status,
         "base_asset": item.base_asset,
         "quote_asset": item.quote_asset,
@@ -268,11 +270,12 @@ def create_app(
         ] = "all",
     ) -> dict:
         try:
-            items = await binance.top_contracts(limit)
+            items = await binance.top_contracts(50)
         except BinanceMarketError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         if market_type != "all":
             items = [item for item in items if item.market_type == market_type]
+        items = items[:limit]
         return {
             "items": [_binance_contract_json(item) for item in items],
             "generated_at": _iso_z(datetime.now(UTC)),

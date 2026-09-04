@@ -132,7 +132,124 @@ async def test_top_contracts_keeps_usdt_perpetuals_ranked_by_quote_volume() -> N
     assert contracts[0].volatility_percent == 15.0
     assert contracts[0].contract_type == "PERPETUAL"
     assert contracts[0].market_type == "crypto"
+    assert contracts[0].underlying_type == ""
+    assert contracts[0].underlying_subtypes == ()
     assert contracts[0].status == "TRADING"
     assert contracts[0].base_asset == "ETH"
     assert contracts[0].quote_asset == "USDT"
     assert contracts[0].updated_at == datetime(2026, 9, 4, 12, 20, tzinfo=UTC)
+
+
+async def test_top_contracts_includes_tradfi_perpetuals_with_market_type() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/fapi/v1/exchangeInfo":
+            return httpx.Response(
+                200,
+                json={
+                    "symbols": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "pair": "BTCUSDT",
+                            "contractType": "PERPETUAL",
+                            "status": "TRADING",
+                            "baseAsset": "BTC",
+                            "quoteAsset": "USDT",
+                            "marginAsset": "USDT",
+                            "underlyingType": "COIN",
+                            "underlyingSubType": ["Layer 1"],
+                        },
+                        {
+                            "symbol": "XAUUSDT",
+                            "pair": "XAUUSDT",
+                            "contractType": "TRADIFI_PERPETUAL",
+                            "status": "TRADING",
+                            "baseAsset": "XAU",
+                            "quoteAsset": "USDT",
+                            "marginAsset": "USDT",
+                            "underlyingType": "COMMODITY",
+                            "underlyingSubType": ["TradFi"],
+                        },
+                        {
+                            "symbol": "SPCXUSDT",
+                            "pair": "SPCXUSDT",
+                            "contractType": "TRADIFI_PERPETUAL",
+                            "status": "TRADING",
+                            "baseAsset": "SPCX",
+                            "quoteAsset": "USDT",
+                            "marginAsset": "USDT",
+                            "underlyingType": "EQUITY",
+                            "underlyingSubType": ["TradFi"],
+                        },
+                    ]
+                },
+            )
+        if request.url.path == "/fapi/v1/ticker/24hr":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "symbol": "BTCUSDT",
+                        "priceChange": "100.0",
+                        "priceChangePercent": "2.50",
+                        "weightedAvgPrice": "101000.0",
+                        "lastPrice": "102000.0",
+                        "openPrice": "100000.0",
+                        "highPrice": "110000.0",
+                        "lowPrice": "95000.0",
+                        "volume": "1000.0",
+                        "quoteVolume": "102000000.0",
+                        "closeTime": 1_788_524_400_000,
+                        "count": 100,
+                    },
+                    {
+                        "symbol": "XAUUSDT",
+                        "priceChange": "40.0",
+                        "priceChangePercent": "1.20",
+                        "weightedAvgPrice": "3350.0",
+                        "lastPrice": "3360.0",
+                        "openPrice": "3320.0",
+                        "highPrice": "3400.0",
+                        "lowPrice": "3300.0",
+                        "volume": "20000.0",
+                        "quoteVolume": "67200000.0",
+                        "closeTime": 1_788_524_401_000,
+                        "count": 300,
+                    },
+                    {
+                        "symbol": "SPCXUSDT",
+                        "priceChange": "-2.0",
+                        "priceChangePercent": "-0.40",
+                        "weightedAvgPrice": "500.0",
+                        "lastPrice": "498.0",
+                        "openPrice": "500.0",
+                        "highPrice": "520.0",
+                        "lowPrice": "480.0",
+                        "volume": "5000.0",
+                        "quoteVolume": "2490000.0",
+                        "closeTime": 1_788_524_402_000,
+                        "count": 120,
+                    },
+                ],
+            )
+        return httpx.Response(404)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://example.test")
+    market = BinanceFuturesMarket(
+        base_url="https://example.test",
+        client=client,
+        cache_ttl_seconds=0,
+    )
+
+    try:
+        contracts = await market.top_contracts(limit=10)
+    finally:
+        await client.aclose()
+
+    by_symbol = {item.symbol: item for item in contracts}
+    assert by_symbol["BTCUSDT"].market_type == "crypto"
+    assert by_symbol["XAUUSDT"].market_type == "traditional"
+    assert by_symbol["SPCXUSDT"].market_type == "traditional"
+    assert by_symbol["XAUUSDT"].underlying_type == "COMMODITY"
+    assert by_symbol["SPCXUSDT"].underlying_type == "EQUITY"
+    assert by_symbol["XAUUSDT"].underlying_subtypes == ("TradFi",)
+    assert by_symbol["XAUUSDT"].contract_type == "TRADIFI_PERPETUAL"

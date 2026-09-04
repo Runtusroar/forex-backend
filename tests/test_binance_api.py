@@ -22,6 +22,8 @@ class StubBinanceMarket:
                 pair="BTCUSDT",
                 contract_type="PERPETUAL",
                 market_type="crypto",
+                underlying_type="COIN",
+                underlying_subtypes=("Layer 1",),
                 status="TRADING",
                 base_asset="BTC",
                 quote_asset="USDT",
@@ -38,7 +40,31 @@ class StubBinanceMarket:
                 count=100,
                 volatility_percent=15.0,
                 updated_at=datetime(2026, 9, 4, 12, 20, tzinfo=UTC),
-            )
+            ),
+            BinanceFuturesContract(
+                symbol="XAUUSDT",
+                pair="XAUUSDT",
+                contract_type="TRADIFI_PERPETUAL",
+                market_type="traditional",
+                underlying_type="COMMODITY",
+                underlying_subtypes=("TradFi",),
+                status="TRADING",
+                base_asset="XAU",
+                quote_asset="USDT",
+                margin_asset="USDT",
+                last_price=3360.0,
+                weighted_avg_price=3350.0,
+                price_change=40.0,
+                price_change_percent=1.2,
+                high_price=3400.0,
+                low_price=3300.0,
+                open_price=3320.0,
+                volume=20000.0,
+                quote_volume=67200000.0,
+                count=300,
+                volatility_percent=3.012,
+                updated_at=datetime(2026, 9, 4, 12, 21, tzinfo=UTC),
+            ),
         ]
 
 
@@ -65,7 +91,7 @@ async def test_top_contracts_endpoint_returns_binance_contracts(tmp_path: Path) 
     await database.close()
 
     assert response.status_code == 200, response.text
-    assert market.requested_limit == 20
+    assert market.requested_limit == 50
     assert response.json() == {
         "items": [
             {
@@ -73,6 +99,8 @@ async def test_top_contracts_endpoint_returns_binance_contracts(tmp_path: Path) 
                 "pair": "BTCUSDT",
                 "contract_type": "PERPETUAL",
                 "market_type": "crypto",
+                "underlying_type": "COIN",
+                "underlying_subtypes": ["Layer 1"],
                 "status": "TRADING",
                 "base_asset": "BTC",
                 "quote_asset": "USDT",
@@ -89,7 +117,31 @@ async def test_top_contracts_endpoint_returns_binance_contracts(tmp_path: Path) 
                 "count": 100,
                 "volatility_percent": 15.0,
                 "updated_at": "2026-09-04T12:20:00Z",
-            }
+            },
+            {
+                "symbol": "XAUUSDT",
+                "pair": "XAUUSDT",
+                "contract_type": "TRADIFI_PERPETUAL",
+                "market_type": "traditional",
+                "underlying_type": "COMMODITY",
+                "underlying_subtypes": ["TradFi"],
+                "status": "TRADING",
+                "base_asset": "XAU",
+                "quote_asset": "USDT",
+                "margin_asset": "USDT",
+                "last_price": 3360.0,
+                "weighted_avg_price": 3350.0,
+                "price_change": 40.0,
+                "price_change_percent": 1.2,
+                "high_price": 3400.0,
+                "low_price": 3300.0,
+                "open_price": 3320.0,
+                "volume": 20000.0,
+                "quote_volume": 67200000.0,
+                "count": 300,
+                "volatility_percent": 3.012,
+                "updated_at": "2026-09-04T12:21:00Z",
+            },
         ],
         "generated_at": response.json()["generated_at"],
     }
@@ -120,7 +172,8 @@ async def test_top_contracts_endpoint_filters_traditional_market_type(
     await database.close()
 
     assert response.status_code == 200, response.text
-    assert response.json()["items"] == []
+    assert [item["symbol"] for item in response.json()["items"]] == ["XAUUSDT"]
+    assert market.requested_limit == 50
 
 
 async def test_top_contracts_endpoint_requires_api_key(tmp_path: Path) -> None:
