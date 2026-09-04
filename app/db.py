@@ -21,6 +21,62 @@ CREATE TABLE IF NOT EXISTS calendar_events (
 );
 CREATE INDEX IF NOT EXISTS idx_calendar_event_at ON calendar_events(event_at);
 
+CREATE TABLE IF NOT EXISTS calendar_event_details (
+  source_id TEXT PRIMARY KEY REFERENCES calendar_events(source_id) ON DELETE CASCADE,
+  title_en TEXT NOT NULL,
+  currency TEXT,
+  currency_name TEXT,
+  impact TEXT,
+  actual TEXT,
+  forecast TEXT,
+  previous TEXT,
+  actual_state TEXT,
+  previous_state TEXT,
+  previous_revised_from TEXT,
+  ff_url TEXT,
+  source_name TEXT,
+  source_url TEXT,
+  latest_release_url TEXT,
+  measures TEXT,
+  usual_effect TEXT,
+  frequency TEXT,
+  next_release_text TEXT,
+  next_release_url TEXT,
+  ff_notes TEXT,
+  why_traders_care TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS calendar_event_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id TEXT NOT NULL REFERENCES calendar_event_details(source_id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  release_date_text TEXT NOT NULL,
+  event_url TEXT,
+  actual TEXT,
+  forecast TEXT,
+  previous TEXT,
+  actual_state TEXT,
+  previous_state TEXT,
+  previous_revised_from TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_calendar_event_history_order
+  ON calendar_event_history(source_id, position);
+
+CREATE TABLE IF NOT EXISTS calendar_event_related_stories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_id TEXT NOT NULL REFERENCES calendar_event_details(source_id) ON DELETE CASCADE,
+  position INTEGER NOT NULL CHECK (position >= 0),
+  title_en TEXT NOT NULL,
+  ff_url TEXT NOT NULL,
+  source_name TEXT,
+  source_url TEXT,
+  published_at_source_text TEXT,
+  preview TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_calendar_event_related_stories_order
+  ON calendar_event_related_stories(source_id, position);
+
 CREATE TABLE IF NOT EXISTS news_items (
   source_id TEXT PRIMARY KEY,
   url TEXT NOT NULL,

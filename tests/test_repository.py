@@ -5,7 +5,13 @@ from pathlib import Path
 import pytest
 
 from app.db import Database
-from app.domain import CalendarObservation, NewsObservation
+from app.domain import (
+    CalendarDetailObservation,
+    CalendarHistoryObservation,
+    CalendarObservation,
+    CalendarRelatedStoryObservation,
+    NewsObservation,
+)
 from app.repository import Repository
 
 
@@ -104,6 +110,71 @@ async def test_calendar_round_trips_source_time_text_and_position(
     )[0]
     assert stored.source_time_text == "Tentative"
     assert stored.source_position == 7
+
+
+async def test_calendar_detail_round_trips_specs_history_and_related_stories(
+    repository: Repository,
+) -> None:
+    item = calendar_item()
+    await repository.upsert_calendar([item])
+    await repository.replace_calendar_detail(
+        CalendarDetailObservation(
+            source_id=item.source_id,
+            title_en=item.title_en,
+            currency=item.currency,
+            currency_name="US dollar",
+            impact=item.impact,
+            actual=item.actual,
+            forecast=item.forecast,
+            previous=item.previous,
+            actual_state="better",
+            previous_state="worse",
+            previous_revised_from="49.5",
+            ff_url="https://www.forexfactory.com/calendar/1-us-ism-manufacturing-pmi",
+            source_name="ISM",
+            source_url="https://www.ismworld.org/",
+            latest_release_url="https://www.ismworld.org/latest/",
+            measures="Level of a diffusion index;",
+            usual_effect="'Actual' greater than 'Forecast' is good for currency;",
+            frequency="Released monthly;",
+            next_release_text="Oct 1, 2026",
+            next_release_url="https://www.forexfactory.com/calendar?day=oct1.2026#detail=2",
+            ff_notes="Survey notes;",
+            why_traders_care="It is a leading indicator;",
+            history=(
+                CalendarHistoryObservation(
+                    "Sep 1, 2026",
+                    "https://www.forexfactory.com/calendar?day=sep1.2026#detail=1",
+                    "51.2",
+                    "50.5",
+                    "49.8",
+                    actual_state="better",
+                    previous_state="worse",
+                    previous_revised_from="49.5",
+                ),
+            ),
+            related_stories=(
+                CalendarRelatedStoryObservation(
+                    "US factory activity expanded",
+                    "https://www.forexfactory.com/news/1-us-factory-activity-expanded",
+                    "ismworld.org",
+                    "https://www.forexfactory.com/news/1-us-factory-activity-expanded/hit",
+                    "Sep 1, 2026",
+                    "tables",
+                ),
+            ),
+        )
+    )
+
+    detail = await repository.get_calendar_detail(item.source_id)
+
+    assert detail is not None
+    assert detail.source_name == "ISM"
+    assert detail.actual_state == "better"
+    assert detail.previous_revised_from == "49.5"
+    assert detail.history[0].release_date_text == "Sep 1, 2026"
+    assert detail.history[0].previous_state == "worse"
+    assert detail.related_stories[0].title_en == "US factory activity expanded"
 
 
 async def test_stale_translation_cannot_overwrite_changed_source(

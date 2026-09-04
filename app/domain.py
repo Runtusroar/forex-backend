@@ -39,6 +39,61 @@ class CalendarRecord(CalendarObservation):
 
 
 @dataclass(frozen=True, slots=True)
+class CalendarHistoryObservation:
+    release_date_text: str
+    event_url: str | None
+    actual: str | None
+    forecast: str | None
+    previous: str | None
+    actual_state: str | None = None
+    previous_state: str | None = None
+    previous_revised_from: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarRelatedStoryObservation:
+    title_en: str
+    ff_url: str
+    source_name: str | None
+    source_url: str | None
+    published_at_source_text: str | None
+    preview: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CalendarDetailObservation:
+    source_id: str
+    title_en: str
+    currency: str | None
+    currency_name: str | None
+    impact: str | None
+    actual: str | None
+    forecast: str | None
+    previous: str | None
+    actual_state: str | None
+    previous_state: str | None
+    previous_revised_from: str | None
+    ff_url: str | None
+    source_name: str | None
+    source_url: str | None
+    latest_release_url: str | None
+    measures: str | None
+    usual_effect: str | None
+    frequency: str | None
+    next_release_text: str | None
+    next_release_url: str | None
+    ff_notes: str | None
+    why_traders_care: str | None
+    history: tuple[CalendarHistoryObservation, ...] = ()
+    related_stories: tuple[CalendarRelatedStoryObservation, ...] = ()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CalendarDetailRecord(CalendarDetailObservation):
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class NewsRecord(NewsObservation):
     title_zh: str | None
     summary_zh: str | None

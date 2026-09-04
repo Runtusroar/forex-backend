@@ -220,7 +220,7 @@ async def test_status_exposes_schema_queues_and_sanitized_collector_state(
     )
 
     assert response.status_code == 200
-    assert response.json()["schema_version"] == 5
+    assert response.json()["schema_version"] == 6
     assert "detail_jobs" in response.json()
     assert "source_documents" not in response.json()
     assert response.json()["last_listing_error"] is None

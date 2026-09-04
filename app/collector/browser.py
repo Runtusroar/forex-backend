@@ -74,6 +74,19 @@ class BrowserSession:
         )
         return await self.calendar_page.content()
 
+    async def calendar_detail_html(self, day: date, source_id: str) -> str:
+        await self.connect()
+        assert self.calendar_page is not None
+        slug = f"{day:%b}{day.day}.{day.year}".lower()
+        await self.calendar_page.goto(
+            f"https://www.forexfactory.com/calendar?day={slug}#detail={source_id}",
+            wait_until="domcontentloaded",
+        )
+        await self.calendar_page.wait_for_selector(
+            "tr.calendar__details--detail", state="attached", timeout=20_000
+        )
+        return await self.calendar_page.content()
+
     async def news_html(self) -> str:
         await self.connect()
         assert self.news_page is not None

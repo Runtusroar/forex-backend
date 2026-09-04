@@ -9,8 +9,12 @@ from typing import Any
 
 from app.db import Database
 from app.domain import (
+    CalendarDetailObservation,
+    CalendarDetailRecord,
+    CalendarHistoryObservation,
     CalendarObservation,
     CalendarRecord,
+    CalendarRelatedStoryObservation,
     NewsObservation,
     NewsRecord,
     TranslationJob,
@@ -289,6 +293,185 @@ class Repository:
             (_iso(start), _iso(end)),
         )
         return [self._calendar(row) for row in rows]
+
+    async def get_calendar(self, source_id: str) -> CalendarRecord | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM calendar_events WHERE source_id=?", (source_id,)
+        )
+        return self._calendar(rows[0]) if rows else None
+
+    @_serialized_write
+    async def replace_calendar_detail(self, detail: CalendarDetailObservation) -> None:
+        now = _iso(_now())
+        assert now is not None
+        await self.db.execute(
+            """INSERT INTO calendar_event_details (
+                 source_id,title_en,currency,currency_name,impact,actual,forecast,previous,
+                 actual_state,previous_state,previous_revised_from,ff_url,source_name,
+                 source_url,latest_release_url,measures,usual_effect,frequency,
+                 next_release_text,next_release_url,ff_notes,why_traders_care,updated_at
+               )
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(source_id) DO UPDATE SET
+                 title_en=excluded.title_en,currency=excluded.currency,
+                 currency_name=excluded.currency_name,impact=excluded.impact,
+                 actual=excluded.actual,forecast=excluded.forecast,
+                 previous=excluded.previous,actual_state=excluded.actual_state,
+                 previous_state=excluded.previous_state,
+                 previous_revised_from=excluded.previous_revised_from,
+                 ff_url=excluded.ff_url,source_name=excluded.source_name,
+                 source_url=excluded.source_url,
+                 latest_release_url=excluded.latest_release_url,
+                 measures=excluded.measures,usual_effect=excluded.usual_effect,
+                 frequency=excluded.frequency,
+                 next_release_text=excluded.next_release_text,
+                 next_release_url=excluded.next_release_url,
+                 ff_notes=excluded.ff_notes,
+                 why_traders_care=excluded.why_traders_care,
+                 updated_at=excluded.updated_at""",
+            (
+                detail.source_id,
+                detail.title_en,
+                detail.currency,
+                detail.currency_name,
+                detail.impact,
+                detail.actual,
+                detail.forecast,
+                detail.previous,
+                detail.actual_state,
+                detail.previous_state,
+                detail.previous_revised_from,
+                detail.ff_url,
+                detail.source_name,
+                detail.source_url,
+                detail.latest_release_url,
+                detail.measures,
+                detail.usual_effect,
+                detail.frequency,
+                detail.next_release_text,
+                detail.next_release_url,
+                detail.ff_notes,
+                detail.why_traders_care,
+                now,
+            ),
+        )
+        await self.db.execute(
+            "DELETE FROM calendar_event_history WHERE source_id=?", (detail.source_id,)
+        )
+        await self.db.execute(
+            "DELETE FROM calendar_event_related_stories WHERE source_id=?",
+            (detail.source_id,),
+        )
+        await self.db.executemany(
+            """INSERT INTO calendar_event_history (
+                 source_id,position,release_date_text,event_url,actual,forecast,previous,
+                 actual_state,previous_state,previous_revised_from
+               )
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            [
+                (
+                    detail.source_id,
+                    position,
+                    row.release_date_text,
+                    row.event_url,
+                    row.actual,
+                    row.forecast,
+                    row.previous,
+                    row.actual_state,
+                    row.previous_state,
+                    row.previous_revised_from,
+                )
+                for position, row in enumerate(detail.history)
+            ],
+        )
+        await self.db.executemany(
+            """INSERT INTO calendar_event_related_stories (
+                 source_id,position,title_en,ff_url,source_name,source_url,
+                 published_at_source_text,preview
+               )
+               VALUES (?,?,?,?,?,?,?,?)""",
+            [
+                (
+                    detail.source_id,
+                    position,
+                    story.title_en,
+                    story.ff_url,
+                    story.source_name,
+                    story.source_url,
+                    story.published_at_source_text,
+                    story.preview,
+                )
+                for position, story in enumerate(detail.related_stories)
+            ],
+        )
+        await self.db.commit()
+
+    async def get_calendar_detail(self, source_id: str) -> CalendarDetailRecord | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM calendar_event_details WHERE source_id=?", (source_id,)
+        )
+        if not rows:
+            return None
+        history_rows = await self.db.execute_fetchall(
+            """SELECT * FROM calendar_event_history
+               WHERE source_id=? ORDER BY position,id""",
+            (source_id,),
+        )
+        story_rows = await self.db.execute_fetchall(
+            """SELECT * FROM calendar_event_related_stories
+               WHERE source_id=? ORDER BY position,id""",
+            (source_id,),
+        )
+        row = rows[0]
+        return CalendarDetailRecord(
+            source_id=row["source_id"],
+            title_en=row["title_en"],
+            currency=row["currency"],
+            currency_name=row["currency_name"],
+            impact=row["impact"],
+            actual=row["actual"],
+            forecast=row["forecast"],
+            previous=row["previous"],
+            actual_state=row["actual_state"],
+            previous_state=row["previous_state"],
+            previous_revised_from=row["previous_revised_from"],
+            ff_url=row["ff_url"],
+            source_name=row["source_name"],
+            source_url=row["source_url"],
+            latest_release_url=row["latest_release_url"],
+            measures=row["measures"],
+            usual_effect=row["usual_effect"],
+            frequency=row["frequency"],
+            next_release_text=row["next_release_text"],
+            next_release_url=row["next_release_url"],
+            ff_notes=row["ff_notes"],
+            why_traders_care=row["why_traders_care"],
+            history=tuple(
+                CalendarHistoryObservation(
+                    release_date_text=history["release_date_text"],
+                    event_url=history["event_url"],
+                    actual=history["actual"],
+                    forecast=history["forecast"],
+                    previous=history["previous"],
+                    actual_state=history["actual_state"],
+                    previous_state=history["previous_state"],
+                    previous_revised_from=history["previous_revised_from"],
+                )
+                for history in history_rows
+            ),
+            related_stories=tuple(
+                CalendarRelatedStoryObservation(
+                    title_en=story["title_en"],
+                    ff_url=story["ff_url"],
+                    source_name=story["source_name"],
+                    source_url=story["source_url"],
+                    published_at_source_text=story["published_at_source_text"],
+                    preview=story["preview"],
+                )
+                for story in story_rows
+            ),
+            updated_at=_dt(row["updated_at"]),
+        )  # type: ignore[arg-type]
 
     async def list_news(self, limit: int = 50, before: datetime | None = None) -> list[NewsRecord]:
         if before:

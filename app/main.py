@@ -11,7 +11,7 @@ from app.binance import BinanceFuturesContract, BinanceFuturesMarket, BinanceMar
 from app.collector import BrowserSession, Collector
 from app.config import Settings, get_settings
 from app.db import Database
-from app.domain import CalendarRecord, NewsRecord
+from app.domain import CalendarDetailRecord, CalendarRecord, NewsRecord
 from app.news.api import create_news_router
 from app.news.backfill import NewsBackfill
 from app.news.collector import NewsCollector
@@ -19,6 +19,8 @@ from app.news.compat import v1_news_detail, v1_news_list
 from app.news.media import MediaWorker
 from app.news.repository import NewsRepository
 from app.news.snapshots import SnapshotStore
+from app.parsers import parse_calendar_detail
+from app.parsers.errors import SourcePageError
 from app.repository import Repository
 from app.runtime import BackgroundRuntime
 from app.translation import KimiTranslator
@@ -38,6 +40,58 @@ def _calendar_json(item: CalendarRecord) -> dict:
         "previous": item.previous,
         "source_time_text": item.source_time_text,
         "source_position": item.source_position,
+        "updated_at": item.updated_at,
+    }
+
+
+def _calendar_detail_json(item: CalendarDetailRecord) -> dict:
+    return {
+        "source_id": item.source_id,
+        "title_en": item.title_en,
+        "currency": item.currency,
+        "currency_name": item.currency_name,
+        "impact": item.impact,
+        "actual": item.actual,
+        "forecast": item.forecast,
+        "previous": item.previous,
+        "actual_state": item.actual_state,
+        "previous_state": item.previous_state,
+        "previous_revised_from": item.previous_revised_from,
+        "ff_url": item.ff_url,
+        "source_name": item.source_name,
+        "source_url": item.source_url,
+        "latest_release_url": item.latest_release_url,
+        "measures": item.measures,
+        "usual_effect": item.usual_effect,
+        "frequency": item.frequency,
+        "next_release_text": item.next_release_text,
+        "next_release_url": item.next_release_url,
+        "ff_notes": item.ff_notes,
+        "why_traders_care": item.why_traders_care,
+        "history": [
+            {
+                "release_date_text": row.release_date_text,
+                "event_url": row.event_url,
+                "actual": row.actual,
+                "forecast": row.forecast,
+                "previous": row.previous,
+                "actual_state": row.actual_state,
+                "previous_state": row.previous_state,
+                "previous_revised_from": row.previous_revised_from,
+            }
+            for row in item.history
+        ],
+        "related_stories": [
+            {
+                "title_en": story.title_en,
+                "ff_url": story.ff_url,
+                "source_name": story.source_name,
+                "source_url": story.source_url,
+                "published_at_source_text": story.published_at_source_text,
+                "preview": story.preview,
+            }
+            for story in item.related_stories
+        ],
         "updated_at": item.updated_at,
     }
 
@@ -125,6 +179,7 @@ def create_app(
             )
             app.state.news_repository = news_repository
             browser = BrowserSession(configured.cdp_url)
+            app.state.calendar_browser = browser
             calendar_collector = Collector(
                 browser,
                 live_repository,
@@ -233,6 +288,31 @@ def create_app(
         items = await repository.list_calendar(start, end)
         generated_at = await repository.get_runtime_state("calendar_last_success") or now
         return {"items": [_calendar_json(item) for item in items], "generated_at": generated_at}
+
+    @app.get("/api/v1/calendar/{source_id}", dependencies=[Depends(authorize)])
+    async def calendar_detail(
+        source_id: str,
+        repository: Annotated[Repository, Depends(repo)],
+        request: Request,
+    ) -> dict:
+        detail = await repository.get_calendar_detail(source_id)
+        if detail is None:
+            event = await repository.get_calendar(source_id)
+            browser = getattr(request.app.state, "calendar_browser", None)
+            if event is not None and browser is not None:
+                event_day = event.event_at.astimezone(
+                    ZoneInfo(configured.calendar_source_timezone)
+                ).date()
+                try:
+                    html = await browser.calendar_detail_html(event_day, source_id)
+                    parsed = parse_calendar_detail(html, source_id, datetime.now(UTC))
+                    await repository.replace_calendar_detail(parsed)
+                    detail = await repository.get_calendar_detail(source_id)
+                except SourcePageError as exc:
+                    raise HTTPException(status_code=502, detail=str(exc)) from exc
+            if detail is None:
+                raise HTTPException(status_code=404, detail="Not found")
+        return _calendar_detail_json(detail)
 
     @app.get("/api/v1/news", dependencies=[Depends(authorize)])
     async def news(

@@ -1,18 +1,37 @@
 import re
 from datetime import UTC, date, datetime, timedelta, tzinfo
+from urllib.parse import urljoin
 
 from selectolax.parser import HTMLParser, Node
 
-from app.domain import CalendarObservation
+from app.domain import (
+    CalendarDetailObservation,
+    CalendarHistoryObservation,
+    CalendarObservation,
+    CalendarRelatedStoryObservation,
+)
 from app.parsers.errors import SourcePageError, reject_challenge
 
 CLOCK_PATTERN = re.compile(r"\d{1,2}:\d{2}(?:am|pm)", re.IGNORECASE)
+SOURCE_ROOT = "https://www.forexfactory.com"
 
 
 def _text(node: Node, selector: str) -> str | None:
     found = node.css_first(selector)
-    value = found.text(strip=True) if found else ""
+    value = _node_text(found) if found else ""
     return value or None
+
+
+def _node_text(node: Node | None) -> str:
+    if node is None:
+        return ""
+    return re.sub(r"\s+", " ", node.text(separator=" ", strip=True)).strip()
+
+
+def _absolute_url(value: str | None) -> str | None:
+    if not value or value == "null":
+        return None
+    return urljoin(SOURCE_ROOT, value)
 
 
 def _impact(node: Node) -> str:
@@ -27,6 +46,112 @@ def _impact(node: Node) -> str:
     if "gry" in classes:
         return "holiday"
     return "unknown"
+
+
+def _value_state(node: Node | None) -> str | None:
+    if node is None:
+        return None
+    classes = " ".join(
+        child.attributes.get("class", "") for child in [node, *node.css("*")]
+    )
+    if "better" in classes:
+        return "better"
+    if "worse" in classes:
+        return "worse"
+    return None
+
+
+def _revised_from(node: Node | None) -> str | None:
+    if node is None:
+        return None
+    title = node.attributes.get("title", "")
+    match = re.search(r"Revised from\s+(.+)", title)
+    return match.group(1).strip() if match else None
+
+
+def _specs(detail: Node) -> dict[str, tuple[str, list[Node]]]:
+    values: dict[str, tuple[str, list[Node]]] = {}
+    for row in detail.css(".calendarspecs tr"):
+        label = _node_text(row.css_first(".calendarspecs__spec"))
+        description = row.css_first(".calendarspecs__specdescription")
+        if not label or description is None:
+            continue
+        values[label] = (_node_text(description), description.css("a"))
+    return values
+
+
+def _spec_url(links: list[Node], index: int) -> str | None:
+    if len(links) <= index:
+        return None
+    return _absolute_url(links[index].attributes.get("href"))
+
+
+def _source_name(spec_value: str | None) -> str | None:
+    if not spec_value:
+        return None
+    return spec_value.split("(", 1)[0].strip() or None
+
+
+def _history(detail: Node) -> tuple[CalendarHistoryObservation, ...]:
+    rows: list[CalendarHistoryObservation] = []
+    for row in detail.css("table.calendarhistory tbody tr"):
+        date_node = row.css_first(".calendarhistory__row--history")
+        actual_node = row.css_first(".calendarhistory__row--actual")
+        forecast_node = row.css_first(".calendarhistory__row--forecast")
+        previous_node = row.css_first(".calendarhistory__row--previous")
+        release_date = _node_text(date_node)
+        if not release_date:
+            continue
+        previous_value = previous_node.css_first("span") if previous_node else None
+        rows.append(
+            CalendarHistoryObservation(
+                release_date_text=release_date,
+                event_url=_absolute_url(
+                    date_node.css_first("a").attributes.get("href")
+                    if date_node and date_node.css_first("a")
+                    else None
+                ),
+                actual=_node_text(actual_node) or None,
+                forecast=_node_text(forecast_node) or None,
+                previous=_node_text(previous_node) or None,
+                actual_state=_value_state(actual_node),
+                previous_state=_value_state(previous_node),
+                previous_revised_from=_revised_from(previous_value),
+            )
+        )
+    return tuple(rows)
+
+
+def _related_stories(detail: Node) -> tuple[CalendarRelatedStoryObservation, ...]:
+    story_nodes = detail.css(".news-block__item") or detail.css(".news-block")
+    stories: list[CalendarRelatedStoryObservation] = []
+    for story in story_nodes:
+        title_link = story.css_first(".news-block__title a[href*='/news/']")
+        title = _node_text(title_link)
+        ff_url = _absolute_url(title_link.attributes.get("href")) if title_link else None
+        if not title or not ff_url:
+            continue
+        source_link = story.css_first(".news-block__details a[href*='/hit']")
+        source_text = _node_text(source_link)
+        if source_text.lower().startswith("from "):
+            source_text = source_text[5:].strip()
+        details_text = _node_text(story.css_first(".news-block__details"))
+        published = None
+        if "|" in details_text:
+            published = details_text.split("|", 1)[1].strip() or None
+        stories.append(
+            CalendarRelatedStoryObservation(
+                title_en=title,
+                ff_url=ff_url,
+                source_name=source_text or None,
+                source_url=_absolute_url(source_link.attributes.get("href"))
+                if source_link
+                else None,
+                published_at_source_text=published,
+                preview=_node_text(story.css_first(".news-block__preview")) or None,
+            )
+        )
+    return tuple(stories)
 
 
 def _source_date(value: str | None) -> str | None:
@@ -116,3 +241,62 @@ def parse_calendar(
     if not results and expected_date is None:
         raise SourcePageError("calendar page contains no event rows")
     return results
+
+
+def parse_calendar_detail(
+    html: str,
+    source_id: str,
+    observed_at: datetime,
+) -> CalendarDetailObservation:
+    del observed_at
+    reject_challenge(html)
+    tree = HTMLParser(html)
+    active = tree.css_first(f"tr.calendar__row[data-event-id='{source_id}']")
+    detail = tree.css_first("tr.calendar__details--detail")
+    if detail is None:
+        raise SourcePageError("calendar detail row is missing")
+
+    title = _text(active, ".calendar__event") if active else None
+    if not title:
+        overlay_title = _node_text(detail.css_first(".overlay__title"))
+        title = re.sub(r"^[A-Z]{3}\s+", "", overlay_title).strip()
+    if not title:
+        raise SourcePageError("calendar detail missing title")
+
+    source_value, source_links = _specs(detail).get("Source", (None, []))
+    measures = _specs(detail).get("Measures", (None, []))[0]
+    usual_effect = _specs(detail).get("Usual Effect", (None, []))[0]
+    frequency = _specs(detail).get("Frequency", (None, []))[0]
+    next_release_text, next_release_links = _specs(detail).get("Next Release", (None, []))
+    ff_notes = _specs(detail).get("FF Notes", (None, []))[0]
+    why_traders_care = _specs(detail).get("Why Traders Care", (None, []))[0]
+    full_detail = detail.css_first(".calendardetails__solo a[href^='/calendar/']")
+    previous_value = active.css_first(".calendar__previous span") if active else None
+    currency_node = active.css_first(".calendar__currency abbr") if active else None
+
+    return CalendarDetailObservation(
+        source_id=source_id,
+        title_en=title,
+        currency=_text(active, ".calendar__currency") if active else None,
+        currency_name=currency_node.attributes.get("title") if currency_node else None,
+        impact=_impact(active) if active else None,
+        actual=_text(active, ".calendar__actual") if active else None,
+        forecast=_text(active, ".calendar__forecast") if active else None,
+        previous=_text(active, ".calendar__previous") if active else None,
+        actual_state=_value_state(active.css_first(".calendar__actual") if active else None),
+        previous_state=_value_state(active.css_first(".calendar__previous") if active else None),
+        previous_revised_from=_revised_from(previous_value),
+        ff_url=_absolute_url(full_detail.attributes.get("href")) if full_detail else None,
+        source_name=_source_name(source_value),
+        source_url=_spec_url(source_links, 0),
+        latest_release_url=_spec_url(source_links, 1),
+        measures=measures,
+        usual_effect=usual_effect,
+        frequency=frequency,
+        next_release_text=next_release_text,
+        next_release_url=_spec_url(next_release_links, 0),
+        ff_notes=ff_notes,
+        why_traders_care=why_traders_care,
+        history=_history(detail),
+        related_stories=_related_stories(detail),
+    )

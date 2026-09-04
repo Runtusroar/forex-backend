@@ -7,7 +7,13 @@ import httpx
 import app.main as main
 from app.config import Settings
 from app.db import Database
-from app.domain import CalendarObservation, NewsObservation
+from app.domain import (
+    CalendarDetailObservation,
+    CalendarHistoryObservation,
+    CalendarObservation,
+    CalendarRelatedStoryObservation,
+    NewsObservation,
+)
 from app.main import create_app
 from app.repository import Repository
 
@@ -25,6 +31,16 @@ async def make_client(tmp_path: Path) -> tuple[httpx.AsyncClient, Repository, Da
     repository = Repository(database)
     transport = httpx.ASGITransport(app=create_app(settings, repository=repository))
     return httpx.AsyncClient(transport=transport, base_url="http://test"), repository, database
+
+
+class FakeCalendarBrowser:
+    def __init__(self, html: str) -> None:
+        self.html = html
+        self.calls: list[tuple[object, str]] = []
+
+    async def calendar_detail_html(self, day: object, source_id: str) -> str:
+        self.calls.append((day, source_id))
+        return self.html
 
 
 async def test_calendar_requires_api_key(tmp_path: Path) -> None:
@@ -137,3 +153,125 @@ async def test_calendar_api_exposes_forex_factory_time_label_and_order(
     item = response.json()["items"][0]
     assert item["source_time_text"] == "Aug 23rd"
     assert item["source_position"] == 9
+
+
+async def test_calendar_detail_api_returns_cached_specs_history_and_related_stories(
+    tmp_path: Path,
+) -> None:
+    client, repository, database = await make_client(tmp_path)
+    now = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    await repository.upsert_calendar(
+        [CalendarObservation("1", now, "USD", "high", "ISM PMI", "51.2", "50", "49")]
+    )
+    await repository.replace_calendar_detail(
+        CalendarDetailObservation(
+            source_id="1",
+            title_en="ISM PMI",
+            currency="USD",
+            currency_name="US dollar",
+            impact="high",
+            actual="51.2",
+            forecast="50",
+            previous="49",
+            actual_state="better",
+            previous_state=None,
+            previous_revised_from=None,
+            ff_url="https://www.forexfactory.com/calendar/1-us-ism-pmi",
+            source_name="ISM",
+            source_url="https://www.ismworld.org/",
+            latest_release_url=None,
+            measures="Level of a diffusion index;",
+            usual_effect="'Actual' greater than 'Forecast' is good for currency;",
+            frequency="Released monthly;",
+            next_release_text="Oct 1, 2026",
+            next_release_url="https://www.forexfactory.com/calendar?day=oct1.2026#detail=2",
+            ff_notes=None,
+            why_traders_care="It is a leading indicator;",
+            history=(
+                CalendarHistoryObservation(
+                    "Sep 1, 2026",
+                    "https://www.forexfactory.com/calendar?day=sep1.2026#detail=1",
+                    "51.2",
+                    "50",
+                    "49",
+                    actual_state="better",
+                ),
+            ),
+            related_stories=(
+                CalendarRelatedStoryObservation(
+                    "Factories expanded",
+                    "https://www.forexfactory.com/news/1",
+                    "ismworld.org",
+                    "https://www.forexfactory.com/news/1/hit",
+                    "Sep 1, 2026",
+                    "tables",
+                ),
+            ),
+        )
+    )
+
+    async with client:
+        response = await client.get(
+            "/api/v1/calendar/1", headers={"X-API-Key": "api-secret"}
+        )
+    await database.close()
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["source_id"] == "1"
+    assert payload["currency_name"] == "US dollar"
+    assert payload["source_name"] == "ISM"
+    assert payload["history"][0]["actual_state"] == "better"
+    assert payload["related_stories"][0]["title_en"] == "Factories expanded"
+
+
+async def test_calendar_detail_api_collects_and_caches_missing_detail(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        database_path=tmp_path / "api.sqlite3",
+        app_api_key="api-secret",
+        moonshot_api_key="kimi-secret",
+        calendar_source_timezone="America/New_York",
+    )
+    database = Database(settings.database_path)
+    await database.open()
+    await database.initialize()
+    repository = Repository(database)
+    event_at = datetime(2026, 8, 31, 12, tzinfo=UTC)
+    await repository.upsert_calendar(
+        [
+            CalendarObservation(
+                "149673",
+                event_at,
+                "JPY",
+                "low",
+                "Prelim Industrial Production m/m",
+                "0.1%",
+                "-0.7%",
+                "1.9%",
+            )
+        ]
+    )
+    app = create_app(settings, repository=repository)
+    fake_browser = FakeCalendarBrowser(
+        (Path(__file__).parent / "fixtures/calendar_detail.html").read_text()
+    )
+    app.state.calendar_browser = fake_browser
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    )
+
+    async with client:
+        response = await client.get(
+            "/api/v1/calendar/149673", headers={"X-API-Key": "api-secret"}
+        )
+    cached = await repository.get_calendar_detail("149673")
+    await database.close()
+
+    assert response.status_code == 200, response.text
+    assert fake_browser.calls == [(event_at.date(), "149673")]
+    assert response.json()["source_name"] == "METI"
+    assert cached is not None
+    assert cached.ff_url == "https://www.forexfactory.com/calendar/225-jn-prelim-industrial-production-mm"

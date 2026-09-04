@@ -7,6 +7,7 @@ from app.parsers import (
     ChallengePageError,
     SourcePageError,
     parse_calendar,
+    parse_calendar_detail,
     parse_news_detail,
     parse_news_listing,
 )
@@ -102,6 +103,39 @@ def test_calendar_preserves_non_clock_source_labels() -> None:
     assert rows[1].source_time_text == "Aug 23rd"
     assert rows[1].source_position == 1
     assert rows[1].event_at == datetime(2026, 9, 8, 16, tzinfo=UTC)
+
+
+def test_calendar_detail_reads_specs_history_and_related_stories() -> None:
+    detail = parse_calendar_detail(
+        fixture("calendar_detail.html"),
+        "149673",
+        datetime(2026, 8, 31, 12, tzinfo=UTC),
+    )
+
+    assert detail.source_id == "149673"
+    assert detail.currency == "JPY"
+    assert detail.currency_name == "Japanese yen"
+    assert detail.title_en == "Prelim Industrial Production m/m"
+    assert detail.actual_state == "better"
+    assert detail.previous_revised_from == "1.3%"
+    assert detail.ff_url == "https://www.forexfactory.com/calendar/225-jn-prelim-industrial-production-mm"
+    assert detail.source_name == "METI"
+    assert detail.source_url == "https://www.meti.go.jp/english/"
+    assert detail.latest_release_url == "http://www.meti.go.jp/english/statistics/tyo/iip/index.html"
+    assert detail.measures == "Change in total output;"
+    assert detail.usual_effect == "'Actual' greater than 'Forecast' is good for currency;"
+    assert detail.frequency == "Released monthly;"
+    assert detail.next_release_text == "Sep 30, 2026"
+    assert detail.next_release_url == "https://www.forexfactory.com/calendar?day=sep30.2026#detail=149674"
+    assert detail.ff_notes == "Preliminary release tends to have the most impact;"
+    assert detail.why_traders_care == "It is a leading indicator of economic health;"
+    assert len(detail.history) == 2
+    assert detail.history[0].event_url == "https://www.forexfactory.com/calendar?day=aug31.2026#detail=149673"
+    assert detail.history[0].actual_state == "better"
+    assert detail.history[0].previous_revised_from == "1.3%"
+    assert len(detail.related_stories) == 1
+    assert detail.related_stories[0].title_en.startswith("Japan: Indices")
+    assert detail.related_stories[0].source_name == "meti.go.jp"
 
 
 def test_news_relative_age_does_not_change_translatable_data() -> None:
