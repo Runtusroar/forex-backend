@@ -369,6 +369,93 @@ async def test_only_complete_comment_collection_deactivates_missing_rows(
     assert await news_repository.comment_count("1416149") == 1
 
 
+async def test_comment_parent_is_kept_only_when_parent_row_is_materialized(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=2))
+    parent = CommentObservation(
+        "parent", "1416149", "Parent", "Older visible body", "https://ff.test/parent", NOW
+    )
+    child = CommentObservation(
+        "child",
+        "1416149",
+        "Child",
+        "Child body",
+        "https://ff.test/child",
+        NOW,
+        parent_comment_id="parent",
+        position=1,
+        depth=1,
+    )
+    await news_repository.replace_comments(
+        CommentCollectionObservation("1416149", NOW, 2, (parent, child), True)
+    )
+
+    refreshed_child = CommentObservation(
+        "child",
+        "1416149",
+        "Child",
+        "Updated child body",
+        "https://ff.test/child",
+        NOW + timedelta(minutes=1),
+        parent_comment_id="parent",
+        position=1,
+        depth=1,
+    )
+    await news_repository.replace_comments(
+        CommentCollectionObservation(
+            "1416149", NOW + timedelta(minutes=1), 2, (refreshed_child,), False
+        )
+    )
+    rows, _ = await news_repository.list_comments("1416149", 10)
+    by_id = {row["comment_id"]: row for row in rows}
+
+    assert by_id["parent"]["text_en"] == "Older visible body"
+    assert by_id["child"]["parent_comment_id"] == "parent"
+
+
+async def test_unknown_and_self_comment_parents_are_cleared_but_depth_is_preserved(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=2))
+    unknown_parent = CommentObservation(
+        "child",
+        "1416149",
+        "Child",
+        "Child body",
+        "https://ff.test/child",
+        NOW,
+        parent_comment_id="hidden-parent",
+        depth=1,
+    )
+    self_parent = CommentObservation(
+        "self",
+        "1416149",
+        "Self",
+        "Self body",
+        "https://ff.test/self",
+        NOW,
+        parent_comment_id="self",
+        depth=2,
+    )
+
+    await news_repository.replace_comments(
+        CommentCollectionObservation(
+            "1416149", NOW, 2, (unknown_parent, self_parent), False
+        )
+    )
+    rows, _ = await news_repository.list_comments("1416149", 10)
+
+    assert {(row["comment_id"], row["parent_comment_id"], row["depth"]) for row in rows} == {
+        ("child", None, 1),
+        ("self", None, 2),
+    }
+    self_rows = await news_repository.db.execute_fetchall(
+        "SELECT count(*) AS count FROM news_comments WHERE parent_comment_id=comment_id"
+    )
+    assert self_rows[0]["count"] == 0
+
+
 async def test_comment_jobs_track_latest_expected_count_and_priority(
     news_repository: NewsRepository,
 ) -> None:
@@ -797,7 +884,9 @@ async def test_mismatch_metadata_preserves_declared_count_and_comments(news_repo
     assert detail["article"]["comments_source_complete"] == 1
     assert detail["article"]["comments_state"] == "partial"
     assert await news_repository.comment_count("1416149") == 2
-    assert (await news_repository.status_counts())["comments_count_mismatch"] == 1
+    status = await news_repository.status_counts()
+    assert status["comments_count_mismatch"] == 1
+    assert status["comment_states"] == {"partial": 1}
 
 
 async def test_status_excludes_obsolete_failed_media(news_repository):

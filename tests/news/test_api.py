@@ -277,6 +277,19 @@ async def test_status_reports_stale_listing_even_without_recent_exception(api):
     assert "listing_stale" in response.json()["issues"]
 
 
+async def test_status_reports_partial_comments_when_source_counts_match(api):
+    repo = api._transport.app.state.news_repository
+    now = datetime.now(UTC)
+    await repo.set_runtime_state("news_last_listing_success", now.isoformat())
+    await repo.replace_comments(CommentCollectionObservation(
+        article_id="100", observed_at=now, expected_count=1, comments=(),
+        is_complete=False, source_complete=True, visible_count=1,
+    ))
+    response = await api.get("/api/v2/status", headers={"X-API-Key": "api-secret"})
+    assert response.json()["status"] == "degraded"
+    assert "comments_partial" in response.json()["issues"]
+
+
 async def test_status_exposes_backfill_coverage_and_reason(api):
     import json
 

@@ -316,6 +316,8 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
                     backfill[section] = {"stop_reason": "invalid_checkpoint"}
         if result.get("comments_count_mismatch", 0):
             issues.append("comment_count_mismatch")
+        if result.get("comment_states", {}).get("partial", 0):
+            issues.append("comments_partial")
         result.update({
             "status": "degraded" if issues else "ok",
             "issues": issues,

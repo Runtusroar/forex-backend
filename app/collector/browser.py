@@ -46,6 +46,10 @@ class NewsCommentCapture:
     source_exhausted: bool = False
 
 
+class SourceAccessRestrictedError(SourcePageError):
+    """The source explicitly requires authentication to show the requested article."""
+
+
 class CalendarDetailPages(dict[str, str | None]):
     """A compatible mapping that also retains evidence for unavailable details."""
 
@@ -136,7 +140,10 @@ async def _visible(locator: Locator) -> bool:
 
 
 async def _settled_news_block(
-    page: Page, block: Locator, activity: _SourceActivity
+    page: Page,
+    block: Locator,
+    activity: _SourceActivity,
+    before_ids: frozenset[str] | None = None,
 ) -> tuple[frozenset[str], bool]:
     # The More control disappears while XHR is in flight. Its absence alone is
     # never a terminal signal; wait for source AJAX and a stable DOM.
@@ -148,7 +155,10 @@ async def _settled_news_block(
         loading = activity.loading or bool(await block.locator(LOADING_SELECTOR).count())
         state = (ids, more_visible)
         stable = stable + 1 if state == previous and not loading else 0
-        if stable >= 8:
+        # After a click, an absent button without new IDs may still be a delayed render.
+        # Without explicit empty-response evidence, leave that case retryable at the deadline.
+        progressed = before_ids is None or bool(ids - before_ids)
+        if stable >= 8 and progressed:
             if (
                 ids == await _source_ids(block)
                 and more_visible == await _visible(block.get_by_text("More", exact=True).last)
@@ -335,7 +345,17 @@ class BrowserSession:
         page = await self.browser.contexts[0].new_page()
         try:
             with _SourceActivity(page) as activity:
-                await page.goto(url, wait_until="domcontentloaded")
+                response = await page.goto(url, wait_until="domcontentloaded")
+                notice = page.locator(".error__body")
+                if await _visible(notice):
+                    text = " ".join((await notice.inner_text()).lower().split())
+                    if "only accessible to registered traders" in text:
+                        status = response.status if response is not None else None
+                        error = SourceAccessRestrictedError(
+                            f"source article requires registered-trader login (HTTP {status})"
+                        )
+                        error.source_html = await page.content()
+                        raise error
                 await page.wait_for_selector(".news__article", state="attached", timeout=20_000)
                 if not expand_comments:
                     await _settled_markup(page, ".news__article", activity)
@@ -438,9 +458,13 @@ class BrowserSession:
                         break
                     more = block.get_by_text("More", exact=True).last
                     before = source_ids
+                    # Category controls prefetch on hover and can ignore a click
+                    # while that response is still loading.
+                    await more.hover()
+                    await _settled_news_block(self.news_page, block, activity)
                     await more.click()
                     source_ids, terminal = await _settled_news_block(
-                        self.news_page, block, activity
+                        self.news_page, block, activity, before_ids=before
                     )
                     if source_ids - before:
                         completed += 1

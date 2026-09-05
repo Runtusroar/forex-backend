@@ -110,6 +110,11 @@ comments. Stable Forex Factory comment IDs are the deduplication
 key; position and nesting depth preserve thread order. A six-hour audit rechecks recent discussions
 even when the listing count did not change. Listing previews have lower quality than detail comments
 and cannot overwrite a complete author, body, timestamp, or reaction count.
+Collapsed source placeholders are counted by their own IDs without inventing comment bodies or
+borrowing nested replies. When parsed comments and hidden placeholders account for the exhausted
+DOM, the job finishes as partial and preserves older stored bodies for the periodic audit. Unknown
+hidden parents remain nullable; already stored parents retain their relationship. Status reports
+partial comments even when the source's declared and visible counts agree.
 
 Media is downloaded with type, signature, and size validation, then deduplicated by SHA-256.
 Forex Factory image attachments that return an HTTP 403 can use the existing Chromium session;
@@ -123,6 +128,9 @@ by the periodic audit without an endless immediate retry loop. A low-priority, c
 backfill follows each section's visible `More` control toward a 30-day target and yields whenever
 live detail work is waiting. Checkpoints reopen daily and distinguish reaching the target from
 source exhaustion or stalled pagination; source exhaustion does not prove 30-day coverage.
+Category pagination waits for hover-triggered prefetch before clicking `More`, then requires new
+article IDs; a disappearing button alone cannot prove exhaustion. Explicit registered-trader notices are reported as source
+access restrictions and do not replace previously cached content.
 
 Forex Factory `full story` anchors are stored as structured segment links, not flattened into
 paragraph text. Video-only articles preserve their caption and playback URL as a `link` segment

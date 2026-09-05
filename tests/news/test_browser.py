@@ -490,6 +490,9 @@ class MoreLocator:
     async def is_visible(self):
         return not self.page.loading and not self.page.terminal
 
+    async def hover(self):
+        pass
+
     async def click(self):
         self.page.loading = True
         self.page.ticks = 0
@@ -825,3 +828,161 @@ async def test_same_origin_analytics_does_not_block_ready_article() -> None:
     assert (
         await session.news_detail_html("https://example.test/news/1") == "<html>64 comments</html>"
     )
+
+
+async def test_news_more_waits_for_delayed_dom_after_response_finished() -> None:
+    class DelayedLocator(MoreLocator):
+        def get_by_text(self, _text, **_kwargs):
+            return DelayedLocator(self.page, "more")
+
+        async def click(self):
+            self.page.clicked = True
+            self.page.ticks = 0
+
+    class DelayedPage(MorePage):
+        clicked = False
+
+        def locator(self, selector):
+            return DelayedLocator(self, selector)
+
+        async def wait_for_timeout(self, _milliseconds):
+            if self.clicked:
+                self.ticks += 1
+                if self.ticks >= 36:
+                    self.ids.add("2")
+
+    page = DelayedPage()
+    session = BrowserSession("http://chrome:9222")
+    session.browser = FakeBrowser(FakeContext())
+    session.news_page = page
+    capture = await session.news_more_html("latest", 1)
+    assert capture.source_ids == frozenset({"1", "2"})
+    assert capture.continuation_count == 1
+    assert capture.terminal is False
+
+
+@pytest.mark.parametrize("kind", ["detail", "comments"])
+async def test_registered_trader_notice_is_classified_before_article_selector_timeout(kind) -> None:
+    from types import SimpleNamespace
+
+    from app.parsers.errors import SourcePageError
+
+    class NoticeLocator(CommentLocator):
+        async def count(self):
+            return 1 if self.selector == ".error__body" else 0
+
+        async def inner_text(self):
+            return (
+                "You've requested a page only accessible to registered traders. "
+                "Please log in to view the requested page."
+            )
+
+    class NoticePage(CommentPage):
+        waited_for_article = False
+
+        async def goto(self, *_args, **_kwargs):
+            return SimpleNamespace(status=400)
+
+        def locator(self, selector):
+            return NoticeLocator(self, selector)
+
+        async def wait_for_selector(self, selector, **_kwargs):
+            self.waited_for_article = True
+            raise TimeoutError("article selector absent on login notice")
+
+        async def content(self):
+            return (
+                '<title>Notice | Forex Factory</title><ul class="error__body">Login required</ul>'
+            )
+
+    page = NoticePage()
+    session = BrowserSession("http://chrome:9222")
+    session.browser = FakeBrowser(CommentContext(page))
+    with pytest.raises(SourcePageError, match="registered-trader login") as caught:
+        if kind == "detail":
+            await session.news_detail_html("https://www.forexfactory.com/news/1416463-test")
+        else:
+            await session.news_comments_html("https://www.forexfactory.com/news/1416463-test", 0)
+    assert type(caught.value).__name__ == "SourceAccessRestrictedError"
+    assert caught.value.source_html == await page.content()
+    assert page.waited_for_article is False
+    assert page.closed is True
+
+
+async def test_news_more_waits_for_hover_prefetch_before_click() -> None:
+    class PrefetchLocator(MoreLocator):
+        def get_by_text(self, _text, **_kwargs):
+            return PrefetchLocator(self.page, "more")
+
+        async def hover(self):
+            self.page.prefetching = True
+
+        async def click(self):
+            if self.page.prefetched:
+                self.page.ids.add("2")
+            else:
+                # The live control starts prefetch on pointer entry and ignores
+                # the immediate click until that response becomes available.
+                self.page.prefetching = True
+
+    class PrefetchPage(MorePage):
+        prefetching = False
+        prefetched = False
+        ticks = 0
+
+        def locator(self, selector):
+            return PrefetchLocator(self, selector)
+
+        async def wait_for_timeout(self, _milliseconds):
+            if self.prefetching:
+                self.ticks += 1
+                if self.ticks >= 5:
+                    self.prefetched = True
+
+    page = PrefetchPage()
+    session = BrowserSession("http://chrome:9222")
+    session.browser = FakeBrowser(FakeContext())
+    session.news_page = page
+    capture = await session.news_more_html("latest", 1)
+    assert capture.source_ids == frozenset({"1", "2"})
+    assert capture.continuation_count == 1
+
+
+@pytest.mark.parametrize("render_delay", [36, None])
+async def test_hidden_more_after_finished_request_does_not_prove_exhaustion(render_delay) -> None:
+    from app.parsers.errors import SourcePageError
+
+    class HiddenLocator(MoreLocator):
+        def locator(self, selector):
+            return HiddenLocator(self.page, selector)
+
+        def get_by_text(self, _text, **_kwargs):
+            return HiddenLocator(self.page, "more")
+
+        async def count(self):
+            return 0 if "loading" in self.kind else await super().count()
+
+    class DelayedPage(MorePage):
+        def locator(self, selector):
+            return HiddenLocator(self, selector)
+
+        async def wait_for_timeout(self, _milliseconds):
+            if self.loading:
+                self.ticks += 1
+                if render_delay is not None and self.ticks >= render_delay:
+                    self.ids.add("2")
+                    self.loading = False
+
+    page = DelayedPage()
+    session = BrowserSession("http://chrome:9222")
+    session.browser = FakeBrowser(FakeContext())
+    session.news_page = page
+    if render_delay is None:
+        with pytest.raises(SourcePageError, match="did not stabilize"):
+            await session.news_more_html("latest", 1)
+        assert page.ticks == 120
+    else:
+        capture = await session.news_more_html("latest", 1)
+        assert capture.source_ids == frozenset({"1", "2"})
+        assert capture.continuation_count == 1
+        assert capture.terminal is False

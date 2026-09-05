@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
@@ -20,12 +21,38 @@ from app.parsers.errors import SourcePageError, reject_challenge
 SOURCE_ROOT = "https://www.forexfactory.com"
 
 
+@dataclass(frozen=True, slots=True)
+class NewsCommentParseResult:
+    comments: tuple[CommentObservation, ...]
+    hidden_comment_ids: frozenset[str]
+
+
 def _clean(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
 def _key(*values: str | None) -> str:
     return hashlib.sha256("\n".join(value or "" for value in values).encode()).hexdigest()
+
+
+def _is_comment(node: Node) -> bool:
+    return "news-comment" in node.attributes.get("class", "").split()
+
+
+def _owned(node: Node, selector: str) -> list[Node]:
+    owned: list[Node] = []
+    for candidate in node.css(selector):
+        parent = candidate.parent
+        while parent is not None and not _is_comment(parent):
+            parent = parent.parent
+        if parent == node:
+            owned.append(candidate)
+    return owned
+
+
+def _owned_first(node: Node, selector: str) -> Node | None:
+    candidates = _owned(node, selector)
+    return candidates[0] if candidates else None
 
 
 def _published(
@@ -56,21 +83,42 @@ def _published(
     return None
 
 
+def _comment_node_id(node: Node) -> str | None:
+    anchor = _owned_first(node, "a.anchor[id^='post']")
+    if anchor:
+        match = re.fullmatch(r"post(\d+)", anchor.attributes.get("id", ""))
+        if match:
+            return match.group(1)
+    control = _owned_first(node, "[data-comment-id]")
+    if control:
+        comment_id = control.attributes.get("data-comment-id", "")
+        if comment_id.isdigit():
+            return comment_id
+    return None
+
+
 def _comment_id(node: Node) -> tuple[str, str] | None:
-    link = node.css_first("a[href*='/comment/']")
-    if not link:
-        return None
-    href = link.attributes.get("href", "")
-    match = re.search(r"/comment/(\d+)", href)
-    return (match.group(1), urljoin(SOURCE_ROOT, href)) if match else None
+    node_id = _comment_node_id(node)
+    fallback: tuple[str, str] | None = None
+    for link in _owned(node, "a[href*='/comment/']"):
+        href = link.attributes.get("href", "")
+        match = re.search(r"/comment/(\d+)", href)
+        if not match:
+            continue
+        identity = (match.group(1), urljoin(SOURCE_ROOT, href))
+        if node_id == identity[0]:
+            return identity
+        if fallback is None:
+            fallback = identity
+    return fallback if node_id is None else None
 
 
 def _parent_comment_id(node: Node) -> str | None:
     parent = node.parent
     while parent is not None:
-        if "news-comment" in parent.attributes.get("class", "").split():
+        if _is_comment(parent):
             identity = _comment_id(parent)
-            return identity[0] if identity else None
+            return _comment_node_id(parent) or (identity[0] if identity else None)
         parent = parent.parent
     return None
 
@@ -79,7 +127,7 @@ def _comment_depth(node: Node) -> int:
     depth = 0
     parent = node.parent
     while parent is not None:
-        if "news-comment" in parent.attributes.get("class", "").split():
+        if _is_comment(parent):
             depth += 1
         parent = parent.parent
     return depth
@@ -118,15 +166,20 @@ def _parse_comments(
     article_id: str,
     observed_at: datetime,
     source_timezone: ZoneInfo,
-) -> tuple[CommentObservation, ...]:
+) -> NewsCommentParseResult:
     comments: list[CommentObservation] = []
+    hidden_comment_ids: set[str] = set()
     for position, node in enumerate(tree.css(".news-comments__list .news-comment")):
+        if "news-comment--collapsed" in node.attributes.get("class", "").split():
+            if comment_id := _comment_node_id(node):
+                hidden_comment_ids.add(comment_id)
+            continue
         identity = _comment_id(node)
-        message = node.css_first(".news-comment__comment-message")
+        message = _owned_first(node, ".news-comment__comment-message")
         if not identity or not message:
             continue
-        author = node.css_first(".news-comment__header-username")
-        source_time = node.css_first(".news-comment__header-date")
+        author = _owned_first(node, ".news-comment__header-username")
+        source_time = _owned_first(node, ".news-comment__header-date")
         source_time_text = _comment_source_time(source_time)
         comments.append(
             CommentObservation(
@@ -144,7 +197,17 @@ def _parse_comments(
                 depth=_comment_depth(node),
             )
         )
-    return tuple(comments)
+    return NewsCommentParseResult(tuple(comments), frozenset(hidden_comment_ids))
+
+
+def parse_news_comment_collection(
+    html: str,
+    article_id: str,
+    observed_at: datetime,
+    source_timezone: ZoneInfo,
+) -> NewsCommentParseResult:
+    reject_challenge(html)
+    return _parse_comments(HTMLParser(html), article_id, observed_at, source_timezone)
 
 
 def parse_news_comments(
@@ -153,8 +216,9 @@ def parse_news_comments(
     observed_at: datetime,
     source_timezone: ZoneInfo,
 ) -> tuple[CommentObservation, ...]:
-    reject_challenge(html)
-    return _parse_comments(HTMLParser(html), article_id, observed_at, source_timezone)
+    return parse_news_comment_collection(
+        html, article_id, observed_at, source_timezone
+    ).comments
 
 
 def parse_news_detail_v2(
@@ -330,6 +394,6 @@ def parse_news_detail_v2(
         segments=tuple(segments),
         links=tuple(links),
         media=tuple(media),
-        comments=_parse_comments(tree, article_id, observed_at, source_timezone),
+        comments=_parse_comments(tree, article_id, observed_at, source_timezone).comments,
         is_complete=len(segments) == len(article_nodes),
     )

@@ -7,7 +7,7 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from app.collector.browser import NewsCommentCapture
-from app.news.detail import parse_news_comments
+from app.news.detail import parse_news_comment_collection
 from app.news.models import CommentCollectionObservation
 from app.news.repository import NewsRepository
 from app.news.snapshots import SnapshotStore
@@ -24,6 +24,10 @@ class CommentCountMismatch(ValueError):
 
 
 class CommentSourceIncomplete(ValueError):
+    pass
+
+
+class SourceCommentsUnavailable(ValueError):
     pass
 
 
@@ -64,11 +68,13 @@ class CommentCollector:
         try:
             capture = await self.browser.news_comments_html(job.ff_url, job.expected_count)
             html = capture.html
-            parsed_comments = parse_news_comments(
+            parsed = parse_news_comment_collection(
                 html, job.article_id, observed_at, self.source_timezone
             )
-            comments_by_id = {comment.comment_id: comment for comment in parsed_comments}
+            comments_by_id = {comment.comment_id: comment for comment in parsed.comments}
             comments = tuple(comments_by_id.values())
+            hidden_comment_ids = parsed.hidden_comment_ids.difference(comments_by_id)
+            accounted_count = len(comments) + len(hidden_comment_ids)
             previous_count = await self.repository.comment_count(job.article_id)
             unverified_zero = (
                 capture.declared_count == 0
@@ -78,6 +84,7 @@ class CommentCollector:
             )
             is_complete = (
                 capture.source_exhausted
+                and not hidden_comment_ids
                 and len(comments) == capture.declared_count
                 and capture.collected_count == capture.declared_count
                 and not unverified_zero
@@ -103,15 +110,24 @@ class CommentCollector:
                 if not capture.source_exhausted or unverified_zero:
                     collection_error = CommentSourceIncomplete(
                         f"declared={capture.declared_count} visible={capture.collected_count}"
-                )
-                terminal_mismatch = (
-                    isinstance(collection_error, CommentCountMismatch)
-                    and capture.source_exhausted
-                    and capture.collected_count == len(comments)
-                    and capture.declared_count != len(comments)
+                    )
+                elif (
+                    hidden_comment_ids
+                    and accounted_count == capture.collected_count
+                ):
+                    collection_error = SourceCommentsUnavailable(
+                        f"hidden={len(hidden_comment_ids)} visible={capture.collected_count}"
+                    )
+                terminal_partial = (
+                    capture.source_exhausted
+                    and capture.collected_count == accounted_count
                     and not unverified_zero
+                    and (
+                        bool(hidden_comment_ids)
+                        or capture.declared_count != len(comments)
+                    )
                 )
-                if not terminal_mismatch:
+                if not terminal_partial:
                     raise collection_error
                 if self.snapshot_store:
                     with suppress(Exception):

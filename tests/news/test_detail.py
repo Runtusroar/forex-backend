@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from app.news.detail import parse_news_detail_v2
+from app.news.detail import parse_news_comments, parse_news_detail_v2
 
 HTML = (Path(__file__).parents[1] / "fixtures/news_v2/detail_alloy.html").read_text()
 TRUTH_SOCIAL_HTML = (
@@ -17,6 +17,9 @@ CAPTIONLESS_VIDEO_HTML = (
 ).read_text()
 PARTIAL_HTML = (
     Path(__file__).parents[1] / "fixtures/news_v2/detail_partial_unrecognized_audit.html"
+).read_text()
+COLLAPSED_PARENT_HTML = (
+    Path(__file__).parents[1] / "fixtures/news_v2/comments_collapsed_parent_audit.html"
 ).read_text()
 NOW = datetime(2026, 9, 3, tzinfo=UTC)
 
@@ -144,3 +147,15 @@ def test_unrecognized_article_node_makes_detail_partial() -> None:
 
     assert [segment.text_en for segment in detail.segments] == ["First recognized segment."]
     assert detail.is_complete is False
+
+
+def test_collapsed_parent_does_not_borrow_nested_reply_identity_or_body() -> None:
+    comments = parse_news_comments(
+        COLLAPSED_PARENT_HTML, "1414850", NOW, ZoneInfo("Asia/Shanghai")
+    )
+
+    assert len(comments) == 1
+    assert comments[0].comment_id == "15870032"
+    assert comments[0].author_name == "Visible Child"
+    assert comments[0].text_en == "Visible child body."
+    assert comments[0].parent_comment_id == "15869995"

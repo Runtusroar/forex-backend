@@ -8,6 +8,7 @@ from app.collector.browser import NewsCommentCapture
 from app.db import Database
 from app.news.collector import NewsCollector
 from app.news.comments import CommentCollector
+from app.news.models import CommentCollectionObservation, CommentObservation
 from app.news.repository import NewsRepository
 from app.news.snapshots import SnapshotStore
 
@@ -17,6 +18,8 @@ DETAIL = (FIXTURES / "news_v2/detail_alloy.html").read_text()
 UNSUPPORTED_WITH_COMMENT = (
     FIXTURES / "news_v2/comments_unsupported_audit.html"
 ).read_text()
+HIDDEN_COVERAGE = (FIXTURES / "news_v2/comments_hidden_coverage_audit.html").read_text()
+UNACCOUNTED_NODE = (FIXTURES / "news_v2/comments_unaccounted_node_audit.html").read_text()
 NOW = datetime(2026, 9, 3, tzinfo=UTC)
 
 
@@ -169,4 +172,81 @@ async def test_equal_counts_without_source_exhaustion_preserve_prior_comments_an
     assert {row["comment_id"] for row in comments} == {"700", "701"}
     assert await news_repository.get_runtime_state("news_last_comment_error") == (
         "CommentSourceIncomplete"
+    )
+
+
+async def test_exhausted_hidden_comments_finish_partial_and_preserve_old_body(
+    news_repository: NewsRepository, tmp_path: Path
+) -> None:
+    browser = FixtureBrowser(HIDDEN_COVERAGE, 15, 15, source_exhausted=True)
+    await NewsCollector(browser, news_repository, ZoneInfo("Asia/Shanghai")).run_listing_cycle(
+        NOW
+    )
+    hidden_old_body = CommentObservation(
+        "2012",
+        "100",
+        "Previously Visible",
+        "Older body retained after source moderation.",
+        "https://www.forexfactory.com/news/coverage/comment/2012#post2012",
+        NOW - timedelta(days=1),
+    )
+    await news_repository.replace_comments(
+        CommentCollectionObservation(
+            "100", NOW - timedelta(days=1), 15, (hidden_old_body,), False
+        )
+    )
+    snapshot_store = SnapshotStore(tmp_path / "hidden-snapshots", news_repository)
+
+    result = await CommentCollector(
+        browser,
+        news_repository,
+        ZoneInfo("Asia/Shanghai"),
+        snapshot_store=snapshot_store,
+    ).run_cycle(NOW)
+    comments, _ = await news_repository.list_comments("100", 20)
+    article_rows = await news_repository.db.execute_fetchall(
+        """SELECT comment_count,comments_state,comments_source_complete,
+                  comments_visible_count
+           FROM news_articles WHERE source_id='100'"""
+    )
+    snapshot_rows = await news_repository.db.execute_fetchall(
+        "SELECT parse_status,error_type FROM source_snapshots"
+    )
+
+    assert result == 1
+    assert await news_repository.comment_job_state("100") == "done"
+    assert len(comments) == 12
+    assert next(row for row in comments if row["comment_id"] == "2012")["text_en"] == (
+        "Older body retained after source moderation."
+    )
+    assert dict(article_rows[0]) == {
+        "comment_count": 15,
+        "comments_state": "partial",
+        "comments_source_complete": 1,
+        "comments_visible_count": 15,
+    }
+    assert [tuple(row) for row in snapshot_rows] == [
+        ("failed", "SourceCommentsUnavailable")
+    ]
+    assert await news_repository.get_runtime_state("news_last_comment_warning") == (
+        "SourceCommentsUnavailable"
+    )
+
+
+async def test_source_exhausted_unaccounted_comment_node_stays_retryable(
+    news_repository: NewsRepository,
+) -> None:
+    browser = FixtureBrowser(UNACCOUNTED_NODE, 2, 2, source_exhausted=True)
+    await NewsCollector(browser, news_repository, ZoneInfo("Asia/Shanghai")).run_listing_cycle(
+        NOW
+    )
+
+    result = await CommentCollector(
+        browser, news_repository, ZoneInfo("Asia/Shanghai")
+    ).run_cycle(NOW)
+
+    assert result == 0
+    assert await news_repository.comment_job_state("100") == "pending"
+    assert await news_repository.get_runtime_state("news_last_comment_error") == (
+        "CommentCountMismatch"
     )

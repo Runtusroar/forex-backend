@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -842,8 +843,21 @@ class NewsRepository:
                 if not jobs:
                     await self.db.rollback()
                     return False
+            incoming_ids = {comment.comment_id for comment in collection.comments}
+            existing_rows = await self.db.execute_fetchall(
+                "SELECT comment_id FROM news_comments WHERE article_id=?",
+                (collection.article_id,),
+            )
+            materialized_ids = incoming_ids | {
+                str(row["comment_id"]) for row in existing_rows
+            }
             current_ids: set[str] = set()
             for comment in collection.comments:
+                if comment.parent_comment_id and (
+                    comment.parent_comment_id == comment.comment_id
+                    or comment.parent_comment_id not in materialized_ids
+                ):
+                    comment = replace(comment, parent_comment_id=None)
                 current_ids.add(comment.comment_id)
                 await self._upsert_comment(comment)
             if collection.is_complete:
@@ -1684,6 +1698,7 @@ class NewsRepository:
         for table, column, key in (
             ("news_detail_jobs", "state", "detail_jobs"),
             ("news_comment_jobs", "state", "comment_jobs"),
+            ("news_articles", "comments_state", "comment_states"),
             ("news_media", "download_state", "media_jobs"),
             ("localized_texts", "status", "translation_jobs"),
         ):
