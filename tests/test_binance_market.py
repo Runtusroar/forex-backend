@@ -241,15 +241,13 @@ async def test_top_contracts_includes_tradfi_perpetuals_with_market_type() -> No
     )
 
     try:
-        contracts = await market.top_contracts(limit=10)
+        contracts = await market.top_contracts(limit=1, market_type="traditional")
     finally:
         await client.aclose()
 
     by_symbol = {item.symbol: item for item in contracts}
-    assert by_symbol["BTCUSDT"].market_type == "crypto"
+    assert list(by_symbol) == ["XAUUSDT"]
     assert by_symbol["XAUUSDT"].market_type == "traditional"
-    assert by_symbol["SPCXUSDT"].market_type == "traditional"
     assert by_symbol["XAUUSDT"].underlying_type == "COMMODITY"
-    assert by_symbol["SPCXUSDT"].underlying_type == "EQUITY"
     assert by_symbol["XAUUSDT"].underlying_subtypes == ("TradFi",)
     assert by_symbol["XAUUSDT"].contract_type == "TRADIFI_PERPETUAL"

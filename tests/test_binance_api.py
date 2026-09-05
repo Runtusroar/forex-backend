@@ -13,10 +13,14 @@ from app.repository import Repository
 class StubBinanceMarket:
     def __init__(self) -> None:
         self.requested_limit: int | None = None
+        self.requested_market_type: str | None = None
 
-    async def top_contracts(self, limit: int) -> list[BinanceFuturesContract]:
+    async def top_contracts(
+        self, limit: int, market_type: str | None = None
+    ) -> list[BinanceFuturesContract]:
         self.requested_limit = limit
-        return [
+        self.requested_market_type = market_type
+        items = [
             BinanceFuturesContract(
                 symbol="BTCUSDT",
                 pair="BTCUSDT",
@@ -66,6 +70,9 @@ class StubBinanceMarket:
                 updated_at=datetime(2026, 9, 4, 12, 21, tzinfo=UTC),
             ),
         ]
+        if market_type is not None:
+            items = [item for item in items if item.market_type == market_type]
+        return items[:limit]
 
 
 async def test_top_contracts_endpoint_returns_binance_contracts(tmp_path: Path) -> None:
@@ -91,7 +98,8 @@ async def test_top_contracts_endpoint_returns_binance_contracts(tmp_path: Path) 
     await database.close()
 
     assert response.status_code == 200, response.text
-    assert market.requested_limit == 50
+    assert market.requested_limit == 20
+    assert market.requested_market_type is None
     assert response.json() == {
         "items": [
             {
@@ -173,7 +181,8 @@ async def test_top_contracts_endpoint_filters_traditional_market_type(
 
     assert response.status_code == 200, response.text
     assert [item["symbol"] for item in response.json()["items"]] == ["XAUUSDT"]
-    assert market.requested_limit == 50
+    assert market.requested_limit == 20
+    assert market.requested_market_type == "traditional"
 
 
 async def test_top_contracts_endpoint_requires_api_key(tmp_path: Path) -> None:

@@ -289,7 +289,8 @@ class Repository:
 
     async def list_calendar(self, start: datetime, end: datetime) -> list[CalendarRecord]:
         rows = await self.db.execute_fetchall(
-            "SELECT * FROM calendar_events WHERE event_at BETWEEN ? AND ? ORDER BY event_at",
+            """SELECT * FROM calendar_events
+               WHERE event_at >= ? AND event_at < ? ORDER BY event_at""",
             (_iso(start), _iso(end)),
         )
         return [self._calendar(row) for row in rows]

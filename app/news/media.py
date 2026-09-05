@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import os
 import tempfile
 from contextlib import suppress
@@ -22,6 +23,28 @@ ALLOWED_TYPES = {
 
 class MediaDownloadError(Exception):
     pass
+
+
+def _validate_media_url(url: str) -> None:
+    try:
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL as exc:
+        raise MediaDownloadError("invalid media URL") from exc
+    host = parsed.host
+    if parsed.scheme != "https" or not host:
+        raise MediaDownloadError("media URL must use HTTPS")
+    if host.lower() == "localhost" or host.lower().endswith(".localhost"):
+        raise MediaDownloadError("private media URL is not allowed")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return
+    if not address.is_global:
+        raise MediaDownloadError("private media URL is not allowed")
+
+
+async def _validate_media_request(request: httpx.Request) -> None:
+    _validate_media_url(str(request.url))
 
 
 def _mime_type_from_signature(header: bytes) -> str | None:
@@ -47,7 +70,11 @@ class MediaWorker:
         self.repository = repository
         self.directory = directory
         self.max_bytes = max_bytes
-        self.client = client or httpx.AsyncClient(timeout=30, follow_redirects=True)
+        self.client = client or httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=True,
+            event_hooks={"request": [_validate_media_request]},
+        )
         self._owns_client = client is None
 
     async def close(self) -> None:
@@ -61,7 +88,9 @@ class MediaWorker:
             try:
                 await self._download(job)
             except Exception as error:
-                await self.repository.fail_media_job(job.media_id, error)
+                await self.repository.fail_media_job(
+                    job.media_id, job.original_url, error
+                )
             else:
                 completed += 1
         return completed
@@ -76,6 +105,7 @@ class MediaWorker:
                 continue
 
     async def _download(self, job: MediaJob) -> None:
+        _validate_media_url(job.original_url)
         self.directory.mkdir(parents=True, exist_ok=True)
         temporary: Path | None = None
         try:
@@ -116,7 +146,7 @@ class MediaWorker:
 
             sha256 = digest.hexdigest()
             existing = await self.repository.completed_media_by_hash(sha256)
-            if existing:
+            if existing and existing.path.is_file():
                 os.unlink(temporary)
                 temporary = None
                 await self._complete_from_existing(job, existing)
@@ -125,7 +155,12 @@ class MediaWorker:
             os.replace(temporary, destination)
             temporary = None
             await self.repository.complete_media_job(
-                job.media_id, str(destination), mime_type, byte_size, sha256
+                job.media_id,
+                job.original_url,
+                str(destination),
+                mime_type,
+                byte_size,
+                sha256,
             )
         finally:
             if temporary is not None:
@@ -137,6 +172,7 @@ class MediaWorker:
     ) -> None:
         await self.repository.complete_media_job(
             job.media_id,
+            job.original_url,
             str(existing.path),
             existing.mime_type,
             existing.byte_size,

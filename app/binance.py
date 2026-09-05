@@ -60,13 +60,15 @@ class BinanceFuturesMarket:
         self._cached_at: float | None = None
         self._cached_contracts: list[BinanceFuturesContract] | None = None
 
-    async def top_contracts(self, limit: int = 20) -> list[BinanceFuturesContract]:
+    async def top_contracts(
+        self, limit: int = 20, market_type: str | None = None
+    ) -> list[BinanceFuturesContract]:
         if (
             self._cached_contracts is not None
             and self._cached_at is not None
             and time.monotonic() - self._cached_at < self.cache_ttl_seconds
         ):
-            return self._cached_contracts[:limit]
+            return _filter_contracts(self._cached_contracts, limit, market_type)
 
         async with self._http_client() as client:
             exchange_info, tickers = await self._fetch_market_data(client)
@@ -80,7 +82,7 @@ class BinanceFuturesMarket:
         contracts.sort(key=lambda item: item.quote_volume, reverse=True)
         self._cached_contracts = contracts
         self._cached_at = time.monotonic()
-        return contracts[:limit]
+        return _filter_contracts(contracts, limit, market_type)
 
     @asynccontextmanager
     async def _http_client(self) -> AsyncIterator[httpx.AsyncClient]:
@@ -164,6 +166,14 @@ def _float(value: Any) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _filter_contracts(
+    contracts: list[BinanceFuturesContract], limit: int, market_type: str | None
+) -> list[BinanceFuturesContract]:
+    if market_type is not None:
+        contracts = [item for item in contracts if item.market_type == market_type]
+    return contracts[:limit]
 
 
 def _int(value: Any) -> int:

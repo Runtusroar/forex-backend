@@ -46,6 +46,8 @@ class BrowserSession:
         self.calendar_page: Page | None = None
         self.news_page: Page | None = None
         self._connect_lock = asyncio.Lock()
+        self._calendar_lock = asyncio.Lock()
+        self._news_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         if self.browser and self.browser.is_connected():
@@ -61,42 +63,45 @@ class BrowserSession:
 
     async def calendar_html(self, day: date) -> str:
         await self.connect()
-        assert self.calendar_page is not None
-        slug = f"{day:%b}{day.day}.{day.year}".lower()
-        await self.calendar_page.goto(
-            f"https://www.forexfactory.com/calendar?day={slug}",
-            wait_until="domcontentloaded",
-        )
-        await self.calendar_page.wait_for_selector(
-            ".calendar__row--day-breaker, tr.calendar__row[data-event-id]",
-            state="attached",
-            timeout=20_000,
-        )
-        return await self.calendar_page.content()
+        async with self._calendar_lock:
+            assert self.calendar_page is not None
+            slug = f"{day:%b}{day.day}.{day.year}".lower()
+            await self.calendar_page.goto(
+                f"https://www.forexfactory.com/calendar?day={slug}",
+                wait_until="domcontentloaded",
+            )
+            await self.calendar_page.wait_for_selector(
+                ".calendar__row--day-breaker, tr.calendar__row[data-event-id]",
+                state="attached",
+                timeout=20_000,
+            )
+            return await self.calendar_page.content()
 
     async def calendar_detail_html(self, day: date, source_id: str) -> str:
         await self.connect()
-        assert self.calendar_page is not None
-        slug = f"{day:%b}{day.day}.{day.year}".lower()
-        await self.calendar_page.goto(
-            f"https://www.forexfactory.com/calendar?day={slug}#detail={source_id}",
-            wait_until="domcontentloaded",
-        )
-        await self.calendar_page.wait_for_selector(
-            "tr.calendar__details--detail", state="attached", timeout=20_000
-        )
-        return await self.calendar_page.content()
+        async with self._calendar_lock:
+            assert self.calendar_page is not None
+            slug = f"{day:%b}{day.day}.{day.year}".lower()
+            await self.calendar_page.goto(
+                f"https://www.forexfactory.com/calendar?day={slug}#detail={source_id}",
+                wait_until="domcontentloaded",
+            )
+            await self.calendar_page.wait_for_selector(
+                "tr.calendar__details--detail", state="attached", timeout=20_000
+            )
+            return await self.calendar_page.content()
 
     async def news_html(self) -> str:
         await self.connect()
-        assert self.news_page is not None
-        await self.news_page.goto(
-            "https://www.forexfactory.com/news", wait_until="domcontentloaded"
-        )
-        await self.news_page.wait_for_selector(
-            ".news-block__item, .news__item", state="attached", timeout=20_000
-        )
-        return await self.news_page.content()
+        async with self._news_lock:
+            assert self.news_page is not None
+            await self.news_page.goto(
+                "https://www.forexfactory.com/news", wait_until="domcontentloaded"
+            )
+            await self.news_page.wait_for_selector(
+                ".news-block__item, .news__item", state="attached", timeout=20_000
+            )
+            return await self.news_page.content()
 
     async def news_detail_html(self, url: str) -> str:
         await self.connect()
@@ -117,60 +122,61 @@ class BrowserSession:
         if continuation_count < 0:
             raise ValueError("continuation_count must not be negative")
         await self.connect()
-        assert self.news_page is not None
-        await self.news_page.goto(
-            "https://www.forexfactory.com/news", wait_until="domcontentloaded"
-        )
-        await self.news_page.wait_for_selector(".news-block", timeout=20_000)
-        blocks = self.news_page.locator(".news-block")
-        block: Locator | None = None
-        for index in range(await blocks.count()):
-            candidate = blocks.nth(index)
-            heading = candidate.locator("h2").first
-            expected_heading = NEWS_SECTION_HEADINGS[section_slug]
-            if (
-                await heading.count()
-                and (await heading.inner_text()).strip() == expected_heading
-            ):
-                block = candidate
-                break
-        if block is None:
-            raise SourcePageError(f"news section missing: {section_slug}")
-
-        source_ids = await _source_ids(block)
-        terminal = False
-        completed = 0
-        for _ in range(continuation_count):
-            more = block.get_by_text("More", exact=True).last
-            if not await more.count() or not await more.is_visible():
-                terminal = True
-                break
-            before = source_ids
-            await more.click()
-            for _ in range(20):
-                await asyncio.sleep(0.25)
-                source_ids = await _source_ids(block)
-                if source_ids - before:
-                    completed += 1
+        async with self._news_lock:
+            assert self.news_page is not None
+            await self.news_page.goto(
+                "https://www.forexfactory.com/news", wait_until="domcontentloaded"
+            )
+            await self.news_page.wait_for_selector(".news-block", timeout=20_000)
+            blocks = self.news_page.locator(".news-block")
+            block: Locator | None = None
+            for index in range(await blocks.count()):
+                candidate = blocks.nth(index)
+                heading = candidate.locator("h2").first
+                expected_heading = NEWS_SECTION_HEADINGS[section_slug]
+                if (
+                    await heading.count()
+                    and (await heading.inner_text()).strip() == expected_heading
+                ):
+                    block = candidate
                     break
-                if not await more.is_visible():
+            if block is None:
+                raise SourcePageError(f"news section missing: {section_slug}")
+
+            source_ids = await _source_ids(block)
+            terminal = False
+            completed = 0
+            for _ in range(continuation_count):
+                more = block.get_by_text("More", exact=True).last
+                if not await more.count() or not await more.is_visible():
                     terminal = True
                     break
-            else:
-                raise SourcePageError(
-                    f"news continuation added no source IDs: {section_slug}"
-                )
-            if terminal:
-                break
-        if not terminal:
-            more = block.get_by_text("More", exact=True).last
-            terminal = not await more.count() or not await more.is_visible()
-        return NewsContinuationPage(
-            html=await self.news_page.content(),
-            continuation_count=completed,
-            source_ids=source_ids,
-            terminal=terminal,
-        )
+                before = source_ids
+                await more.click()
+                for _ in range(20):
+                    await asyncio.sleep(0.25)
+                    source_ids = await _source_ids(block)
+                    if source_ids - before:
+                        completed += 1
+                        break
+                    if not await more.is_visible():
+                        terminal = True
+                        break
+                else:
+                    raise SourcePageError(
+                        f"news continuation added no source IDs: {section_slug}"
+                    )
+                if terminal:
+                    break
+            if not terminal:
+                more = block.get_by_text("More", exact=True).last
+                terminal = not await more.count() or not await more.is_visible()
+            return NewsContinuationPage(
+                html=await self.news_page.content(),
+                continuation_count=completed,
+                source_ids=source_ids,
+                terminal=terminal,
+            )
 
     async def close(self) -> None:
         for page in (self.calendar_page, self.news_page):

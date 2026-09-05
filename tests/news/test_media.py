@@ -177,3 +177,78 @@ async def test_stream_limit_and_timeout_are_retryable_without_temp_files(
     assert await media_repository.media_state(1) == "failed"
     assert await media_repository.media_state(2) == "failed"
     assert not list(directory.glob("*"))
+
+
+async def test_stale_download_cannot_complete_media_after_url_changes(
+    media_repository: NewsRepository, tmp_path: Path
+) -> None:
+    old_url = "https://assets.example/old.png"
+    new_url = "https://assets.example/new.png"
+    await add_media(media_repository, old_url)
+    job = (await media_repository.claim_media_jobs(1, NOW))[0]
+    await add_media(media_repository, new_url)
+
+    applied = await media_repository.complete_media_job(
+        job.media_id,
+        job.original_url,
+        str(tmp_path / "old.png"),
+        "image/png",
+        len(PNG),
+        "old-hash",
+    )
+    jobs = await media_repository.claim_media_jobs(1, NOW)
+
+    assert applied is False
+    assert [item.original_url for item in jobs] == [new_url]
+
+
+@respx.mock
+async def test_missing_deduplicated_file_is_replaced_by_fresh_download(
+    media_repository: NewsRepository, tmp_path: Path
+) -> None:
+    first = "https://assets.example/one.png"
+    second = "https://assets.example/two.png"
+    await add_media(media_repository, first, second)
+    for url in (first, second):
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200, content=PNG, headers={"content-type": "image/png"}
+            )
+        )
+    worker = MediaWorker(media_repository, tmp_path / "files", max_bytes=1024)
+    assert await worker.run_once(limit=1) == 1
+    first_cached = await media_repository.resolve_media_path(1)
+    assert first_cached is not None
+    first_cached.path.unlink()
+
+    assert await worker.run_once(limit=1) == 1
+    second_cached = await media_repository.resolve_media_path(2)
+
+    assert second_cached is not None
+    assert second_cached.path.is_file()
+    assert second_cached.path.read_bytes() == PNG
+
+
+async def test_private_media_url_is_rejected_before_request(
+    media_repository: NewsRepository, tmp_path: Path
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
+
+    url = "http://127.0.0.1/internal.png"
+    await add_media(media_repository, url)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    worker = MediaWorker(
+        media_repository, tmp_path / "files", max_bytes=1024, client=client
+    )
+    try:
+        completed = await worker.run_once()
+    finally:
+        await client.aclose()
+
+    assert completed == 0
+    assert requests == []
+    assert await media_repository.media_state(1) == "failed"

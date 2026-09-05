@@ -91,6 +91,20 @@ async def test_replace_calendar_window_removes_only_stale_rows_inside_window(
     assert [row.source_id for row in rows] == ["fresh", "outside"]
 
 
+async def test_list_calendar_excludes_event_at_end_boundary(
+    repository: Repository,
+) -> None:
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    end = start + timedelta(days=1)
+    inside = replace(calendar_item(), source_id="inside", event_at=end - timedelta(seconds=1))
+    boundary = replace(calendar_item(), source_id="boundary", event_at=end)
+    await repository.upsert_calendar([inside, boundary])
+
+    rows = await repository.list_calendar(start, end)
+
+    assert [row.source_id for row in rows] == ["inside"]
+
+
 async def test_calendar_round_trips_source_time_text_and_position(
     repository: Repository,
 ) -> None:

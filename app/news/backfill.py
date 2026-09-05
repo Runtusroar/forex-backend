@@ -96,7 +96,12 @@ class NewsBackfill:
                 if article.source_id in relevant_ids and article.published_at is not None
             ]
             oldest = min(timestamps) if timestamps else None
-            streak = 0 if result.new_article_ids else int(checkpoint["no_new_id_streak"]) + 1
+            has_relevant_new_id = bool(set(result.new_article_ids) & relevant_ids)
+            streak = (
+                0
+                if has_relevant_new_id
+                else int(checkpoint["no_new_id_streak"]) + 1
+            )
             beyond_cutoff = oldest is not None and oldest < observed_at - timedelta(days=self.days)
             complete = page.terminal or beyond_cutoff or streak >= 2
             updated = {

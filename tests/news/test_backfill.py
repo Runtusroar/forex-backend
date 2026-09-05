@@ -22,6 +22,19 @@ def listing(article_id: str, source_time: str) -> str:
     """
 
 
+def mixed_listing(latest_id: str, fundamental_id: str) -> str:
+    return f"""
+    <div class="news-block"><h2>News / Latest Stories</h2>
+      <div class="news-block__item"><div class="news-block__title">
+        <a href="/news/{latest_id}-x">Story {latest_id}</a></div></div>
+    </div>
+    <div class="news-block"><h2>Fundamental Analysis / Latest Stories</h2>
+      <div class="news-block__item"><div class="news-block__title">
+        <a href="/news/{fundamental_id}-x">Story {fundamental_id}</a></div></div>
+    </div>
+    """
+
+
 class FakeContinuationBrowser:
     def __init__(self, pages: list[str], terminal: bool = False) -> None:
         self.pages = pages
@@ -93,4 +106,33 @@ async def test_backfill_stops_at_cutoff_or_terminal_page() -> None:
 
     checkpoint = json.loads(repository.state["news_backfill:latest"])
     assert result.completed_sections == 1
+    assert checkpoint["complete"] is True
+
+
+async def test_backfill_streak_only_counts_new_ids_in_current_section() -> None:
+    page = mixed_listing("200", "100")
+    browser = FakeContinuationBrowser([page])
+    repository = FakeBackfillRepository()
+    repository.ids.add("100")
+    repository.state["news_backfill:fundamental"] = json.dumps(
+        {
+            "continuation_count": 0,
+            "oldest_published_at": None,
+            "no_new_id_streak": 1,
+            "complete": False,
+        }
+    )
+    backfill = NewsBackfill(
+        browser,
+        repository,
+        ZoneInfo("Asia/Shanghai"),
+        days=30,
+        sections=("fundamental",),
+    )
+
+    result = await backfill.run_once(now=NOW)
+
+    checkpoint = json.loads(repository.state["news_backfill:fundamental"])
+    assert result.completed_sections == 1
+    assert checkpoint["no_new_id_streak"] == 2
     assert checkpoint["complete"] is True

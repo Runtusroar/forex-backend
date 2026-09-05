@@ -110,7 +110,12 @@ async def api(tmp_path: Path):
     media_path.parent.mkdir(parents=True)
     media_path.write_bytes(b"\x89PNG\r\n\x1a\nimage")
     await news.complete_media_job(
-        media_job.media_id, str(media_path), "image/png", media_path.stat().st_size, "abc"
+        media_job.media_id,
+        media_job.original_url,
+        str(media_path),
+        "image/png",
+        media_path.stat().st_size,
+        "abc",
     )
     app = create_app(settings, repository=legacy)
     client = httpx.AsyncClient(

@@ -1,4 +1,5 @@
 import hmac
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, time, timedelta, tzinfo
@@ -25,6 +26,8 @@ from app.repository import Repository
 from app.runtime import BackgroundRuntime
 from app.translation import KimiTranslator
 from app.translation.worker import NewsTranslationWorker, TranslationWorker
+
+logger = logging.getLogger(__name__)
 
 
 def _calendar_json(item: CalendarRecord) -> dict:
@@ -296,22 +299,30 @@ def create_app(
         request: Request,
     ) -> dict:
         detail = await repository.get_calendar_detail(source_id)
-        if detail is None:
-            event = await repository.get_calendar(source_id)
-            browser = getattr(request.app.state, "calendar_browser", None)
-            if event is not None and browser is not None:
-                event_day = event.event_at.astimezone(
-                    ZoneInfo(configured.calendar_source_timezone)
-                ).date()
-                try:
-                    html = await browser.calendar_detail_html(event_day, source_id)
-                    parsed = parse_calendar_detail(html, source_id, datetime.now(UTC))
-                    await repository.replace_calendar_detail(parsed)
-                    detail = await repository.get_calendar_detail(source_id)
-                except SourcePageError as exc:
+        event = await repository.get_calendar(source_id)
+        browser = getattr(request.app.state, "calendar_browser", None)
+        if event is not None and browser is not None:
+            event_day = event.event_at.astimezone(
+                ZoneInfo(configured.calendar_source_timezone)
+            ).date()
+            try:
+                html = await browser.calendar_detail_html(event_day, source_id)
+                parsed = parse_calendar_detail(html, source_id, datetime.now(UTC))
+            except SourcePageError as exc:
+                if detail is None:
                     raise HTTPException(status_code=502, detail=str(exc)) from exc
-            if detail is None:
-                raise HTTPException(status_code=404, detail="Not found")
+                logger.warning("Calendar detail refresh rejected for %s: %s", source_id, exc)
+            except Exception as exc:
+                if detail is None:
+                    raise HTTPException(
+                        status_code=502, detail="Calendar source unavailable"
+                    ) from exc
+                logger.exception("Calendar detail refresh failed for %s", source_id)
+            else:
+                await repository.replace_calendar_detail(parsed)
+                detail = await repository.get_calendar_detail(source_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail="Not found")
         return _calendar_detail_json(detail)
 
     @app.get("/api/v1/news", dependencies=[Depends(authorize)])
@@ -350,12 +361,11 @@ def create_app(
         ] = "all",
     ) -> dict:
         try:
-            items = await binance.top_contracts(50)
+            items = await binance.top_contracts(
+                limit, None if market_type == "all" else market_type
+            )
         except BinanceMarketError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
-        if market_type != "all":
-            items = [item for item in items if item.market_type == market_type]
-        items = items[:limit]
         return {
             "items": [_binance_contract_json(item) for item in items],
             "generated_at": _iso_z(datetime.now(UTC)),

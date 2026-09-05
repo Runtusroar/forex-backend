@@ -18,7 +18,9 @@ from app.main import create_app
 from app.repository import Repository
 
 
-async def make_client(tmp_path: Path) -> tuple[httpx.AsyncClient, Repository, Database]:
+async def make_client(
+    tmp_path: Path, calendar_browser: object | None = None
+) -> tuple[httpx.AsyncClient, Repository, Database]:
     settings = Settings(
         _env_file=None,
         database_path=tmp_path / "api.sqlite3",
@@ -29,7 +31,10 @@ async def make_client(tmp_path: Path) -> tuple[httpx.AsyncClient, Repository, Da
     await database.open()
     await database.initialize()
     repository = Repository(database)
-    transport = httpx.ASGITransport(app=create_app(settings, repository=repository))
+    app = create_app(settings, repository=repository)
+    if calendar_browser is not None:
+        app.state.calendar_browser = calendar_browser
+    transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://test"), repository, database
 
 
@@ -41,6 +46,42 @@ class FakeCalendarBrowser:
     async def calendar_detail_html(self, day: object, source_id: str) -> str:
         self.calls.append((day, source_id))
         return self.html
+
+
+class FailingCalendarBrowser:
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, str]] = []
+
+    async def calendar_detail_html(self, day: object, source_id: str) -> str:
+        self.calls.append((day, source_id))
+        raise RuntimeError("browser disconnected")
+
+
+def minimal_calendar_detail(source_id: str, source_name: str) -> CalendarDetailObservation:
+    return CalendarDetailObservation(
+        source_id=source_id,
+        title_en="Cached title",
+        currency="USD",
+        currency_name="US dollar",
+        impact="high",
+        actual=None,
+        forecast=None,
+        previous=None,
+        actual_state=None,
+        previous_state=None,
+        previous_revised_from=None,
+        ff_url=None,
+        source_name=source_name,
+        source_url=None,
+        latest_release_url=None,
+        measures=None,
+        usual_effect=None,
+        frequency=None,
+        next_release_text=None,
+        next_release_url=None,
+        ff_notes=None,
+        why_traders_care=None,
+    )
 
 
 async def test_calendar_requires_api_key(tmp_path: Path) -> None:
@@ -275,3 +316,69 @@ async def test_calendar_detail_api_collects_and_caches_missing_detail(
     assert response.json()["source_name"] == "METI"
     assert cached is not None
     assert cached.ff_url == "https://www.forexfactory.com/calendar/225-jn-prelim-industrial-production-mm"
+
+
+async def test_calendar_detail_api_refreshes_existing_cache(tmp_path: Path) -> None:
+    browser = FakeCalendarBrowser(
+        (Path(__file__).parent / "fixtures/calendar_detail.html").read_text()
+    )
+    client, repository, database = await make_client(tmp_path, browser)
+    event_at = datetime(2026, 8, 31, 12, tzinfo=UTC)
+    await repository.upsert_calendar(
+        [CalendarObservation("149673", event_at, "JPY", "low", "Event", None, None, None)]
+    )
+    await repository.replace_calendar_detail(
+        minimal_calendar_detail("149673", "Stale source")
+    )
+
+    async with client:
+        response = await client.get(
+            "/api/v1/calendar/149673", headers={"X-API-Key": "api-secret"}
+        )
+    await database.close()
+
+    assert response.status_code == 200, response.text
+    assert browser.calls == [(event_at.date(), "149673")]
+    assert response.json()["source_name"] == "METI"
+
+
+async def test_calendar_detail_api_returns_cached_detail_when_refresh_fails(
+    tmp_path: Path,
+) -> None:
+    browser = FailingCalendarBrowser()
+    client, repository, database = await make_client(tmp_path, browser)
+    event_at = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    await repository.upsert_calendar(
+        [CalendarObservation("1", event_at, "USD", "high", "Event", None, None, None)]
+    )
+    await repository.replace_calendar_detail(minimal_calendar_detail("1", "Cached source"))
+
+    async with client:
+        response = await client.get(
+            "/api/v1/calendar/1", headers={"X-API-Key": "api-secret"}
+        )
+    await database.close()
+
+    assert response.status_code == 200, response.text
+    assert browser.calls == [(event_at.date(), "1")]
+    assert response.json()["source_name"] == "Cached source"
+
+
+async def test_calendar_detail_api_maps_uncached_browser_failure_to_bad_gateway(
+    tmp_path: Path,
+) -> None:
+    browser = FailingCalendarBrowser()
+    client, repository, database = await make_client(tmp_path, browser)
+    event_at = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    await repository.upsert_calendar(
+        [CalendarObservation("1", event_at, "USD", "high", "Event", None, None, None)]
+    )
+
+    async with client:
+        response = await client.get(
+            "/api/v1/calendar/1", headers={"X-API-Key": "api-secret"}
+        )
+    await database.close()
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Calendar source unavailable"

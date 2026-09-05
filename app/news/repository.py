@@ -877,39 +877,51 @@ class NewsRepository:
     async def complete_media_job(
         self,
         media_id: int,
+        original_url: str,
         local_path: str,
         mime_type: str,
         byte_size: int,
         sha256: str,
-    ) -> None:
-        await self.db.execute(
+    ) -> bool:
+        cursor = await self.db.execute(
             """UPDATE news_media SET local_path=?,mime_type=?,byte_size=?,sha256=?,
-               download_state='complete',next_attempt_at=NULL,last_error=NULL WHERE id=?""",
-            (local_path, mime_type, byte_size, sha256, media_id),
+               download_state='complete',next_attempt_at=NULL,last_error=NULL
+               WHERE id=? AND original_url=?""",
+            (local_path, mime_type, byte_size, sha256, media_id, original_url),
         )
         await self.db.commit()
+        return cursor.rowcount > 0
 
     @_serialized_write
     async def fail_media_job(
-        self, media_id: int, error: Exception, now: datetime | None = None
-    ) -> None:
+        self,
+        media_id: int,
+        original_url: str,
+        error: Exception,
+        now: datetime | None = None,
+    ) -> bool:
         failed = now or datetime.now(UTC)
         rows = await self.db.execute_fetchall(
-            "SELECT attempts FROM news_media WHERE id=?", (media_id,)
+            "SELECT attempts FROM news_media WHERE id=? AND original_url=?",
+            (media_id, original_url),
         )
+        if not rows:
+            return False
         attempts = int(rows[0]["attempts"]) + 1
         delay = (1, 5, 30, 120, 360)[min(attempts - 1, 4)]
-        await self.db.execute(
+        cursor = await self.db.execute(
             """UPDATE news_media SET download_state='failed',attempts=?,
-               next_attempt_at=?,last_error=? WHERE id=?""",
+               next_attempt_at=?,last_error=? WHERE id=? AND original_url=?""",
             (
                 attempts,
                 _iso(failed + timedelta(minutes=delay)),
                 type(error).__name__,
                 media_id,
+                original_url,
             ),
         )
         await self.db.commit()
+        return cursor.rowcount > 0
 
     async def completed_media_by_hash(self, sha256: str) -> CachedMedia | None:
         rows = await self.db.execute_fetchall(
