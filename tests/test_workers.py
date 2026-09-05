@@ -94,6 +94,14 @@ class PartialCalendarDetailBatchBrowser(CalendarDetailBatchBrowser):
         return {"149673": (FIXTURES / "calendar_detail.html").read_text()}
 
 
+class UnavailableCalendarDetailBatchBrowser(CalendarDetailBatchBrowser):
+    async def calendar_details_html(
+        self, day: date, source_ids: list[str]
+    ) -> dict[str, str | None]:
+        self.detail_batches.append((day, tuple(source_ids)))
+        return {source_id: None for source_id in source_ids}
+
+
 def daily_calendar_html(day: date, source_id: str) -> str:
     return f"""
     <table>
@@ -291,3 +299,25 @@ async def test_calendar_detail_worker_keeps_error_when_batch_is_partially_succes
 
     assert completed == 1
     assert await repository.get_runtime_state("calendar_detail_last_error") == "KeyError"
+
+
+async def test_calendar_detail_worker_completes_event_without_detail_link(
+    repository: Repository,
+) -> None:
+    event_at = datetime(2026, 8, 31, 7, 50, tzinfo=UTC)
+    await repository.upsert_calendar(
+        [
+            CalendarObservation(
+                "149673", event_at, "JPY", "low", "Holiday", None, None, None
+            )
+        ]
+    )
+    worker = CalendarDetailCollector(
+        UnavailableCalendarDetailBatchBrowser(), repository, source_timezone=UTC
+    )
+
+    completed = await worker.run_cycle(datetime.now(UTC) + timedelta(seconds=1))
+
+    assert completed == 1
+    assert await repository.get_calendar_detail("149673") is None
+    assert (await repository.calendar_detail_job_counts()) == {"done": 1}

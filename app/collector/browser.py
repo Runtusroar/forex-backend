@@ -95,7 +95,9 @@ class BrowserSession:
             )
             return await self.calendar_page.content()
 
-    async def calendar_details_html(self, day: date, source_ids: Sequence[str]) -> dict[str, str]:
+    async def calendar_details_html(
+        self, day: date, source_ids: Sequence[str]
+    ) -> dict[str, str | None]:
         await self.connect()
         async with self._calendar_lock:
             assert self.calendar_page is not None
@@ -110,6 +112,7 @@ class BrowserSession:
                 timeout=20_000,
             )
             expanded: list[str] = []
+            unavailable: list[str] = []
             details = self.calendar_page.locator("tr.calendar__details--detail")
             for source_id in dict.fromkeys(source_ids):
                 if not re.fullmatch(r"\d+", source_id):
@@ -119,6 +122,7 @@ class BrowserSession:
                     ".calendar__cell.calendar__detail .calendar__detail-link"
                 )
                 if not await link.count():
+                    unavailable.append(source_id)
                     continue
                 before = await details.count()
                 await link.click()
@@ -128,7 +132,9 @@ class BrowserSession:
                         break
                     await self.calendar_page.wait_for_timeout(100)
             html = await self.calendar_page.content()
-            return {source_id: html for source_id in expanded}
+            pages: dict[str, str | None] = {source_id: html for source_id in expanded}
+            pages.update({source_id: None for source_id in unavailable})
+            return pages
 
     async def news_html(self) -> str:
         await self.connect()

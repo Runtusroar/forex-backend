@@ -14,7 +14,7 @@ from app.repository import Repository
 class CalendarDetailBrowserSource(Protocol):
     async def calendar_details_html(
         self, day: date, source_ids: Sequence[str]
-    ) -> dict[str, str]: ...
+    ) -> dict[str, str | None]: ...
 
 
 class CalendarDetailCollector:
@@ -74,6 +74,12 @@ class CalendarDetailCollector:
             for job in day_jobs:
                 try:
                     html = pages[job.source_id]
+                    if html is None:
+                        await self.repository.complete_calendar_detail_job(
+                            job.source_id, job.desired_source_hash
+                        )
+                        completed += 1
+                        continue
                     detail = parse_calendar_detail(html, job.source_id, observed_at)
                     stored = await self.repository.replace_calendar_detail(
                         detail, desired_source_hash=job.desired_source_hash

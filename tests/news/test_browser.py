@@ -146,6 +146,9 @@ class CalendarDetailLocator:
     async def count(self) -> int:
         if self.selector == "tr.calendar__details--detail":
             return len(self.page.expanded)
+        if "data-event-id='" in self.selector:
+            source_id = self.selector.split("data-event-id='", 1)[1].split("'", 1)[0]
+            return int(source_id not in self.page.unavailable)
         return 1
 
     async def click(self) -> None:
@@ -158,6 +161,7 @@ class CalendarBatchPage:
     def __init__(self) -> None:
         self.goto_calls = 0
         self.expanded: list[str] = []
+        self.unavailable: set[str] = set()
 
     async def goto(self, _url: str, **_kwargs) -> None:
         self.goto_calls += 1
@@ -317,3 +321,18 @@ async def test_calendar_detail_batch_uses_one_day_navigation() -> None:
     assert page.expanded == ["148126", "149662", "151187"]
     assert set(pages) == {"148126", "149662", "151187"}
     assert all(html == "<html>148126,149662,151187</html>" for html in pages.values())
+
+
+async def test_calendar_detail_batch_marks_event_without_detail_link_unavailable() -> None:
+    session = BrowserSession("http://chrome:9222")
+    session.browser = FakeBrowser(FakeContext())  # type: ignore[assignment]
+    page = CalendarBatchPage()
+    page.unavailable.add("149662")
+    session.calendar_page = page  # type: ignore[assignment]
+
+    pages = await session.calendar_details_html(
+        date(2026, 9, 7), ["148126", "149662"]
+    )
+
+    assert pages["148126"] == "<html>148126</html>"
+    assert pages["149662"] is None
