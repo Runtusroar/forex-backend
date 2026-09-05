@@ -112,6 +112,10 @@ even when the listing count did not change. Listing previews have lower quality 
 and cannot overwrite a complete author, body, timestamp, or reaction count.
 
 Media is downloaded with type, signature, and size validation, then deduplicated by SHA-256.
+Forex Factory image attachments that return an HTTP 403 can use the existing Chromium session;
+this fallback rejects redirects and caps the streamed bytes before returning them to the worker.
+Source capture waits for stable content and source data requests, so unrelated advertising
+traffic cannot keep an otherwise ready page waiting for network idle.
 Content changes and failures are snapshotted for 30 days; unchanged content keeps one sample per
 UTC day. Calendar/detail and expanded comments are included. If a fully expanded source reports a
 different declared count, both counts are retained and the record remains partial; it is revisited

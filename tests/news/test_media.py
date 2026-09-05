@@ -73,9 +73,7 @@ async def test_valid_image_is_cached_with_content_hash_name(
     url = "https://assets.example/chart.png"
     await add_media(media_repository, url)
     respx.get(url).mock(
-        return_value=httpx.Response(
-            200, content=PNG, headers={"content-type": "image/png"}
-        )
+        return_value=httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
     )
     worker = MediaWorker(media_repository, tmp_path / "files", max_bytes=1024)
 
@@ -144,9 +142,7 @@ async def test_identical_bytes_share_one_cached_path(
     await add_media(media_repository, first, second)
     for url in (first, second):
         respx.get(url).mock(
-            return_value=httpx.Response(
-                200, content=PNG, headers={"content-type": "image/png"}
-            )
+            return_value=httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
         )
     worker = MediaWorker(media_repository, tmp_path / "files", max_bytes=1024)
 
@@ -211,9 +207,7 @@ async def test_missing_deduplicated_file_is_replaced_by_fresh_download(
     await add_media(media_repository, first, second)
     for url in (first, second):
         respx.get(url).mock(
-            return_value=httpx.Response(
-                200, content=PNG, headers={"content-type": "image/png"}
-            )
+            return_value=httpx.Response(200, content=PNG, headers={"content-type": "image/png"})
         )
     worker = MediaWorker(media_repository, tmp_path / "files", max_bytes=1024)
     assert await worker.run_once(limit=1) == 1
@@ -241,9 +235,7 @@ async def test_private_media_url_is_rejected_before_request(
     url = "http://127.0.0.1/internal.png"
     await add_media(media_repository, url)
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    worker = MediaWorker(
-        media_repository, tmp_path / "files", max_bytes=1024, client=client
-    )
+    worker = MediaWorker(media_repository, tmp_path / "files", max_bytes=1024, client=client)
     try:
         completed = await worker.run_once()
     finally:
@@ -252,3 +244,205 @@ async def test_private_media_url_is_rejected_before_request(
     assert completed == 0
     assert requests == []
     assert await media_repository.media_state(1) == "failed"
+
+
+def browser_attachment_response(
+    url, body=WEBP, content_type="image/webp", status=200, headers=None
+):
+    import base64
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    response = {
+        "status": status,
+        "headers": {"content-type": content_type, **(headers or {})},
+        "bodyBase64": base64.b64encode(body).decode(),
+    }
+    page = SimpleNamespace(
+        goto=AsyncMock(),
+        evaluate=AsyncMock(return_value=response),
+        close=AsyncMock(),
+        route=AsyncMock(),
+    )
+    context = SimpleNamespace(new_page=AsyncMock(return_value=page))
+    session = SimpleNamespace(
+        connect=AsyncMock(),
+        browser=SimpleNamespace(contexts=[context]),
+    )
+    return session, page, response
+
+
+@respx.mock
+async def test_challenged_ff_attachment_uses_browser_and_closes_own_page(
+    media_repository, tmp_path
+):
+    url = "https://www.forexfactory.com/attachment/image/5279811?d=1788356246"
+    await add_media(media_repository, url)
+    respx.get(url).mock(return_value=httpx.Response(403, text="Just a moment"))
+    browser, page, _ = browser_attachment_response(url)
+    worker = MediaWorker(media_repository, tmp_path / "files", 1024, browser=browser)
+    try:
+        assert await worker.run_once() == 1
+        cached = await media_repository.resolve_media_path(1)
+        assert cached.path.read_bytes() == WEBP
+        assert cached.mime_type == "image/webp"
+        assert cached.path.name == f"{cached.sha256}.webp"
+        page.goto.assert_awaited_once_with(
+            "https://www.forexfactory.com/news", wait_until="domcontentloaded", timeout=30000
+        )
+        page.close.assert_awaited_once()
+    finally:
+        await worker.close()
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("url", "status"),
+    [
+        ("https://other.example/attachment/image/1", 403),
+        ("https://www.forexfactory.com/news/1", 403),
+        ("https://www.forexfactory.com/attachment/image/1", 404),
+    ],
+)
+async def test_browser_attachment_fallback_is_narrow(media_repository, tmp_path, url, status):
+    await add_media(media_repository, url)
+    respx.get(url).mock(return_value=httpx.Response(status))
+    browser, _page, _ = browser_attachment_response(url)
+    worker = MediaWorker(media_repository, tmp_path / "files", 1024, browser=browser)
+    try:
+        assert await worker.run_once() == 0
+        browser.connect.assert_not_awaited()
+        assert not list((tmp_path / "files").iterdir())
+    finally:
+        await worker.close()
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("body", "content_type", "status", "headers"),
+    [
+        (b"<html>challenge</html>", "text/html", 200, {}),
+        (b"not an image", "image/png", 200, {}),
+        (WEBP + b"x" * 1024, "image/webp", 200, {}),
+        (WEBP, "image/webp", 200, {"content-length": "2048"}),
+        (WEBP, "image/webp", 403, {}),
+    ],
+)
+async def test_browser_attachment_rejects_invalid_payload_and_closes_page(
+    media_repository,
+    tmp_path,
+    body,
+    content_type,
+    status,
+    headers,
+):
+    url = "https://www.forexfactory.com/attachment/image/1"
+    await add_media(media_repository, url)
+    respx.get(url).mock(return_value=httpx.Response(403))
+    browser, page, _ = browser_attachment_response(url, body, content_type, status, headers)
+    worker = MediaWorker(media_repository, tmp_path / "files", 1024, browser=browser)
+    try:
+        assert await worker.run_once() == 0
+        page.close.assert_awaited_once()
+        assert not list((tmp_path / "files").iterdir())
+    finally:
+        await worker.close()
+
+
+@respx.mock
+async def test_browser_attachment_blocks_unrelated_redirect_and_closes_on_timeout(
+    media_repository,
+    tmp_path,
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    url = "https://www.forexfactory.com/attachment/image/1"
+    await add_media(media_repository, url)
+    respx.get(url).mock(return_value=httpx.Response(403))
+    browser, page, _ = browser_attachment_response(url)
+    page.goto.side_effect = TimeoutError("navigation timeout")
+    worker = MediaWorker(media_repository, tmp_path / "files", 1024, browser=browser)
+    try:
+        assert await worker.run_once() == 0
+        handler = page.route.call_args.args[1]
+        blocked = SimpleNamespace(
+            request=SimpleNamespace(url="https://other.example/attachment/image/1"),
+            abort=AsyncMock(),
+            continue_=AsyncMock(),
+        )
+        await handler(blocked)
+        blocked.abort.assert_awaited_once()
+        blocked.continue_.assert_not_awaited()
+        page.close.assert_awaited_once()
+    finally:
+        await worker.close()
+
+
+async def test_browser_stream_rejects_redirect_cancels_oversize_and_times_out():
+    import asyncio
+    import json
+
+    from playwright._impl._driver import compute_driver_executable
+
+    from app.news import media
+
+    script = (
+        "const download = "
+        + media.BROWSER_ATTACHMENT_FETCH
+        + ";\n"
+        + r"""
+const http = require('node:http');
+(async () => {
+  let redirectedRequests = 0;
+  const server = http.createServer((req, res) => {
+    if (req.url === '/redirect') {
+      res.writeHead(302, {Location: '/private'}); res.end();
+    } else if (req.url === '/private') {
+      redirectedRequests++; res.end('private');
+    } else {
+      res.writeHead(200, {'content-type':'image/png'});
+      res.flushHeaders();
+    }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const origin = 'http://127.0.0.1:' + server.address().port;
+  let redirectRejected = false, timedOut = false;
+  try {await download({url: origin + '/redirect', maxBytes: 32, timeoutMs: 1000})}
+  catch {redirectRejected = true}
+  try {await download({url: origin + '/stall', maxBytes: 32, timeoutMs: 30})}
+  catch {timedOut = true}
+  server.closeAllConnections(); server.close();
+  let readCalls = 0, cancelled = false;
+  globalThis.fetch = async () => ({status:200,
+    headers:new Headers({'content-type':'image/png'}),
+    body:{getReader:()=>({
+      read:async()=>{readCalls++; return {done:false,value:new Uint8Array(20)}},
+      cancel:async()=>{cancelled=true}, releaseLock:()=>{},
+    })}
+  });
+  let oversized = false;
+  try {await download({url:'https://www.forexfactory.com/attachment/image/1',
+    maxBytes:32,timeoutMs:1000})} catch {oversized=true}
+  console.log(JSON.stringify({redirectRejected, redirectedRequests, timedOut,
+    oversized, cancelled, readCalls}));
+})().catch(error=>{console.error(error);process.exit(1)});
+"""
+    )
+    process = await asyncio.create_subprocess_exec(
+        str(compute_driver_executable()[0]),
+        "-e",
+        script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=10)
+    assert process.returncode == 0, stderr.decode()
+    assert json.loads(stdout) == {
+        "redirectRejected": True,
+        "redirectedRequests": 0,
+        "timedOut": True,
+        "oversized": True,
+        "cancelled": True,
+        "readCalls": 2,
+    }

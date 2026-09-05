@@ -7,6 +7,23 @@ from app.collector import browser as browser_module
 from app.collector.browser import BrowserSession
 
 
+class PageEvents:
+    def locator(self, selector):
+        return CalendarDetailLocator(self, selector)
+
+    def on(self, event, callback):
+        if not hasattr(self, "listeners"):
+            self.listeners = {}
+        self.listeners.setdefault(event, []).append(callback)
+
+    def remove_listener(self, event, callback):
+        self.listeners[event].remove(callback)
+
+    def emit(self, event, request):
+        for callback in getattr(self, "listeners", {}).get(event, []):
+            callback(request)
+
+
 class FakeContext:
     def __init__(self) -> None:
         self.created = 0
@@ -52,7 +69,7 @@ class FakeStarter:
         return self.playwright
 
 
-class ConcurrencyProbePage:
+class ConcurrencyProbePage(PageEvents):
     def __init__(self) -> None:
         self.active_navigations = 0
         self.max_active_navigations = 0
@@ -119,7 +136,7 @@ class CommentLocator:
         return ""
 
 
-class CommentPage:
+class CommentPage(PageEvents):
     def __init__(self) -> None:
         self.expanded = False
         self.clicks = 0
@@ -170,7 +187,12 @@ class CalendarDetailLocator:
         self.page = page
         self.selector = selector
 
+    async def evaluate_all(self, _expression):
+        return await self.page.content()
+
     async def count(self) -> int:
+        if "loading" in self.selector:
+            return 0
         if self.selector == "tr.calendar__details--detail":
             return len(self.page.expanded)
         if "data-event-id='" in self.selector:
@@ -188,7 +210,7 @@ class CalendarDetailLocator:
         self.page.expanded.append(source_id)
 
 
-class CalendarBatchPage:
+class CalendarBatchPage(PageEvents):
     def __init__(self) -> None:
         self.goto_calls = 0
         self.expanded: list[str] = []
@@ -473,7 +495,7 @@ class MoreLocator:
         self.page.ticks = 0
 
 
-class MorePage:
+class MorePage(PageEvents):
     def __init__(self):
         self.ids = {"1"}
         self.loading = False
@@ -616,9 +638,25 @@ async def test_unavailable_calendar_details_keep_source_page_evidence() -> None:
 async def test_calendar_capture_waits_for_inflight_value_update() -> None:
     class UpdatingPage(CalendarBatchPage):
         updated = False
+        ticks = 0
+        request = type(
+            "SourceRequest",
+            (),
+            {
+                "url": "https://www.forexfactory.com/calendar/day",
+                "resource_type": "xhr",
+            },
+        )()
 
-        async def wait_for_load_state(self, *_args, **_kwargs):
-            self.updated = True
+        async def goto(self, *args, **kwargs):
+            await super().goto(*args, **kwargs)
+            self.emit("request", self.request)
+
+        async def wait_for_timeout(self, _milliseconds):
+            self.ticks += 1
+            if self.ticks >= 12:
+                self.updated = True
+                self.emit("requestfinished", self.request)
 
         async def content(self):
             html = await super().content()
@@ -652,3 +690,138 @@ async def test_calendar_browser_rejects_truncated_source_without_payload() -> No
     session.calendar_page = TruncatedPage()
     with pytest.raises(SourcePageError, match="source payload"):
         await session.calendar_html(date(2026, 9, 1))
+
+
+@pytest.mark.parametrize("kind", ["detail", "comments", "more", "calendar", "calendar-details"])
+async def test_source_capture_ignores_unrelated_never_idle_ad_network(kind) -> None:
+    async def unrelated_network(*_args, **_kwargs):
+        raise TimeoutError("advertisement network never idle")
+
+    session = BrowserSession("http://chrome:9222")
+    if kind in ("detail", "comments"):
+        page = CommentPage()
+        page.wait_for_load_state = unrelated_network
+        session.browser = FakeBrowser(CommentContext(page))
+        if kind == "detail":
+            assert (
+                await session.news_detail_html("https://example.test/news/1")
+                == "<html>64 comments</html>"
+            )
+        else:
+            capture = await session.news_comments_html("https://example.test/news/1", 184)
+            assert capture.source_exhausted is True
+            assert capture.collected_count == 184
+    elif kind == "more":
+        page = MorePage()
+        page.wait_for_load_state = unrelated_network
+        session.browser = FakeBrowser(FakeContext())
+        session.news_page = page
+        capture = await session.news_more_html("latest", 1)
+        assert capture.source_ids == frozenset({"1", "2"})
+        assert capture.terminal is False
+    else:
+        page = CalendarBatchPage()
+        page.wait_for_load_state = unrelated_network
+        session.browser = FakeBrowser(FakeContext())
+        session.calendar_page = page
+        if kind == "calendar":
+            assert 'data-event-id="148126"' in await session.calendar_html(date(2026, 9, 7))
+        else:
+            assert "148126" in await session.calendar_details_html(date(2026, 9, 7), ["148126"])
+
+
+async def test_news_more_waits_for_same_origin_xhr_without_visible_spinner() -> None:
+    class SourceRequest:
+        url = "https://www.forexfactory.com/news/block/1000"
+        resource_type = "xhr"
+
+    class NoSpinnerLocator(MoreLocator):
+        def locator(self, selector):
+            return NoSpinnerLocator(self.page, selector)
+
+        def get_by_text(self, _text, **_kwargs):
+            return NoSpinnerLocator(self.page, "more")
+
+        async def count(self):
+            return 0 if "loading" in self.kind else await super().count()
+
+        async def click(self):
+            await super().click()
+            self.page.emit("request", self.page.request)
+
+    class NoSpinnerPage(MorePage):
+        request = SourceRequest()
+
+        def locator(self, selector):
+            return NoSpinnerLocator(self, selector)
+
+        async def wait_for_timeout(self, milliseconds):
+            await super().wait_for_timeout(milliseconds)
+            if not self.loading:
+                self.emit("requestfinished", self.request)
+
+    page = NoSpinnerPage()
+    session = BrowserSession("http://chrome:9222")
+    session.browser = FakeBrowser(FakeContext())
+    session.news_page = page
+    capture = await session.news_more_html("latest", 1)
+    assert capture.source_ids == frozenset({"1", "2"})
+    assert capture.terminal is False
+
+
+@pytest.mark.parametrize("failure", ["transport", "http"])
+async def test_failed_source_request_cannot_prove_news_exhaustion(failure) -> None:
+    from app.parsers.errors import SourcePageError
+
+    class SourceRequest:
+        url = "https://www.forexfactory.com/news/block/1000"
+        resource_type = "xhr"
+
+    class FailedLocator(MoreLocator):
+        def get_by_text(self, _text, **_kwargs):
+            return FailedLocator(self.page, "more")
+
+        async def click(self):
+            await super().click()
+            self.page.emit("request", self.page.request)
+
+    class FailedPage(MorePage):
+        request = SourceRequest()
+
+        def locator(self, selector):
+            return FailedLocator(self, selector)
+
+        async def wait_for_timeout(self, _milliseconds):
+            if self.loading:
+                self.loading = False
+                self.terminal = True
+                if failure == "transport":
+                    self.emit("requestfailed", self.request)
+                else:
+                    from types import SimpleNamespace
+
+                    self.emit("response", SimpleNamespace(request=self.request, status=503))
+                    self.emit("requestfinished", self.request)
+
+    session = BrowserSession("http://chrome:9222")
+    session.browser = FakeBrowser(FakeContext())
+    session.news_page = FailedPage()
+    with pytest.raises(SourcePageError, match="source request"):
+        await session.news_more_html("latest", 1)
+
+
+async def test_same_origin_analytics_does_not_block_ready_article() -> None:
+    class AnalyticsRequest:
+        url = "https://www.forexfactory.com/cdn-cgi/rum"
+        resource_type = "fetch"
+
+    class AnalyticsPage(CommentPage):
+        async def goto(self, *args, **kwargs):
+            await super().goto(*args, **kwargs)
+            self.emit("request", AnalyticsRequest())
+
+    session = BrowserSession("http://chrome:9222")
+    session.browser = FakeBrowser(CommentContext(AnalyticsPage()))
+    assert (
+        await session.news_detail_html("https://example.test/news/1") == "<html>64 comments</html>"
+    )

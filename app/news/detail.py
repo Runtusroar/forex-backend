@@ -175,6 +175,7 @@ def parse_news_detail_v2(
         social = article.css_first(".x-twitter-post-preview__text")
         truth_social = article.css_first(".truthsocial-post__content")
         video_caption = article.css_first(".news__video-caption")
+        video = article.css_first(".news__video")
         if social:
             text = _clean(social.text(separator=" ", strip=True))
             author = article.css_first(".x-twitter-post-preview__name")
@@ -224,10 +225,11 @@ def parse_news_detail_v2(
                 max_lines=10 if is_clamped else None,
                 external_action_label="Show More" if is_clamped else None,
             )
-        elif video_caption:
+        elif video_caption or video:
             watch_link = article.css_first(".news__caption a[href]")
             source_href = watch_link.attributes.get("href") if watch_link else None
-            text = _clean(video_caption.text(separator=" ", strip=True))
+            text_node = video_caption or article.css_first("h1")
+            text = _clean(text_node.text(separator=" ", strip=True)) if text_node else ""
             if not source_href or not text:
                 continue
             source_url = urljoin(SOURCE_ROOT, source_href)

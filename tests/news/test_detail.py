@@ -11,6 +11,10 @@ TRUTH_SOCIAL_HTML = (
 VIDEO_HTML = (
     Path(__file__).parents[1] / "fixtures/news_v2/detail_video_audit_1416136.html"
 ).read_text()
+CAPTIONLESS_VIDEO_HTML = (
+    Path(__file__).parents[1]
+    / "fixtures/news_v2/detail_video_captionless_audit_1416253.html"
+).read_text()
 PARTIAL_HTML = (
     Path(__file__).parents[1] / "fixtures/news_v2/detail_partial_unrecognized_audit.html"
 ).read_text()
@@ -115,6 +119,22 @@ def test_real_video_page_becomes_watchable_link_segment() -> None:
         "https://www.bankofcanada.ca/multimedia/"
         "press-conference-policy-rate-announcement-september-2026/"
     )
+    assert segment.external_action_label == "Watch Video"
+    assert detail.is_complete is True
+
+
+def test_captionless_video_uses_article_heading_for_watchable_link_segment() -> None:
+    detail = parse_news_detail_v2(
+        CAPTIONLESS_VIDEO_HTML, "1416253", NOW, ZoneInfo("Asia/Shanghai")
+    )
+
+    assert len(detail.segments) == 1
+    segment = detail.segments[0]
+    assert segment.segment_type == "link"
+    assert segment.text_en == (
+        "RBA Hunter: Senate Committee on Intergenerational Housing Inequity"
+    )
+    assert segment.source_url == "https://www.youtube.com/watch?v=CFaGLURZHqU"
     assert segment.external_action_label == "Watch Video"
     assert detail.is_complete is True
 

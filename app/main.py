@@ -215,6 +215,7 @@ def create_app(
                 news_repository,
                 configured.news_media_dir,
                 configured.news_media_max_bytes,
+                browser=browser,
             )
             kimi = KimiTranslator(configured)
             translator = TranslationWorker(live_repository, kimi)
