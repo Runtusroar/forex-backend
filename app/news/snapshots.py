@@ -10,11 +10,21 @@ from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from selectolax.parser import HTMLParser
+
 from app.news.repository import NewsRepository
 
 
 def _normalized_hash(html: str) -> str:
-    normalized = re.sub(r"\s+", " ", html).strip()
+    tree = HTMLParser(html)
+    for node in tree.css("script, style, noscript"):
+        node.decompose()
+    roots = tree.css(
+        ".calendar__table, .news-block, .hot-stories, .news__article, .news-comments"
+    )
+    # Compare source content, not rotating ads, analytics or the page's server clock.
+    content = "\n".join(node.html for node in roots) if roots else tree.html or html
+    normalized = re.sub(r"\s+", " ", content).strip()
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 
@@ -42,7 +52,11 @@ class SnapshotStore:
         error: Exception | None = None,
     ) -> Path | None:
         captured = captured_at or datetime.now(UTC)
-        content_hash = _normalized_hash(html)
+        fingerprint = hashlib.sha256(html.encode()).hexdigest() if error else _normalized_hash(html)
+        # Keep one complete replay sample per day even if semantic content never changes.
+        content_hash = hashlib.sha256(
+            f"{captured.astimezone(UTC).date()}:{fingerprint}".encode()
+        ).hexdigest()
         parse_status = "failed" if error else "success"
         if await self.repository.has_snapshot(
             page_type, page_key, content_hash, parse_status
@@ -76,7 +90,7 @@ class SnapshotStore:
                 parse_status=parse_status,
                 error_type=type(error).__name__ if error else None,
             )
-        except Exception:
+        except BaseException:
             for path in (temporary, destination):
                 with suppress(FileNotFoundError):
                     os.unlink(path)

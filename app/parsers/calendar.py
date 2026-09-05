@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import UTC, date, datetime, timedelta, tzinfo
 from urllib.parse import urljoin
@@ -165,9 +166,11 @@ def _event_time(
     time_text: str | None,
     now: datetime,
     source_timezone: tzinfo,
+    *,
+    use_timestamp: bool = True,
 ) -> datetime:
     timestamp = row.attributes.get("data-timestamp")
-    if timestamp and timestamp.isdigit():
+    if use_timestamp and timestamp and timestamp.isdigit():
         return datetime.fromtimestamp(int(timestamp), tz=UTC)
     date_text = _source_date(date_text)
     if not date_text or not time_text:
@@ -183,16 +186,47 @@ def _event_time(
     return parsed.astimezone(UTC)
 
 
+def _embedded_day_events(tree: HTMLParser, marker: str | None) -> set[str] | None:
+    """Use the source's JSON payload to distinguish an empty day from its loading shell."""
+    found: set[str] | None = None
+    for script in tree.css("script"):
+        text = script.text()
+        if "calendarComponentStates" not in text:
+            continue
+        for match in re.finditer(r"\bdays\s*:\s*(\[)", text):
+            try:
+                days, _ = json.JSONDecoder().raw_decode(text[match.start(1) :])
+            except (ValueError, TypeError) as error:
+                raise SourcePageError("calendar source payload is incomplete") from error
+            for day in days:
+                label = _node_text(HTMLParser(day.get("date", "")).body)
+                if marker and _source_date(label) != marker:
+                    continue
+                if not isinstance(day.get("events"), list):
+                    raise SourcePageError("calendar source events are incomplete")
+                if found is None:
+                    found = set()
+                found.update(str(event["id"]) for event in day["events"])
+    return found
+
+
 def parse_calendar(
     html: str,
     now: datetime,
     source_timezone: tzinfo | None = None,
     expected_date: date | None = None,
+    *,
+    require_source_payload: bool = False,
 ) -> list[CalendarObservation]:
     reject_challenge(html)
     tree = HTMLParser(html)
     results: list[CalendarObservation] = []
     source_timezone = source_timezone or datetime.now().astimezone().tzinfo or UTC
+    reference = (
+        datetime.combine(expected_date, datetime.min.time(), source_timezone)
+        if expected_date
+        else now
+    )
     last_date: str | None = None
     last_time: str | None = None
     expected_marker = f"{expected_date:%b} {expected_date.day}" if expected_date else None
@@ -218,7 +252,7 @@ def parse_calendar(
         results.append(
             CalendarObservation(
                 source_id=source_id,
-                event_at=_event_time(row, last_date, last_time, now, source_timezone),
+                event_at=_event_time(row, last_date, last_time, reference, source_timezone),
                 currency=currency,
                 impact=_impact(row),
                 title_en=title,
@@ -231,13 +265,28 @@ def parse_calendar(
                     else None
                 ),
                 source_position=source_position,
+                source_date=(
+                    expected_date
+                    if expected_marker == _source_date(last_date)
+                    else _event_time(
+                        row, last_date, "12:00am", reference, source_timezone, use_timestamp=False
+                    )
+                    .astimezone(source_timezone)
+                    .date()
+                ),
             )
         )
         source_position += 1
     if expected_date and not requested_day_seen:
         raise SourcePageError("calendar page does not contain requested day")
-    if not results and expected_date is None:
-        raise SourcePageError("calendar page contains no event rows")
+    embedded_ids = _embedded_day_events(tree, expected_marker)
+    if require_source_payload and embedded_ids is None:
+        raise SourcePageError("calendar source payload is missing or unrecognized")
+    rendered_ids = {item.source_id for item in results}
+    if embedded_ids is not None and embedded_ids != rendered_ids:
+        raise SourcePageError("calendar page has incomplete event rows")
+    if not results and embedded_ids != set():
+        raise SourcePageError("calendar empty day is not verified by source data")
     return results
 
 
@@ -264,6 +313,8 @@ def parse_calendar_detail(
         detail = tree.css_first("tr.calendar__details--detail")
     if detail is None:
         raise SourcePageError("calendar detail row is missing")
+    if not _specs(detail):
+        raise SourcePageError("calendar detail source data is incomplete")
 
     title = _text(active, ".calendar__event") if active else None
     if not title:

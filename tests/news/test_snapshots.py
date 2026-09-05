@@ -67,3 +67,32 @@ async def test_cleanup_removes_only_expired_snapshot_files_and_metadata(
     assert expired is not None and not expired.exists()
     assert recent is not None and recent.exists()
     assert await snapshot_store.repository.snapshot_count() == 1
+
+
+async def test_script_clock_changes_do_not_duplicate_source_snapshot(snapshot_store):
+    html = '<script>var serverTime=100;</script><div class="news__article">Story</div>'
+    first = await snapshot_store.capture("detail", "1", html, NOW)
+    repeated = await snapshot_store.capture(
+        "detail", "1", html.replace("=100", "=101"), NOW + timedelta(seconds=30)
+    )
+    assert first is not None
+    assert repeated is None
+    assert decompress(first.read_bytes()).decode() == html
+
+
+async def test_unchanged_source_retains_a_daily_replay_sample(snapshot_store):
+    first = await snapshot_store.capture("listing", "news", "unchanged", NOW)
+    next_day = await snapshot_store.capture(
+        "listing", "news", "unchanged", NOW + timedelta(days=1)
+    )
+    assert first is not None and next_day is not None
+    assert first != next_day
+
+
+async def test_error_snapshots_preserve_different_diagnostic_scripts(snapshot_store):
+    html = '<script>error="challenge"</script><div>Unavailable</div>'
+    first = await snapshot_store.capture("detail", "1", html, NOW, ValueError())
+    second = await snapshot_store.capture(
+        "detail", "1", html.replace("challenge", "network"), NOW, ValueError()
+    )
+    assert first is not None and second is not None

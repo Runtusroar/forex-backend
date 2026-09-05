@@ -174,6 +174,7 @@ def create_app(
             app.state.repository = live_repository
             news_repository = NewsRepository(live_repository.db, live_repository.write_lock)
             app.state.news_repository = news_repository
+            snapshot_store = SnapshotStore(configured.news_snapshot_dir, news_repository)
             browser = BrowserSession(configured.cdp_url)
             app.state.calendar_browser = browser
             calendar_collector = Collector(
@@ -182,6 +183,8 @@ def create_app(
                 ZoneInfo(configured.calendar_source_timezone),
                 configured.calendar_horizon_days,
                 configured.calendar_schedule_interval_seconds,
+                lookback_days=configured.calendar_lookback_days,
+                snapshot_store=snapshot_store,
             )
             calendar_detail_collector = CalendarDetailCollector(
                 browser,
@@ -190,8 +193,8 @@ def create_app(
                 configured.calendar_detail_batch_size,
                 configured.news_detail_max_attempts,
                 timedelta(seconds=configured.calendar_detail_refresh_interval_seconds),
+                snapshot_store=snapshot_store,
             )
-            snapshot_store = SnapshotStore(configured.news_snapshot_dir, news_repository)
             news_collector = NewsCollector(
                 browser,
                 news_repository,
@@ -206,6 +209,7 @@ def create_app(
                 configured.news_detail_max_attempts,
                 timedelta(seconds=configured.news_comment_audit_interval_seconds),
                 timedelta(days=configured.news_comment_audit_days),
+                snapshot_store=snapshot_store,
             )
             media_worker = MediaWorker(
                 news_repository,
@@ -268,8 +272,10 @@ def create_app(
         cache_ttl_seconds=configured.binance_cache_ttl_seconds,
     )
 
-    def repo(request: Request) -> Repository:
-        return request.app.state.repository
+    async def repo(request: Request) -> AsyncIterator[Repository]:
+        live = request.app.state.repository
+        async with live.database.read_connection() as reader:
+            yield Repository(live.database, reader=reader)
 
     def market(request: Request) -> BinanceFuturesMarket:
         return request.app.state.binance_market
@@ -320,7 +326,10 @@ def create_app(
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         before: datetime | None = None,
     ) -> dict:
-        v2_items = await v1_news_list(request.app.state.news_repository, limit, before)
+        news_repository = NewsRepository(
+            repository.db, repository.write_lock, reader=repository.reader
+        )
+        v2_items = await v1_news_list(news_repository, limit, before)
         if v2_items:
             return {"items": v2_items, "generated_at": datetime.now(UTC)}
         items = await repository.list_news(limit, before)
@@ -332,7 +341,10 @@ def create_app(
         repository: Annotated[Repository, Depends(repo)],
         request: Request,
     ) -> dict:
-        v2_item = await v1_news_detail(request.app.state.news_repository, source_id)
+        news_repository = NewsRepository(
+            repository.db, repository.write_lock, reader=repository.reader
+        )
+        v2_item = await v1_news_detail(news_repository, source_id)
         if v2_item is not None:
             return v2_item
         item = await repository.get_news(source_id)
@@ -367,12 +379,21 @@ def create_app(
         )
         detail_last_error = await repository.get_runtime_state("calendar_detail_last_error")
         detail_jobs = await repository.calendar_detail_job_counts()
+        issues = []
+        if last_error:
+            issues.append("calendar_error")
+        if detail_last_error or detail_jobs.get("failed", 0):
+            issues.append("calendar_detail_error")
+        try:
+            age = (datetime.now(UTC) - datetime.fromisoformat(last_success)).total_seconds()
+        except (TypeError, ValueError):
+            age = None
+        if age is None or age > max(300, configured.collect_interval_seconds * 5):
+            issues.append("calendar_stale")
         return {
-            "status": (
-                "degraded"
-                if last_error or detail_last_error or detail_jobs.get("failed", 0)
-                else "ok"
-            ),
+            "status": "degraded" if issues else "ok",
+            "issues": issues,
+            "collection_age_seconds": age,
             "model": configured.kimi_model,
             "calendar": {
                 "last_success": last_success,

@@ -380,9 +380,7 @@ async def test_comment_jobs_track_latest_expected_count_and_priority(
             NOW,
             2,
             (
-                CommentObservation(
-                    "comment-1", "1416149", "A", "One", "https://ff.test/1", NOW
-                ),
+                CommentObservation("comment-1", "1416149", "A", "One", "https://ff.test/1", NOW),
                 CommentObservation(
                     "comment-2",
                     "1416149",
@@ -544,13 +542,9 @@ async def test_latest_comment_preview_cannot_reactivate_removed_detail_comment(
     await news_repository.apply_listing(
         batch(comment_count=0, observed_at=NOW + timedelta(minutes=1))
     )
-    removal_job = (
-        await news_repository.claim_comment_jobs(1, NOW + timedelta(minutes=1))
-    )[0]
+    removal_job = (await news_repository.claim_comment_jobs(1, NOW + timedelta(minutes=1)))[0]
     await news_repository.replace_comments(
-        CommentCollectionObservation(
-            "1416149", NOW + timedelta(minutes=1), 0, (), True
-        ),
+        CommentCollectionObservation("1416149", NOW + timedelta(minutes=1), 0, (), True),
         claimed_expected_count=removal_job.expected_count,
     )
     await news_repository.complete_comment_job(
@@ -596,12 +590,8 @@ async def test_stale_comment_worker_cannot_complete_newer_job(
             NOW + timedelta(minutes=1),
             2,
             (
-                CommentObservation(
-                    "comment-1", "1416149", "A", "One", "https://ff.test/1", NOW
-                ),
-                CommentObservation(
-                    "comment-2", "1416149", "B", "Two", "https://ff.test/2", NOW
-                ),
+                CommentObservation("comment-1", "1416149", "A", "One", "https://ff.test/1", NOW),
+                CommentObservation("comment-2", "1416149", "B", "Two", "https://ff.test/2", NOW),
             ),
             True,
         ),
@@ -710,8 +700,112 @@ async def test_comment_audit_respects_failed_job_retry_time(
         job.article_id, ValueError("bad comments"), NOW, max_attempts=1
     )
 
-    queued = await news_repository.enqueue_due_comment_audits(
-        NOW, audit_interval=timedelta(0)
-    )
+    queued = await news_repository.enqueue_due_comment_audits(NOW, audit_interval=timedelta(0))
 
     assert queued == 0
+
+
+async def test_obsolete_detail_cannot_overwrite_current_listing(news_repository):
+    await news_repository.apply_listing(batch())
+    job = (await news_repository.claim_detail_jobs(1, now=NOW))[0]
+    await news_repository.apply_listing(
+        batch(comment_count=1, observed_at=NOW + timedelta(minutes=1))
+    )
+    assert not await news_repository.replace_detail(
+        job.article_id,
+        DetailObservation(job.article_id, NOW, "old", segments=()),
+        desired_source_hash=job.desired_source_hash,
+    )
+    assert (await news_repository.get_article(job.article_id)).detail_state == "pending"
+
+
+async def test_exhausted_details_are_requeued_with_a_daily_bound(news_repository):
+    await news_repository.apply_listing(batch())
+    job = (await news_repository.claim_detail_jobs(1, now=NOW))[0]
+    await news_repository.fail_detail_job(job.article_id, RuntimeError(), now=NOW, max_attempts=1)
+    assert await news_repository.enqueue_due_detail_audits(now=NOW + timedelta(hours=1)) == 0
+    assert await news_repository.enqueue_due_detail_audits(now=NOW + timedelta(days=1)) == 1
+    assert await news_repository.enqueue_due_detail_audits(now=NOW + timedelta(days=1)) == 0
+
+
+async def test_recent_zero_comment_article_is_audited(news_repository):
+    await news_repository.apply_listing(batch())
+    await news_repository.claim_comment_jobs(1, now=NOW)
+    await news_repository.complete_comment_job("1416149", completed_at=NOW)
+    assert await news_repository.enqueue_due_comment_audits(now=NOW + timedelta(hours=7)) == 1
+
+
+async def test_cancelled_news_transaction_cannot_leak_into_next_commit(
+    news_repository, monkeypatch
+):
+    entered = asyncio.Event()
+    original = news_repository._upsert_article
+
+    async def paused(article, source_hash):
+        await original(article, source_hash)
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(news_repository, "_upsert_article", paused)
+    task = asyncio.create_task(news_repository.apply_listing(batch()))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await news_repository.set_runtime_state("other", "committed")
+    assert await news_repository.count_articles() == 0
+
+
+async def test_news_read_scope_holds_one_committed_snapshot(tmp_path):
+    database = Database(tmp_path / "snap.sqlite3")
+    await database.open()
+    await database.initialize()
+    try:
+        writer = NewsRepository(database.connection, database.write_lock)
+        await writer.apply_listing(batch())
+        async with database.read_connection() as reader:
+            scoped = NewsRepository(database.connection, database.write_lock, reader=reader)
+            assert (await scoped.get_article("1416149")).comment_count == 0
+            await writer.apply_listing(batch(comment_count=1))
+            assert (await scoped.detail_data("1416149"))["article"]["comment_count"] == 0
+        assert (await writer.get_article("1416149")).comment_count == 1
+    finally:
+        await database.close()
+
+
+async def test_mismatch_metadata_preserves_declared_count_and_comments(news_repository):
+    await news_repository.apply_listing(batch(comment_count=2))
+    old = CommentObservation("old", "1416149", "Alice", "Keep", "https://ff.test/old", NOW)
+    await news_repository.replace_comments(
+        CommentCollectionObservation("1416149", NOW, 1, (old,), is_complete=True)
+    )
+    fresh = CommentObservation("fresh", "1416149", "Bob", "New", "https://ff.test/new", NOW)
+    await news_repository.replace_comments(
+        CommentCollectionObservation(
+            "1416149",
+            NOW,
+            2,
+            (fresh,),
+            is_complete=False,
+            source_complete=True,
+            visible_count=1,
+        )
+    )
+    detail = await news_repository.detail_data("1416149")
+    assert detail["article"]["comment_count"] == 2
+    assert detail["article"]["comments_visible_count"] == 1
+    assert detail["article"]["comments_source_complete"] == 1
+    assert detail["article"]["comments_state"] == "partial"
+    assert await news_repository.comment_count("1416149") == 2
+    assert (await news_repository.status_counts())["comments_count_mismatch"] == 1
+
+
+async def test_status_excludes_obsolete_failed_media(news_repository):
+    await news_repository.apply_listing(batch())
+    await news_repository.db.execute(
+        """INSERT INTO news_media(article_id,stable_key,position,media_type,original_url,
+           download_state,is_current) VALUES ('1416149','old',0,'image','https://ff.test/old',
+           'failed',0)"""
+    )
+    await news_repository.db.commit()
+    assert (await news_repository.status_counts())["media_jobs"] == {}

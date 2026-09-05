@@ -7,9 +7,10 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from app.collector.browser import NewsCommentCapture
-from app.news.detail import parse_news_detail_v2
+from app.news.detail import parse_news_comments
 from app.news.models import CommentCollectionObservation
 from app.news.repository import NewsRepository
+from app.news.snapshots import SnapshotStore
 
 
 class CommentBrowserSource(Protocol):
@@ -22,6 +23,10 @@ class CommentCountMismatch(ValueError):
     pass
 
 
+class CommentSourceIncomplete(ValueError):
+    pass
+
+
 class CommentCollector:
     def __init__(
         self,
@@ -31,6 +36,7 @@ class CommentCollector:
         max_attempts: int = 8,
         audit_interval: timedelta = timedelta(hours=6),
         audit_window: timedelta = timedelta(days=30),
+        snapshot_store: SnapshotStore | None = None,
     ) -> None:
         self.browser = browser
         self.repository = repository
@@ -38,6 +44,7 @@ class CommentCollector:
         self.max_attempts = max_attempts
         self.audit_interval = audit_interval
         self.audit_window = audit_window
+        self.snapshot_store = snapshot_store
 
     async def run_cycle(self, now: datetime | None = None) -> int:
         observed_at = now or datetime.now(UTC)
@@ -53,12 +60,15 @@ class CommentCollector:
             if not jobs:
                 return 0
         job = jobs[0]
+        html: str | None = None
         try:
             capture = await self.browser.news_comments_html(job.ff_url, job.expected_count)
-            detail = parse_news_detail_v2(
-                capture.html, job.article_id, observed_at, self.source_timezone
+            html = capture.html
+            parsed_comments = parse_news_comments(
+                html, job.article_id, observed_at, self.source_timezone
             )
-            comments = tuple(dict.fromkeys(comment.comment_id for comment in detail.comments))
+            comments_by_id = {comment.comment_id: comment for comment in parsed_comments}
+            comments = tuple(comments_by_id.values())
             previous_count = await self.repository.comment_count(job.article_id)
             unverified_zero = (
                 capture.declared_count == 0
@@ -67,7 +77,8 @@ class CommentCollector:
                 and not job.expected_count_observed
             )
             is_complete = (
-                len(comments) == capture.declared_count
+                capture.source_exhausted
+                and len(comments) == capture.declared_count
                 and capture.collected_count == capture.declared_count
                 and not unverified_zero
             )
@@ -76,18 +87,57 @@ class CommentCollector:
                     article_id=job.article_id,
                     observed_at=observed_at,
                     expected_count=capture.declared_count,
-                    comments=detail.comments,
+                    comments=comments,
                     is_complete=is_complete,
+                    source_complete=capture.source_exhausted,
+                    visible_count=capture.collected_count,
                 ),
                 claimed_expected_count=job.expected_count,
             )
             if not stored:
                 return 0
             if not is_complete:
-                raise CommentCountMismatch(
+                collection_error: ValueError = CommentCountMismatch(
                     f"declared={capture.declared_count} collected={len(comments)}"
                 )
+                if not capture.source_exhausted or unverified_zero:
+                    collection_error = CommentSourceIncomplete(
+                        f"declared={capture.declared_count} visible={capture.collected_count}"
+                )
+                terminal_mismatch = (
+                    isinstance(collection_error, CommentCountMismatch)
+                    and capture.source_exhausted
+                    and capture.collected_count == len(comments)
+                    and capture.declared_count != len(comments)
+                    and not unverified_zero
+                )
+                if not terminal_mismatch:
+                    raise collection_error
+                if self.snapshot_store:
+                    with suppress(Exception):
+                        await self.snapshot_store.capture(
+                            "comments", job.article_id, html, observed_at, collection_error
+                        )
+                await self.repository.complete_comment_job(
+                    job.article_id,
+                    observed_at,
+                    claimed_expected_count=job.expected_count,
+                    collected_count=capture.declared_count,
+                )
+                await self.repository.set_runtime_state(
+                    "news_last_comment_success", observed_at.isoformat()
+                )
+                await self.repository.set_runtime_state("news_last_comment_error", "")
+                await self.repository.set_runtime_state(
+                    "news_last_comment_warning", type(collection_error).__name__
+                )
+                return 1
         except Exception as error:
+            if html is not None and self.snapshot_store:
+                with suppress(Exception):
+                    await self.snapshot_store.capture(
+                        "comments", job.article_id, html, observed_at, error
+                    )
             await self.repository.fail_comment_job(
                 job.article_id,
                 error,
@@ -99,6 +149,11 @@ class CommentCollector:
                 "news_last_comment_error", type(error).__name__
             )
             return 0
+        if self.snapshot_store:
+            with suppress(Exception):
+                await self.snapshot_store.capture(
+                    "comments", job.article_id, capture.html, observed_at
+                )
         await self.repository.complete_comment_job(
             job.article_id,
             observed_at,
@@ -109,6 +164,7 @@ class CommentCollector:
             "news_last_comment_success", observed_at.isoformat()
         )
         await self.repository.set_runtime_state("news_last_comment_error", "")
+        await self.repository.set_runtime_state("news_last_comment_warning", "")
         return 1
 
     async def run(self, stop: asyncio.Event, interval: int) -> None:

@@ -351,3 +351,128 @@ async def test_stale_translation_cannot_overwrite_changed_source(
 
     assert applied is False
     assert (await repository.get_news(item.source_id)).title_zh is None
+
+
+async def test_reads_do_not_see_uncommitted_rows(repository: Repository) -> None:
+    await repository.db.execute(
+        "INSERT INTO runtime_state(key,value) VALUES ('uncommitted','dirty')"
+    )
+    try:
+        assert await repository.get_runtime_state("uncommitted") is None
+    finally:
+        await repository.db.rollback()
+
+
+async def test_cancelled_write_is_rolled_back_before_next_commit(repository, monkeypatch):
+    import asyncio
+
+    started = asyncio.Event()
+
+    async def interrupted(_items, _now):
+        await repository.db.execute(
+            "INSERT INTO runtime_state(key,value) VALUES ('cancelled','dirty')"
+        )
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(repository, "_upsert_calendar", interrupted)
+    task = asyncio.create_task(repository.upsert_calendar([]))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await repository.set_runtime_state("unrelated", "committed")
+    assert await repository.get_runtime_state("cancelled") is None
+
+
+async def test_translation_claim_has_a_lease(repository):
+    await repository.upsert_calendar([calendar_item()])
+    assert len(await repository.claim_translation_jobs(1)) == 1
+    assert await repository.claim_translation_jobs(1) == []
+
+
+async def test_unavailable_calendar_detail_waits_for_refresh(repository):
+    item = calendar_item()
+    await repository.upsert_calendar([item])
+    job = (await repository.claim_calendar_detail_jobs(1))[0]
+    checked = item.event_at
+    await repository.complete_calendar_detail_job(
+        item.source_id,
+        job.desired_source_hash,
+        unavailable_reason="no_detail_control",
+        checked_at=checked,
+    )
+    assert await repository.enqueue_due_calendar_detail_refreshes(now=checked) == 0
+    assert (
+        await repository.enqueue_due_calendar_detail_refreshes(now=checked + timedelta(days=1)) == 1
+    )
+
+
+async def test_read_connection_keeps_snapshot_and_is_read_only(repository):
+    await repository.set_runtime_state("version", "old")
+    async with repository.database.read_connection() as reader:
+        scoped = Repository(repository.database, reader=reader)
+        assert await scoped.get_runtime_state("version") == "old"
+        await repository.set_runtime_state("version", "new")
+        assert await scoped.get_runtime_state("version") == "old"
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            await reader.execute("UPDATE runtime_state SET value='bad'")
+        # A supplied reader never redirects a write method to the read-only connection.
+        await scoped.set_runtime_state("other", "writer")
+        assert await scoped.get_runtime_state("other") is None
+    assert await repository.get_runtime_state("version") == "new"
+    assert await repository.get_runtime_state("other") == "writer"
+
+
+async def test_repeated_cancellation_holds_writer_lock_until_rollback(repository, monkeypatch):
+    import asyncio
+
+    inserted = asyncio.Event()
+    rolling_back = asyncio.Event()
+    release_rollback = asyncio.Event()
+    original_rollback = repository.db.rollback
+
+    async def paused_insert(_items, _now):
+        await repository.db.execute(
+            "INSERT INTO runtime_state(key,value) VALUES ('cancelled','dirty')"
+        )
+        inserted.set()
+        await asyncio.Event().wait()
+
+    async def paused_rollback():
+        rolling_back.set()
+        await release_rollback.wait()
+        await original_rollback()
+
+    monkeypatch.setattr(repository, "_upsert_calendar", paused_insert)
+    monkeypatch.setattr(repository.db, "rollback", paused_rollback)
+    task = asyncio.create_task(repository.upsert_calendar([]))
+    await inserted.wait()
+    task.cancel()
+    await rolling_back.wait()
+    task.cancel()
+    other = asyncio.create_task(repository.set_runtime_state("other", "committed"))
+    await asyncio.sleep(0)
+    assert not other.done()
+    release_rollback.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await other
+    assert await repository.get_runtime_state("cancelled") is None
+
+
+async def test_translation_lease_expires_and_calendar_job_keeps_source_date(
+    repository, monkeypatch
+):
+    import app.repository as module
+
+    now = datetime(2026, 9, 5, tzinfo=UTC)
+    monkeypatch.setattr(module, "_now", lambda: now)
+    item = replace(calendar_item(), source_date=now.date())
+    await repository.upsert_calendar([item])
+    first = await repository.claim_translation_jobs(1)
+    assert first
+    assert not await repository.claim_translation_jobs(1)
+    now += timedelta(minutes=6)
+    assert (await repository.claim_translation_jobs(1))[0].id == first[0].id
+    assert (await repository.claim_calendar_detail_jobs(1))[0].source_date == item.source_date

@@ -48,10 +48,12 @@ def test_calendar_accepts_a_validated_empty_requested_day() -> None:
         <table><tr class="calendar__row calendar__row--day-breaker">
           <td>Sun <span>Sep 6</span></td>
         </tr></table>
+        <script>window.calendarComponentStates[1] = {days: [{"date":"Sep 6","events":[]}]};</script>
         """,
         datetime(2026, 9, 4, tzinfo=UTC),
         source_timezone=timezone(timedelta(hours=8)),
         expected_date=date(2026, 9, 6),
+        require_source_payload=True,
     )
 
     assert rows == []
@@ -261,3 +263,82 @@ def test_news_detail_supports_article_and_social_content() -> None:
 def test_challenge_page_is_rejected(parser) -> None:
     with pytest.raises(ChallengePageError):
         parser(fixture("challenge.html"), datetime(2026, 9, 1, tzinfo=UTC))
+
+
+def test_calendar_rejects_date_only_loading_shell() -> None:
+    with pytest.raises(SourcePageError, match=r"empty|incomplete"):
+        parse_calendar(
+            '<table><tr class="calendar__row calendar__row--day-breaker">'
+            "<td>Sep 6</td></tr></table>",
+            datetime(2026, 9, 6, tzinfo=UTC),
+            expected_date=date(2026, 9, 6),
+        )
+
+
+def test_calendar_rejects_missing_embedded_source_event() -> None:
+    html = (
+        fixture("calendar.html")
+        + """<script>
+    window.calendarComponentStates[1] = {days: [
+        {"date":"Sep 1","events":[{"id":1001},{"id":1002},{"id":1003}]}]};
+    </script>"""
+    )
+    with pytest.raises(SourcePageError, match="incomplete"):
+        parse_calendar(html, datetime(2026, 9, 1, tzinfo=UTC), expected_date=date(2026, 9, 1))
+
+
+def test_calendar_source_date_is_independent_of_timestamp_timezone() -> None:
+    html = fixture("calendar.html").replace(
+        'data-timestamp="1788265800"', 'data-timestamp="1788190000"'
+    )
+    rows = parse_calendar(html, datetime(2026, 9, 1, tzinfo=UTC), expected_date=date(2026, 9, 1))
+    assert rows[0].source_date == date(2026, 9, 1)
+
+
+@pytest.mark.parametrize(("day", "count"), [(date(2026, 9, 1), 39), (date(2026, 9, 2), 16)])
+def test_calendar_replays_audited_source_with_all_ids(day, count) -> None:
+    rows = parse_calendar(
+        fixture(f"calendar_source_{day}.html"),
+        datetime(2026, 9, 5, tzinfo=UTC),
+        expected_date=day,
+    )
+    assert len({row.source_id for row in rows}) == count
+    assert {row.source_date for row in rows} == {day}
+
+
+def test_calendar_rejects_audited_source_with_one_missing_row() -> None:
+    from selectolax.parser import HTMLParser
+
+    tree = HTMLParser(fixture("calendar_source_2026-09-01.html"))
+    tree.css_first("tr.calendar__row[data-event-id]").decompose()
+    with pytest.raises(SourcePageError, match="incomplete"):
+        parse_calendar(tree.html, datetime(2026, 9, 5, tzinfo=UTC), expected_date=date(2026, 9, 1))
+
+
+def test_calendar_detail_loading_row_is_retryable() -> None:
+    with pytest.raises(SourcePageError, match="incomplete"):
+        parse_calendar_detail(
+            '<table><tr class="calendar__row" data-event-id="1">'
+            '<td class="calendar__event">Event</td><td class="calendar__impact"></td></tr>'
+            '<tr class="calendar__details--detail"><td>Loading...</td></tr></table>',
+            "1",
+            datetime(2026, 9, 1, tzinfo=UTC),
+        )
+
+
+def test_calendar_source_date_without_expected_day_uses_label() -> None:
+    html = fixture("calendar.html").replace(
+        'data-timestamp="1788265800"', 'data-timestamp="1788190000"'
+    )
+    rows = parse_calendar(html, datetime(2026, 9, 1, tzinfo=UTC), source_timezone=UTC)
+    assert rows[0].source_date == date(2026, 9, 1)
+
+
+def test_calendar_explicit_historical_date_controls_year() -> None:
+    rows = parse_calendar(
+        fixture("calendar.html").replace('data-timestamp="1788265800"', ""),
+        datetime(2026, 9, 5, tzinfo=UTC),
+        source_timezone=UTC,
+        expected_date=date(2025, 9, 1),
+    )
+    assert rows[0].event_at.year == 2025

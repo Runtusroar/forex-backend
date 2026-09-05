@@ -68,7 +68,9 @@ class FakeBackfillRepository:
         return ListingApplyResult(len(observed), new)
 
 
-async def test_backfill_checkpoint_survives_new_instance_and_stops_after_no_new_ids() -> None:
+async def test_backfill_checkpoint_survives_new_instance_and_pauses_without_false_coverage() -> (
+    None
+):
     page = listing("1", "Sep 2, 2026, 10:42pm")
     browser = FakeContinuationBrowser([page])
     repository = FakeBackfillRepository()
@@ -86,7 +88,11 @@ async def test_backfill_checkpoint_survives_new_instance_and_stops_after_no_new_
     checkpoint = json.loads(repository.state["news_backfill:latest"])
     assert browser.calls == [("latest", 1), ("latest", 2), ("latest", 3)]
     assert checkpoint["no_new_id_streak"] == 2
-    assert checkpoint["complete"] is True
+    assert checkpoint["complete"] is False
+    assert checkpoint["stop_reason"] == "no_progress"
+    assert checkpoint["reached_cutoff"] is False
+    await backfill.run_once(now=NOW)
+    assert len(browser.calls) == 3
     assert repository.ids == {"1"}
 
 
@@ -118,6 +124,7 @@ async def test_backfill_streak_only_counts_new_ids_in_current_section() -> None:
         {
             "continuation_count": 0,
             "oldest_published_at": None,
+            "last_run_at": NOW.isoformat(),
             "no_new_id_streak": 1,
             "complete": False,
         }
@@ -133,6 +140,64 @@ async def test_backfill_streak_only_counts_new_ids_in_current_section() -> None:
     result = await backfill.run_once(now=NOW)
 
     checkpoint = json.loads(repository.state["news_backfill:fundamental"])
-    assert result.completed_sections == 1
+    assert result.completed_sections == 0
     assert checkpoint["no_new_id_streak"] == 2
-    assert checkpoint["complete"] is True
+    assert checkpoint["complete"] is False
+
+
+async def test_existing_overlap_does_not_hide_unknown_third_page() -> None:
+    browser = FakeContinuationBrowser(
+        [listing(str(i), "Sep 2, 2026, 10:42pm") for i in range(1, 4)]
+    )
+    repository = FakeBackfillRepository()
+    repository.ids.update({"1", "2"})
+    backfill = NewsBackfill(browser, repository, ZoneInfo("UTC"), sections=("latest",))
+    for _ in range(3):
+        await backfill.run_once(now=NOW)
+    assert "3" in repository.ids
+    assert json.loads(repository.state["news_backfill:latest"])["reached_cutoff"] is False
+
+
+async def test_completed_checkpoint_reopens_after_one_day() -> None:
+    from datetime import timedelta
+
+    browser = FakeContinuationBrowser([listing("1", "Jul 1, 2026, 10:42pm")])
+    repository = FakeBackfillRepository()
+    backfill = NewsBackfill(browser, repository, ZoneInfo("UTC"), sections=("latest",))
+    await backfill.run_once(now=NOW)
+    await backfill.run_once(now=NOW)
+    await backfill.run_once(now=NOW + timedelta(days=1))
+    assert browser.calls == [("latest", 1), ("latest", 1)]
+    checkpoint = json.loads(repository.state["news_backfill:latest"])
+    assert checkpoint["stop_reason"] == "cutoff"
+    assert checkpoint["reached_cutoff"] is True
+    assert checkpoint["target_cutoff"] is not None
+
+
+async def test_legacy_completed_checkpoint_reopens() -> None:
+    browser = FakeContinuationBrowser([listing("1", "Sep 2, 2026, 10:42pm")], terminal=True)
+    repository = FakeBackfillRepository()
+    repository.state["news_backfill:latest"] = json.dumps(
+        {"continuation_count": 3, "complete": True}
+    )
+    backfill = NewsBackfill(browser, repository, ZoneInfo("UTC"), sections=("latest",))
+    await backfill.run_once(now=NOW)
+    assert browser.calls == [("latest", 1)]
+    checkpoint = json.loads(repository.state["news_backfill:latest"])
+    assert checkpoint["stop_reason"] == "source_exhausted"
+    assert checkpoint["reached_cutoff"] is False
+
+
+async def test_active_backfill_sections_make_fair_progress() -> None:
+    browser = FakeContinuationBrowser([mixed_listing("1", "2")])
+    repository = FakeBackfillRepository()
+    for _ in range(4):
+        await NewsBackfill(
+            browser, repository, ZoneInfo("UTC"), sections=("latest", "fundamental")
+        ).run_once(now=NOW)
+    assert [section for section, _ in browser.calls] == [
+        "latest",
+        "fundamental",
+        "latest",
+        "fundamental",
+    ]

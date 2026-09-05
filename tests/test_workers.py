@@ -30,7 +30,9 @@ class FakeBrowser:
 
     async def calendar_html(self, day: date) -> str:
         self.calendar_days.append(day)
-        return (FIXTURES / "calendar.html").read_text()
+        return (FIXTURES / "calendar.html").read_text() + calendar_payload(
+            date(2026, 9, 1), "1001", "1002"
+        )
 
     async def news_html(self) -> str:
         return (FIXTURES / "news.html").read_text()
@@ -74,7 +76,9 @@ class FailingCalendarBrowser(FakeBrowser):
 class CurrentCalendarBrowser(FakeBrowser):
     async def calendar_html(self, day: date) -> str:
         self.calendar_days.append(day)
-        return (FIXTURES / "calendar_current.html").read_text()
+        return (FIXTURES / "calendar_current.html").read_text() + calendar_payload(
+            date(2026, 8, 31), "149673"
+        )
 
 
 class CalendarDetailBatchBrowser(FakeBrowser):
@@ -102,6 +106,13 @@ class UnavailableCalendarDetailBatchBrowser(CalendarDetailBatchBrowser):
         return {source_id: None for source_id in source_ids}
 
 
+def calendar_payload(day: date, *source_ids: str) -> str:
+    import json
+
+    days = [{"date": f"{day:%b} {day.day}", "events": [{"id": value} for value in source_ids]}]
+    return "<script>window.calendarComponentStates[1] = {days: " + json.dumps(days) + "};</script>"
+
+
 def daily_calendar_html(day: date, source_id: str) -> str:
     return f"""
     <table>
@@ -117,11 +128,11 @@ def daily_calendar_html(day: date, source_id: str) -> str:
         <td class="calendar__previous">49</td>
       </tr>
     </table>
-    """
+    """ + calendar_payload(day, source_id)
 
 
 async def test_collection_cycle_commits_calendar_and_news(repository: Repository) -> None:
-    result = await Collector(FakeBrowser(), repository, horizon_days=1).run_cycle(
+    result = await Collector(FakeBrowser(), repository, horizon_days=1, lookback_days=0).run_cycle(
         datetime(2026, 9, 1, 12, tzinfo=UTC)
     )
 
@@ -139,6 +150,7 @@ async def test_calendar_collection_requests_daily_page_and_uses_source_timezone(
         repository,
         source_timezone=timezone(timedelta(hours=8)),
         horizon_days=1,
+        lookback_days=0,
     )
 
     await collector.run_calendar_cycle(datetime(2026, 8, 31, 12, tzinfo=UTC))
@@ -188,7 +200,7 @@ async def test_collection_reuses_stored_news_detail_on_later_cycles(
     repository: Repository,
 ) -> None:
     browser = FakeBrowser()
-    collector = Collector(browser, repository, horizon_days=1)
+    collector = Collector(browser, repository, horizon_days=1, lookback_days=0)
 
     await collector.run_cycle(datetime(2026, 9, 1, 12, tzinfo=UTC))
     await collector.run_cycle(datetime(2026, 9, 1, 12, 1, tzinfo=UTC))
@@ -199,9 +211,9 @@ async def test_collection_reuses_stored_news_detail_on_later_cycles(
 async def test_detail_failure_does_not_block_news_listing_storage(
     repository: Repository,
 ) -> None:
-    result = await Collector(FailingDetailBrowser(), repository, horizon_days=1).run_cycle(
-        datetime(2026, 9, 1, 12, tzinfo=UTC)
-    )
+    result = await Collector(
+        FailingDetailBrowser(), repository, horizon_days=1, lookback_days=0
+    ).run_cycle(datetime(2026, 9, 1, 12, tzinfo=UTC))
 
     stored = await repository.get_news("9001")
     assert result.news_count == 1
@@ -306,11 +318,7 @@ async def test_calendar_detail_worker_completes_event_without_detail_link(
 ) -> None:
     event_at = datetime(2026, 8, 31, 7, 50, tzinfo=UTC)
     await repository.upsert_calendar(
-        [
-            CalendarObservation(
-                "149673", event_at, "JPY", "low", "Holiday", None, None, None
-            )
-        ]
+        [CalendarObservation("149673", event_at, "JPY", "low", "Holiday", None, None, None)]
     )
     worker = CalendarDetailCollector(
         UnavailableCalendarDetailBatchBrowser(), repository, source_timezone=UTC
@@ -321,3 +329,100 @@ async def test_calendar_detail_worker_completes_event_without_detail_link(
     assert completed == 1
     assert await repository.get_calendar_detail("149673") is None
     assert (await repository.calendar_detail_job_counts()) == {"done": 1}
+
+
+async def test_calendar_lookback_runs_once_per_source_day(repository: Repository) -> None:
+    browser = FailingCalendarBrowser(date(2000, 1, 1))
+    collector = Collector(
+        browser, repository, horizon_days=2, lookback_days=2, schedule_interval=600
+    )
+    now = datetime(2026, 9, 3, 12, tzinfo=UTC)
+    await collector.run_calendar_cycle(now)
+    assert browser.calendar_days == [date(2026, 9, i) for i in (1, 2, 3, 4)]
+    browser.calendar_days.clear()
+    # Restart should retain the daily lookback checkpoint.
+    collector = Collector(
+        browser, repository, horizon_days=2, lookback_days=2, schedule_interval=600
+    )
+    await collector.run_calendar_cycle(now + timedelta(minutes=20))
+    assert browser.calendar_days == [date(2026, 9, 3), date(2026, 9, 4)]
+
+
+async def test_calendar_failed_parse_captures_source_snapshot(repository: Repository) -> None:
+    class ShellBrowser(FakeBrowser):
+        async def calendar_html(self, day):
+            return '<table><tr class="calendar__row"><td>Sep 1</td></tr></table>'
+
+    class Snapshots:
+        def __init__(self):
+            self.calls = []
+
+        async def capture(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    snapshots = Snapshots()
+    collector = Collector(
+        ShellBrowser(), repository, horizon_days=1, lookback_days=0, snapshot_store=snapshots
+    )
+    from app.parsers.errors import SourcePageError
+
+    with pytest.raises(SourcePageError):
+        await collector.run_calendar_cycle(datetime(2026, 9, 1, tzinfo=UTC))
+    assert snapshots.calls[0][0][0:2] == ("calendar", "2026-09-01")
+    assert snapshots.calls[0][1]["error"] is not None
+
+
+async def test_calendar_detail_uses_source_day_over_utc_timestamp_day(
+    repository: Repository,
+) -> None:
+    await repository.upsert_calendar(
+        [
+            CalendarObservation(
+                "149673",
+                datetime(2026, 8, 30, 23, 50, tzinfo=UTC),
+                "JPY",
+                "low",
+                "Prelim Industrial Production m/m",
+                None,
+                None,
+                None,
+                source_date=date(2026, 8, 31),
+            )
+        ]
+    )
+    browser = CalendarDetailBatchBrowser()
+    collector = CalendarDetailCollector(browser, repository, source_timezone=UTC)
+    await collector.run_cycle()
+    assert browser.detail_batches[0][0] == date(2026, 8, 31)
+
+
+async def test_truncated_source_without_payload_cannot_replace_complete_calendar(
+    repository: Repository,
+) -> None:
+    from selectolax.parser import HTMLParser
+
+    from app.parsers.errors import SourcePageError
+
+    complete = (FIXTURES / "calendar_source_2026-09-01.html").read_text()
+    tree = HTMLParser(complete)
+    for node in tree.css("script") + tree.css("tr.calendar__row[data-event-id]")[1:]:
+        node.decompose()
+
+    class SourceBrowser(FakeBrowser):
+        html = complete
+
+        async def calendar_html(self, day):
+            return self.html
+
+    browser = SourceBrowser()
+    collector = Collector(browser, repository, horizon_days=1, lookback_days=0)
+    now = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    assert await collector.run_calendar_cycle(now) == 39
+    browser.html = tree.html
+    with pytest.raises(SourcePageError, match="source payload"):
+        await collector.run_calendar_cycle(now + timedelta(minutes=1))
+    retained = await repository.list_calendar(
+        datetime(2026, 8, 30, tzinfo=UTC),
+        datetime(2026, 9, 3, tzinfo=UTC),
+    )
+    assert len({row.source_id for row in retained}) == 39

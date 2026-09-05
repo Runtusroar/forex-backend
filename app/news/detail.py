@@ -113,6 +113,50 @@ def _reaction_count(node: Node) -> int | None:
     return None
 
 
+def _parse_comments(
+    tree: HTMLParser,
+    article_id: str,
+    observed_at: datetime,
+    source_timezone: ZoneInfo,
+) -> tuple[CommentObservation, ...]:
+    comments: list[CommentObservation] = []
+    for position, node in enumerate(tree.css(".news-comments__list .news-comment")):
+        identity = _comment_id(node)
+        message = node.css_first(".news-comment__comment-message")
+        if not identity or not message:
+            continue
+        author = node.css_first(".news-comment__header-username")
+        source_time = node.css_first(".news-comment__header-date")
+        source_time_text = _comment_source_time(source_time)
+        comments.append(
+            CommentObservation(
+                comment_id=identity[0],
+                article_id=article_id,
+                parent_comment_id=_parent_comment_id(node),
+                author_name=_clean(author.text(strip=True)) if author else "Unknown",
+                text_en=_clean(message.text(separator=" ", strip=True)),
+                permalink=identity[1],
+                observed_at=observed_at,
+                published_at=_published(source_time_text, source_timezone, observed_at),
+                published_at_source_text=source_time_text,
+                reaction_count=_reaction_count(node),
+                position=position,
+                depth=_comment_depth(node),
+            )
+        )
+    return tuple(comments)
+
+
+def parse_news_comments(
+    html: str,
+    article_id: str,
+    observed_at: datetime,
+    source_timezone: ZoneInfo,
+) -> tuple[CommentObservation, ...]:
+    reject_challenge(html)
+    return _parse_comments(HTMLParser(html), article_id, observed_at, source_timezone)
+
+
 def parse_news_detail_v2(
     html: str,
     article_id: str,
@@ -121,14 +165,16 @@ def parse_news_detail_v2(
 ) -> DetailObservation:
     reject_challenge(html)
     tree = HTMLParser(html)
+    article_nodes = tree.css(".news__article")
     segments: list[SegmentObservation] = []
     links: list[SegmentLinkObservation] = []
     media: list[MediaObservation] = []
-    for position, article in enumerate(tree.css(".news__article")):
+    for position, article in enumerate(article_nodes):
         full_story = None
         link_label = None
         social = article.css_first(".x-twitter-post-preview__text")
         truth_social = article.css_first(".truthsocial-post__content")
+        video_caption = article.css_first(".news__video-caption")
         if social:
             text = _clean(social.text(separator=" ", strip=True))
             author = article.css_first(".x-twitter-post-preview__name")
@@ -177,6 +223,21 @@ def parse_news_detail_v2(
                 display_mode="clamped" if is_clamped else "full",
                 max_lines=10 if is_clamped else None,
                 external_action_label="Show More" if is_clamped else None,
+            )
+        elif video_caption:
+            watch_link = article.css_first(".news__caption a[href]")
+            source_href = watch_link.attributes.get("href") if watch_link else None
+            text = _clean(video_caption.text(separator=" ", strip=True))
+            if not source_href or not text:
+                continue
+            source_url = urljoin(SOURCE_ROOT, source_href)
+            segment = SegmentObservation(
+                stable_key=_key("link", source_url, text),
+                position=position,
+                segment_type="link",
+                text_en=text,
+                source_url=source_url,
+                external_action_label="Watch Video",
             )
         else:
             copy = article.css_first(".news__copy")
@@ -260,31 +321,6 @@ def parse_news_detail_v2(
     if not segments:
         raise SourcePageError("news detail contains no story segments")
 
-    comments: list[CommentObservation] = []
-    for position, node in enumerate(tree.css(".news-comments__list .news-comment")):
-        identity = _comment_id(node)
-        message = node.css_first(".news-comment__comment-message")
-        if not identity or not message:
-            continue
-        author = node.css_first(".news-comment__header-username")
-        source_time = node.css_first(".news-comment__header-date")
-        source_time_text = _comment_source_time(source_time)
-        comments.append(
-            CommentObservation(
-                comment_id=identity[0],
-                article_id=article_id,
-                parent_comment_id=_parent_comment_id(node),
-                author_name=_clean(author.text(strip=True)) if author else "Unknown",
-                text_en=_clean(message.text(separator=" ", strip=True)),
-                permalink=identity[1],
-                observed_at=observed_at,
-                published_at=_published(source_time_text, source_timezone, observed_at),
-                published_at_source_text=source_time_text,
-                reaction_count=_reaction_count(node),
-                position=position,
-                depth=_comment_depth(node),
-            )
-        )
     return DetailObservation(
         article_id=article_id,
         observed_at=observed_at,
@@ -292,6 +328,6 @@ def parse_news_detail_v2(
         segments=tuple(segments),
         links=tuple(links),
         media=tuple(media),
-        comments=tuple(comments),
-        is_complete=True,
+        comments=_parse_comments(tree, article_id, observed_at, source_timezone),
+        is_complete=len(segments) == len(article_nodes),
     )

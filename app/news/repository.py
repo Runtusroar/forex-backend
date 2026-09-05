@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from datetime import UTC, datetime, timedelta
-from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -24,19 +23,8 @@ from app.news.models import (
     MediaJob,
     NewsListingBatch,
 )
-
-
-def _serialized_write(method):
-    @wraps(method)
-    async def wrapper(self, *args, **kwargs):
-        async with self.write_lock:
-            try:
-                return await method(self, *args, **kwargs)
-            except Exception:
-                await self.db.rollback()
-                raise
-
-    return wrapper
+from app.transactions import serialized_write as _serialized_write
+from app.transactions import snapshot_read as _snapshot_read
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -66,8 +54,11 @@ class NewsRepository:
         self,
         connection: aiosqlite.Connection,
         write_lock: asyncio.Lock | None = None,
+        reader: aiosqlite.Connection | None = None,
     ) -> None:
-        self.db = connection
+        self.database = None
+        self.reader = reader
+        self.db = self._writer_db = connection
         self.write_lock = write_lock or asyncio.Lock()
 
     @_serialized_write
@@ -347,6 +338,7 @@ class NewsRepository:
             (article_id, feed_type, event_type, previous_rank, new_rank, observed_at),
         )
 
+    @_snapshot_read
     async def count_articles(self) -> int:
         rows = await self.db.execute_fetchall("SELECT count(*) AS count FROM news_articles")
         return int(rows[0]["count"])
@@ -434,7 +426,10 @@ class NewsRepository:
         parameters = (
             state,
             attempts,
-            _iso(failed_at + timedelta(minutes=delay_minutes)),
+            _iso(
+                failed_at
+                + (timedelta(days=1) if state == "failed" else timedelta(minutes=delay_minutes))
+            ),
             type(error).__name__,
             article_id,
         )
@@ -453,12 +448,44 @@ class NewsRepository:
             )
         await self.db.commit()
 
+    @_serialized_write
+    async def enqueue_due_detail_audits(
+        self,
+        now: datetime | None = None,
+        audit_interval: timedelta = timedelta(days=1),
+        recent_window: timedelta = timedelta(days=30),
+        limit: int = 10,
+    ) -> int:
+        observed_at = now or datetime.now(UTC)
+        rows = await self.db.execute_fetchall(
+            """SELECT j.article_id FROM news_detail_jobs j
+               JOIN news_articles a ON a.source_id=j.article_id
+               WHERE j.state='failed' AND j.next_attempt_at<=?
+                 AND COALESCE(a.published_at,a.first_seen_at)>=?
+               ORDER BY j.next_attempt_at,j.article_id LIMIT ?""",
+            (
+                _iso(observed_at + timedelta(days=1) - audit_interval),
+                _iso(observed_at - recent_window),
+                limit,
+            ),
+        )
+        for row in rows:
+            await self.db.execute(
+                """UPDATE news_detail_jobs SET state='pending',attempts=0,claimed_at=NULL,
+                   next_attempt_at=?,last_error=NULL WHERE article_id=? AND state='failed'""",
+                (_iso(observed_at), row["article_id"]),
+            )
+        await self.db.commit()
+        return len(rows)
+
+    @_snapshot_read
     async def detail_job_state(self, article_id: str) -> str | None:
         rows = await self.db.execute_fetchall(
             "SELECT state FROM news_detail_jobs WHERE article_id=?", (article_id,)
         )
         return str(rows[0]["state"]) if rows else None
 
+    @_snapshot_read
     async def has_snapshot(
         self, page_type: str, page_key: str, content_hash: str, parse_status: str
     ) -> bool:
@@ -497,10 +524,12 @@ class NewsRepository:
         )
         await self.db.commit()
 
+    @_snapshot_read
     async def snapshot_count(self) -> int:
         rows = await self.db.execute_fetchall("SELECT count(*) AS count FROM source_snapshots")
         return int(rows[0]["count"])
 
+    @_snapshot_read
     async def expired_snapshots(self, cutoff: datetime) -> list[tuple[int, str]]:
         rows = await self.db.execute_fetchall(
             "SELECT id,compressed_path FROM source_snapshots WHERE captured_at<?",
@@ -519,11 +548,28 @@ class NewsRepository:
         await self.db.commit()
 
     @_serialized_write
-    async def replace_detail(self, article_id: str, detail: DetailObservation) -> None:
+    async def replace_detail(
+        self,
+        article_id: str,
+        detail: DetailObservation,
+        *,
+        desired_source_hash: str | None = None,
+    ) -> bool:
         observed = _iso(detail.observed_at)
         current_keys = {segment.stable_key for segment in detail.segments}
         await self.db.execute("BEGIN IMMEDIATE")
         try:
+            if desired_source_hash is not None:
+                current = await self.db.execute_fetchall(
+                    """SELECT 1 FROM news_detail_jobs j
+                       JOIN news_articles a ON a.source_id=j.article_id
+                       WHERE j.article_id=? AND j.state='processing'
+                         AND j.desired_source_hash=? AND a.source_hash=?""",
+                    (article_id, desired_source_hash, desired_source_hash),
+                )
+                if not current:
+                    await self.db.rollback()
+                    return False
             for segment in detail.segments:
                 source_hash = hashlib.sha256(
                     "\n".join(
@@ -688,6 +734,7 @@ class NewsRepository:
                 ),
             )
             await self.db.commit()
+            return True
         except Exception:
             await self.db.rollback()
             raise
@@ -815,7 +862,8 @@ class NewsRepository:
             await self.db.execute(
                 """UPDATE news_articles SET comments_state=?,comments_checked_at=?,
                    comments_completed_at=CASE WHEN ? THEN ? ELSE comments_completed_at END,
-                   comment_count=?,updated_at=? WHERE source_id=?""",
+                   comment_count=?,updated_at=?,comments_source_complete=?,
+                   comments_visible_count=? WHERE source_id=?""",
                 (
                     "complete" if collection.is_complete else "partial",
                     observed,
@@ -823,6 +871,8 @@ class NewsRepository:
                     observed,
                     collection.expected_count,
                     observed,
+                    int(collection.source_complete),
+                    collection.visible_count,
                     collection.article_id,
                 ),
             )
@@ -953,6 +1003,7 @@ class NewsRepository:
         await self.db.commit()
         return True
 
+    @_snapshot_read
     async def comment_job_state(self, article_id: str) -> str | None:
         rows = await self.db.execute_fetchall(
             "SELECT state FROM news_comment_jobs WHERE article_id=?", (article_id,)
@@ -972,12 +1023,7 @@ class NewsRepository:
             """SELECT a.source_id,a.comment_count
                FROM news_articles a
                LEFT JOIN news_comment_jobs j ON j.article_id=a.source_id
-               WHERE (a.comment_count>0 OR EXISTS (
-                   SELECT 1 FROM news_comments c
-                   WHERE c.article_id=a.source_id AND c.is_current=1
-                     AND c.observation_quality='detail'
-                 ))
-                 AND COALESCE(a.published_at,a.first_seen_at)>=?
+               WHERE COALESCE(a.published_at,a.first_seen_at)>=?
                  AND (a.comments_checked_at IS NULL OR a.comments_checked_at<=?)
                  AND (j.article_id IS NULL OR j.state='done'
                       OR (j.state='failed' AND j.next_attempt_at<=?))
@@ -1153,6 +1199,7 @@ class NewsRepository:
         )
         await self.db.commit()
 
+    @_snapshot_read
     async def localized_text(self, entity_type: str, entity_id: str, field_name: str) -> str | None:
         source_text = await self._localized_source_text(entity_type, entity_id, field_name)
         if source_text is None:
@@ -1166,6 +1213,7 @@ class NewsRepository:
         )
         return str(rows[0]["translated_text"]) if rows else None
 
+    @_snapshot_read
     async def localized_status(
         self, entity_type: str, entity_id: str, field_name: str
     ) -> str | None:
@@ -1177,6 +1225,7 @@ class NewsRepository:
         )
         return str(rows[0]["status"]) if rows else None
 
+    @_snapshot_read
     async def localized_status_by_id(self, job_id: int) -> str | None:
         rows = await self.db.execute_fetchall(
             "SELECT status FROM localized_texts WHERE id=?", (job_id,)
@@ -1268,6 +1317,7 @@ class NewsRepository:
         await self.db.commit()
         return cursor.rowcount > 0
 
+    @_snapshot_read
     async def completed_media_by_hash(self, sha256: str) -> CachedMedia | None:
         rows = await self.db.execute_fetchall(
             """SELECT id,local_path,mime_type,byte_size,sha256 FROM news_media
@@ -1277,6 +1327,7 @@ class NewsRepository:
         )
         return self._cached_media(rows[0]) if rows else None
 
+    @_snapshot_read
     async def resolve_media_path(self, media_id: int) -> CachedMedia | None:
         rows = await self.db.execute_fetchall(
             """SELECT id,local_path,mime_type,byte_size,sha256 FROM news_media
@@ -1295,12 +1346,14 @@ class NewsRepository:
             sha256=str(row["sha256"]),
         )
 
+    @_snapshot_read
     async def media_state(self, media_id: int) -> str | None:
         rows = await self.db.execute_fetchall(
             "SELECT download_state FROM news_media WHERE id=?", (media_id,)
         )
         return str(rows[0]["download_state"]) if rows else None
 
+    @_snapshot_read
     async def comment_count(self, article_id: str) -> int:
         rows = await self.db.execute_fetchall(
             """SELECT count(*) AS count FROM news_comments
@@ -1309,12 +1362,14 @@ class NewsRepository:
         )
         return int(rows[0]["count"])
 
+    @_snapshot_read
     async def comment_collection_state(self, article_id: str) -> str:
         rows = await self.db.execute_fetchall(
             "SELECT comments_state FROM news_articles WHERE source_id=?", (article_id,)
         )
         return str(rows[0]["comments_state"]) if rows else "pending"
 
+    @_snapshot_read
     async def current_segment_keys(self, article_id: str) -> tuple[str, ...]:
         rows = await self.db.execute_fetchall(
             """SELECT stable_key FROM news_segments
@@ -1323,12 +1378,14 @@ class NewsRepository:
         )
         return tuple(str(row["stable_key"]) for row in rows)
 
+    @_snapshot_read
     async def segment_count(self, article_id: str) -> int:
         rows = await self.db.execute_fetchall(
             "SELECT count(*) AS count FROM news_segments WHERE article_id=?", (article_id,)
         )
         return int(rows[0]["count"])
 
+    @_snapshot_read
     async def get_article(self, source_id: str) -> ArticleRecord | None:
         rows = await self.db.execute_fetchall(
             "SELECT * FROM news_articles WHERE source_id=?", (source_id,)
@@ -1361,6 +1418,7 @@ class NewsRepository:
             categories=tuple(row["category"] for row in categories),
         )  # type: ignore[arg-type]
 
+    @_snapshot_read
     async def current_feed_ids(self, feed_type: FeedType) -> tuple[str, ...]:
         rows = await self.db.execute_fetchall(
             """SELECT article_id FROM news_feed_placements
@@ -1369,6 +1427,7 @@ class NewsRepository:
         )
         return tuple(str(row["article_id"]) for row in rows)
 
+    @_snapshot_read
     async def feed_event_types(self, article_id: str, feed_type: FeedType) -> tuple[str, ...]:
         rows = await self.db.execute_fetchall(
             """SELECT event_type FROM news_feed_events
@@ -1377,6 +1436,7 @@ class NewsRepository:
         )
         return tuple(str(row["event_type"]) for row in rows)
 
+    @_snapshot_read
     async def section_counts(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for feed_type in ("latest", "hot"):
@@ -1404,6 +1464,7 @@ class NewsRepository:
         counts["latest-comments"] = int(rows[0]["count"])
         return counts
 
+    @_snapshot_read
     async def list_section(
         self,
         section: str,
@@ -1519,6 +1580,7 @@ class NewsRepository:
                 result[key] = str(row["translated_text"])
         return result
 
+    @_snapshot_read
     async def detail_data(self, article_id: str) -> dict[str, Any] | None:
         article_rows = await self.db.execute_fetchall(
             "SELECT * FROM news_articles WHERE source_id=?", (article_id,)
@@ -1572,6 +1634,7 @@ class NewsRepository:
             "comment_count_collected": comments,
         }
 
+    @_snapshot_read
     async def list_comments(
         self,
         article_id: str | None,
@@ -1615,6 +1678,7 @@ class NewsRepository:
             )
         return selected, next_cursor
 
+    @_snapshot_read
     async def status_counts(self) -> dict[str, Any]:
         result: dict[str, Any] = {"sections": await self.section_counts()}
         for table, column, key in (
@@ -1624,13 +1688,22 @@ class NewsRepository:
             ("localized_texts", "status", "translation_jobs"),
         ):
             rows = await self.db.execute_fetchall(
-                f"SELECT {column} AS state,count(*) AS count FROM {table} GROUP BY {column}"
+                f"SELECT {column} AS state,count(*) AS count FROM {table} "
+                + ("WHERE is_current=1 " if table == "news_media" else "")
+                + f"GROUP BY {column}"
             )
             result[key] = {str(row["state"]): int(row["count"]) for row in rows}
         rows = await self.db.execute_fetchall(
             "SELECT value FROM runtime_state WHERE key='schema_version'"
         )
         result["schema_version"] = int(rows[0]["value"])
+        rows = await self.db.execute_fetchall(
+            """SELECT sum(comments_source_complete) AS source_complete,
+               sum(CASE WHEN comments_source_complete=1 AND comments_visible_count!=comment_count
+                        THEN 1 ELSE 0 END) AS count_mismatch FROM news_articles"""
+        )
+        result["comments_source_complete"] = int(rows[0]["source_complete"] or 0)
+        result["comments_count_mismatch"] = int(rows[0]["count_mismatch"] or 0)
         for key in (
             "news_last_listing_success",
             "news_last_listing_error",
@@ -1643,6 +1716,7 @@ class NewsRepository:
             result[key.removeprefix("news_")] = await self.get_runtime_state(key)
         return result
 
+    @_snapshot_read
     async def list_articles(
         self, limit: int, before: datetime | None = None
     ) -> list[dict[str, Any]]:
@@ -1669,6 +1743,7 @@ class NewsRepository:
             item["teaser_zh"] = translations.get((article_id, "teaser"))
         return items
 
+    @_snapshot_read
     async def get_runtime_state(self, key: str) -> str | None:
         rows = await self.db.execute_fetchall("SELECT value FROM runtime_state WHERE key=?", (key,))
         return str(rows[0]["value"]) if rows else None
@@ -1682,6 +1757,7 @@ class NewsRepository:
         )
         await self.db.commit()
 
+    @_snapshot_read
     async def ready_detail_job_count(self, now: datetime | None = None) -> int:
         ready = _iso(now or datetime.now(UTC))
         rows = await self.db.execute_fetchall(

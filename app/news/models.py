@@ -123,6 +123,8 @@ class CommentCollectionObservation:
     expected_count: int
     comments: tuple[CommentObservation, ...] = ()
     is_complete: bool = False
+    source_complete: bool = False
+    visible_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -1,7 +1,7 @@
 import base64
 import binascii
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse
 
 from app.config import Settings
+from app.news.backfill import DEFAULT_SECTIONS
 from app.news.repository import NewsRepository
 
 Section = Literal[
@@ -132,8 +133,10 @@ def _comment(item: dict[str, Any]) -> dict[str, Any]:
 def create_news_router(settings: Settings, authorize: Callable[..., None]) -> APIRouter:
     router = APIRouter(prefix="/api/v2", dependencies=[Depends(authorize)])
 
-    def repository(request: Request) -> NewsRepository:
-        return request.app.state.news_repository
+    async def repository(request: Request) -> AsyncIterator[NewsRepository]:
+        live = request.app.state.repository
+        async with live.database.read_connection() as reader:
+            yield NewsRepository(live.db, live.write_lock, reader=reader)
 
     @router.get("/news/sections")
     async def sections(repo: Annotated[NewsRepository, Depends(repository)]) -> dict:
@@ -272,6 +275,15 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
                 "comment_count_collected": data["comment_count_collected"],
                 "comments_state": data["article"].get("comments_state", "pending"),
                 "comments_complete": data["article"].get("comments_state") == "complete",
+                "comments_source_complete": bool(
+                    data["article"].get("comments_source_complete", False)
+                ),
+                "comments_visible_count": data["article"].get("comments_visible_count"),
+                "comments_count_mismatch": bool(
+                    data["article"].get("comments_source_complete")
+                    and data["article"].get("comments_visible_count")
+                    != data["article"].get("comment_count")
+                ),
                 "generated_at": datetime.now(UTC),
             }
         )
@@ -280,7 +292,37 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
     @router.get("/status")
     async def status(repo: Annotated[NewsRepository, Depends(repository)]) -> dict:
         result = await repo.status_counts()
-        result.update({"status": "ok", "model": settings.kimi_model})
+        issues = []
+        for worker in ("listing", "detail", "comment"):
+            if result.get(f"last_{worker}_error"):
+                issues.append(f"{worker}_error")
+        for queue in ("detail_jobs", "comment_jobs", "media_jobs"):
+            if result.get(queue, {}).get("failed", 0):
+                issues.append(f"{queue}_failed")
+        last_listing = result.get("last_listing_success")
+        try:
+            age = (datetime.now(UTC) - datetime.fromisoformat(last_listing)).total_seconds()
+        except (TypeError, ValueError):
+            age = None
+        if age is None or age > max(300, settings.collect_interval_seconds * 5):
+            issues.append("listing_stale")
+        backfill = {}
+        for section in DEFAULT_SECTIONS:
+            raw = await repo.get_runtime_state(f"news_backfill:{section}")
+            if raw:
+                try:
+                    backfill[section] = json.loads(raw)
+                except ValueError:
+                    backfill[section] = {"stop_reason": "invalid_checkpoint"}
+        if result.get("comments_count_mismatch", 0):
+            issues.append("comment_count_mismatch")
+        result.update({
+            "status": "degraded" if issues else "ok",
+            "issues": issues,
+            "model": settings.kimi_model,
+            "listing_age_seconds": age,
+            "backfill": backfill,
+        })
         return result
 
     return router

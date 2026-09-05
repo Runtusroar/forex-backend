@@ -19,6 +19,10 @@ class NewsBrowserSource(Protocol):
     async def news_detail_html(self, url: str) -> str: ...
 
 
+class IncompleteDetailError(ValueError):
+    pass
+
+
 class NewsCollector:
     def __init__(
         self,
@@ -70,7 +74,10 @@ class NewsCollector:
         observed_at = now or datetime.now(UTC)
         jobs = await self.repository.claim_detail_jobs(1, observed_at)
         if not jobs:
-            return 0
+            await self.repository.enqueue_due_detail_audits(observed_at, limit=1)
+            jobs = await self.repository.claim_detail_jobs(1, observed_at)
+            if not jobs:
+                return 0
         job = jobs[0]
         html: str | None = None
         try:
@@ -78,7 +85,15 @@ class NewsCollector:
             detail = parse_news_detail_v2(
                 html, job.article_id, observed_at, self.source_timezone
             )
-            await self.repository.replace_detail(job.article_id, detail)
+            stored = await self.repository.replace_detail(
+                job.article_id,
+                detail,
+                desired_source_hash=job.desired_source_hash,
+            )
+            if not stored:
+                return 0
+            if not detail.is_complete:
+                raise IncompleteDetailError("news detail contains unrecognized article nodes")
             await self.repository.complete_detail_job(
                 job.article_id, job.desired_source_hash
             )

@@ -14,6 +14,7 @@ from app.parsers import ChallengePageError
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 LISTING = (FIXTURES / "news_v2/listing_all_sections.html").read_text()
 DETAIL = (FIXTURES / "news_v2/detail_alloy.html").read_text()
+PARTIAL_DETAIL = (FIXTURES / "news_v2/detail_partial_unrecognized_audit.html").read_text()
 CHALLENGE = (FIXTURES / "challenge.html").read_text()
 NOW = datetime(2026, 9, 3, tzinfo=UTC)
 
@@ -39,16 +40,28 @@ class FailingDetailBrowser(FakeBrowser):
 
 
 class CommentBrowser(FakeBrowser):
-    def __init__(self, declared_count: int, collected_count: int) -> None:
+    def __init__(
+        self,
+        declared_count: int,
+        collected_count: int,
+        *,
+        source_exhausted: bool = True,
+    ) -> None:
         super().__init__(listing=LISTING.replace("16 comments", f"{declared_count} comments"))
         self.declared_count = declared_count
         self.collected_count = collected_count
+        self.source_exhausted = source_exhausted
 
     async def news_comments_html(
         self, url: str, expected_comment_count: int | None = None
     ) -> NewsCommentCapture:
         self.detail_urls.append(url)
-        return NewsCommentCapture(self.detail, self.declared_count, self.collected_count)
+        return NewsCommentCapture(
+            self.detail,
+            self.declared_count,
+            self.collected_count,
+            source_exhausted=self.source_exhausted,
+        )
 
 
 @pytest.fixture
@@ -108,6 +121,27 @@ async def test_detail_failure_is_persisted_and_bounded(news_repository: NewsRepo
     assert browser.detail_urls.count("https://www.forexfactory.com/news/100-yen") == 1
 
 
+async def test_partial_detail_is_saved_without_retiring_old_segments_and_retried(
+    news_repository: NewsRepository,
+) -> None:
+    initial = NewsCollector(FakeBrowser(), news_repository, ZoneInfo("Asia/Shanghai"))
+    await initial.run_listing_cycle(NOW)
+    assert await initial.run_detail_cycle(NOW) == 1
+    old_keys = set(await news_repository.current_segment_keys("100"))
+
+    changed_listing = LISTING.replace("Yen moves", "Yen moves again")
+    partial = NewsCollector(
+        FakeBrowser(listing=changed_listing, detail=PARTIAL_DETAIL),
+        news_repository,
+        ZoneInfo("Asia/Shanghai"),
+    )
+    await partial.run_listing_cycle(NOW)
+
+    assert await partial.run_detail_cycle(NOW) == 0
+    assert await news_repository.detail_job_state("100") == "pending"
+    assert old_keys.issubset(set(await news_repository.current_segment_keys("100")))
+
+
 async def test_successful_cycles_capture_listing_and_detail_snapshots(
     news_repository: NewsRepository, tmp_path: Path
 ) -> None:
@@ -143,10 +177,12 @@ async def test_comment_collector_completes_only_when_source_count_matches(
     )
 
 
-async def test_comment_collector_retries_stable_count_mismatch(
+async def test_comment_collector_retries_nonexhausted_count_mismatch(
     news_repository: NewsRepository,
 ) -> None:
-    browser = CommentBrowser(declared_count=3, collected_count=2)
+    browser = CommentBrowser(
+        declared_count=3, collected_count=2, source_exhausted=False
+    )
     listing = NewsCollector(browser, news_repository, ZoneInfo("Asia/Shanghai"))
     await listing.run_listing_cycle(NOW)
     collector = CommentCollector(browser, news_repository, ZoneInfo("Asia/Shanghai"))
@@ -155,7 +191,7 @@ async def test_comment_collector_retries_stable_count_mismatch(
     assert await news_repository.comment_count("100") == 2
     assert await news_repository.comment_job_state("100") == "pending"
     assert await news_repository.get_runtime_state("news_last_comment_error") == (
-        "CommentCountMismatch"
+        "CommentSourceIncomplete"
     )
 
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 
 @dataclass(frozen=True, slots=True)
@@ -16,6 +16,7 @@ class CalendarObservation:
     previous: str | None
     source_time_text: str | None = None
     source_position: int = 0
+    source_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +102,7 @@ class CalendarDetailJob:
     priority: int
     attempts: int
     claimed_at: datetime
+    source_date: date | None = None
 
 
 @dataclass(frozen=True, slots=True)

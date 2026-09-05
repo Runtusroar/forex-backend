@@ -4,10 +4,11 @@ import asyncio
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime
 
 from playwright.async_api import Browser, Locator, Page, Playwright, async_playwright
 
+from app.parsers.calendar import parse_calendar
 from app.parsers.errors import SourcePageError
 
 NEWS_SECTION_HEADINGS = {
@@ -33,6 +34,15 @@ class NewsCommentCapture:
     html: str
     declared_count: int
     collected_count: int
+    source_exhausted: bool = False
+
+
+class CalendarDetailPages(dict[str, str | None]):
+    """A compatible mapping that also retains evidence for unavailable details."""
+
+    def __init__(self, pages: dict[str, str | None], source_html: str) -> None:
+        super().__init__(pages)
+        self.source_html = source_html
 
 
 async def _source_ids(block: Locator) -> frozenset[str]:
@@ -40,6 +50,39 @@ async def _source_ids(block: Locator) -> frozenset[str]:
         "links => links.map(link => link.getAttribute('href') || '')"
     )
     return frozenset(match.group(1) for href in hrefs if (match := re.search(r"/news/(\d+)", href)))
+
+
+LOADING_SELECTOR = ".loading:visible, .is-loading:visible, [aria-busy='true']:visible"
+
+
+async def _visible(locator: Locator) -> bool:
+    return bool(await locator.count()) and await locator.is_visible()
+
+
+async def _settled_news_block(page: Page, block: Locator) -> tuple[frozenset[str], bool]:
+    # The More control disappears while XHR is in flight. Its absence alone is
+    # never a terminal signal; wait for network completion and a stable DOM.
+    await page.wait_for_load_state("networkidle", timeout=20_000)
+    previous = None
+    stable = 0
+    for _ in range(120):
+        ids = await _source_ids(block)
+        more_visible = await _visible(block.get_by_text("More", exact=True).last)
+        loading = bool(await block.locator(LOADING_SELECTOR).count())
+        state = (ids, more_visible)
+        stable = stable + 1 if state == previous and not loading else 0
+        if stable >= 8:
+            await page.wait_for_load_state("networkidle", timeout=20_000)
+            if (
+                ids == await _source_ids(block)
+                and more_visible == await _visible(block.get_by_text("More", exact=True).last)
+                and not await block.locator(LOADING_SELECTOR).count()
+            ):
+                return ids, not more_visible
+            stable = 0
+        previous = state
+        await page.wait_for_timeout(250)
+    raise SourcePageError("news continuation did not stabilize")
 
 
 class BrowserSession:
@@ -79,7 +122,40 @@ class BrowserSession:
                 state="attached",
                 timeout=20_000,
             )
-            return await self.calendar_page.content()
+            return await self._calendar_capture(day)
+
+    async def _calendar_capture(self, day: date) -> str:
+        assert self.calendar_page is not None
+        try:
+            await self.calendar_page.wait_for_load_state("networkidle", timeout=20_000)
+        except Exception as error:
+            error.source_html = await self.calendar_page.content()
+            raise
+        previous = None
+        stable = 0
+        error = SourcePageError("calendar capture is incomplete")
+        for _ in range(80):
+            html = await self.calendar_page.content()
+            try:
+                rows = parse_calendar(
+                    html,
+                    datetime.combine(day, datetime.min.time(), UTC),
+                    source_timezone=UTC,
+                    expected_date=day,
+                    require_source_payload=True,
+                )
+            except SourcePageError as cause:
+                error = cause
+                stable = 0
+            else:
+                stable = stable + 1 if rows == previous else 0
+                if stable >= 3:
+                    return html
+                previous = rows
+            await self.calendar_page.wait_for_timeout(250)
+        # Keep the last source evidence available to the collector snapshot hook.
+        error.source_html = html
+        raise error
 
     async def calendar_detail_html(self, day: date, source_id: str) -> str:
         await self.connect()
@@ -111,11 +187,15 @@ class BrowserSession:
                 state="attached",
                 timeout=20_000,
             )
+            await self._calendar_capture(day)
             expanded: list[str] = []
             unavailable: list[str] = []
             details = self.calendar_page.locator("tr.calendar__details--detail")
             for source_id in dict.fromkeys(source_ids):
                 if not re.fullmatch(r"\d+", source_id):
+                    continue
+                event = self.calendar_page.locator(f"tr.calendar__row[data-event-id='{source_id}']")
+                if not await event.count():
                     continue
                 link = self.calendar_page.locator(
                     f"tr.calendar__row[data-event-id='{source_id}'] "
@@ -126,15 +206,16 @@ class BrowserSession:
                     continue
                 before = await details.count()
                 await link.click()
-                for _ in range(20):
+                for _ in range(100):
                     if await details.count() > before:
                         expanded.append(source_id)
                         break
-                    await self.calendar_page.wait_for_timeout(100)
+                    await self.calendar_page.wait_for_timeout(200)
+            await self.calendar_page.wait_for_load_state("networkidle", timeout=20_000)
             html = await self.calendar_page.content()
             pages: dict[str, str | None] = {source_id: html for source_id in expanded}
             pages.update({source_id: None for source_id in unavailable})
-            return pages
+            return CalendarDetailPages(pages, html)
 
     async def news_html(self) -> str:
         await self.connect()
@@ -157,9 +238,7 @@ class BrowserSession:
     async def news_comments_html(
         self, url: str, expected_comment_count: int | None = None
     ) -> NewsCommentCapture:
-        return await self._news_detail_capture(
-            url, expected_comment_count, expand_comments=True
-        )
+        return await self._news_detail_capture(url, expected_comment_count, expand_comments=True)
 
     async def _news_detail_capture(
         self,
@@ -175,41 +254,67 @@ class BrowserSession:
             await page.goto(url, wait_until="domcontentloaded")
             await page.wait_for_selector(".news__article", state="attached", timeout=20_000)
             if not expand_comments:
+                await page.wait_for_load_state("networkidle", timeout=20_000)
                 return NewsCommentCapture(await page.content(), 0, 0)
             await page.wait_for_selector(".news-comments", state="attached", timeout=5_000)
+            await page.wait_for_load_state("networkidle", timeout=20_000)
             more = page.locator(".news-comments .foot li.more a")
+            comments = page.locator(".news-comments__list .news-comment")
             declared_count = expected_comment_count or 0
-            has_more = bool(await more.count())
+            has_more = await _visible(more)
             if has_more:
                 text = await more.inner_text()
                 match = re.search(r"([\d,]+)\s+Comments?", text, re.I)
                 if match:
                     declared_count = int(match.group(1).replace(",", ""))
+            initial_count = await comments.count()
+            if has_more:
                 await more.click()
-            comments = page.locator(".news-comments__list .news-comment")
-            previous = -1
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+            previous = None
             stable_reads = 0
-            target_count = declared_count if has_more else 0
-            for _ in range(60):
+            source_exhausted = False
+            collected_count = initial_count
+            for _ in range(120):
                 current = await comments.count()
-                if current == previous:
-                    stable_reads += 1
-                else:
+                markup = await comments.evaluate_all(
+                    "nodes => nodes.map(node => node.outerHTML).join('')"
+                )
+                state = (current, markup)
+                loading = bool(await page.locator(LOADING_SELECTOR).count())
+                stable_reads = stable_reads + 1 if state == previous and not loading else 0
+                more_visible = await _visible(more)
+                progressed = not has_more or current > initial_count
+                if stable_reads >= 8 and progressed and more_visible:
+                    initial_count = current
+                    has_more = True
+                    await more.click()
+                    await page.wait_for_load_state("networkidle", timeout=20_000)
                     stable_reads = 0
-                reached_target = target_count > 0 and current >= target_count
-                if (reached_target and stable_reads >= 1) or (
-                    target_count == 0 and stable_reads >= 2
-                ):
-                    break
-                previous = current
+                elif stable_reads >= 8 and progressed and not more_visible:
+                    await page.wait_for_load_state("networkidle", timeout=20_000)
+                    if (
+                        current == await comments.count()
+                        and markup
+                        == await comments.evaluate_all(
+                            "nodes => nodes.map(node => node.outerHTML).join('')"
+                        )
+                        and not await _visible(more)
+                        and not await page.locator(LOADING_SELECTOR).count()
+                    ):
+                        source_exhausted = True
+                        collected_count = current
+                        break
+                collected_count = current
+                previous = state
                 await page.wait_for_timeout(250)
-            collected_count = await comments.count()
             if not has_more:
                 declared_count = max(expected_comment_count or 0, collected_count)
             return NewsCommentCapture(
                 html=await page.content(),
                 declared_count=declared_count or collected_count,
                 collected_count=collected_count,
+                source_exhausted=source_exhausted,
             )
         finally:
             await page.close()
@@ -243,32 +348,19 @@ class BrowserSession:
             if block is None:
                 raise SourcePageError(f"news section missing: {section_slug}")
 
-            source_ids = await _source_ids(block)
-            terminal = False
+            source_ids, terminal = await _settled_news_block(self.news_page, block)
             completed = 0
             for _ in range(continuation_count):
-                more = block.get_by_text("More", exact=True).last
-                if not await more.count() or not await more.is_visible():
-                    terminal = True
-                    break
-                before = source_ids
-                await more.click()
-                for _ in range(20):
-                    await asyncio.sleep(0.25)
-                    source_ids = await _source_ids(block)
-                    if source_ids - before:
-                        completed += 1
-                        break
-                    if not await more.is_visible():
-                        terminal = True
-                        break
-                else:
-                    raise SourcePageError(f"news continuation added no source IDs: {section_slug}")
                 if terminal:
                     break
-            if not terminal:
                 more = block.get_by_text("More", exact=True).last
-                terminal = not await more.count() or not await more.is_visible()
+                before = source_ids
+                await more.click()
+                source_ids, terminal = await _settled_news_block(self.news_page, block)
+                if source_ids - before:
+                    completed += 1
+                elif not terminal:
+                    raise SourcePageError(f"news continuation added no source IDs: {section_slug}")
             return NewsContinuationPage(
                 html=await self.news_page.content(),
                 continuation_count=completed,

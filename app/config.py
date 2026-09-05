@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     collect_interval_seconds: int = Field(default=30, gt=0)
     calendar_source_timezone: str = "Asia/Singapore"
     calendar_horizon_days: int = Field(default=8, gt=0, le=31)
+    calendar_lookback_days: int = Field(default=2, ge=0, le=7)
     calendar_schedule_interval_seconds: int = Field(default=600, gt=0)
     calendar_detail_interval_seconds: int = Field(default=2, gt=0)
     calendar_detail_refresh_interval_seconds: int = Field(default=86_400, gt=0)

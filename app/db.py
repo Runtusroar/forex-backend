@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiosqlite
@@ -129,6 +130,20 @@ class Database:
         await self.connection.execute("PRAGMA journal_mode=WAL")
         await self.connection.execute("PRAGMA foreign_keys=ON")
         await self.connection.execute("PRAGMA busy_timeout=5000")
+
+    @asynccontextmanager
+    async def read_connection(self):
+        """A read-only connection whose reads share one committed WAL snapshot."""
+        connection = await aiosqlite.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)
+        connection.row_factory = aiosqlite.Row
+        try:
+            await connection.execute("PRAGMA busy_timeout=5000")
+            await connection.execute("BEGIN")
+            # Pin the snapshot now, including when a response performs multiple queries.
+            await connection.execute_fetchall("SELECT value FROM runtime_state LIMIT 1")
+            yield connection
+        finally:
+            await connection.close()
 
     async def initialize(self) -> None:
         assert self.connection is not None

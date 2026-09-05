@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -249,10 +249,43 @@ async def test_status_exposes_schema_queues_and_sanitized_collector_state(
     response = await api.get("/api/v2/status", headers={"X-API-Key": "api-secret"})
 
     assert response.status_code == 200
-    assert response.json()["schema_version"] == 7
+    assert response.json()["schema_version"] == 8
     assert "detail_jobs" in response.json()
     assert "comment_jobs" in response.json()
     assert "last_comment_success" in response.json()
     assert "last_comment_error" in response.json()
     assert "source_documents" not in response.json()
     assert response.json()["last_listing_error"] is None
+
+
+async def test_status_reports_collection_failure_instead_of_ok(api):
+    repo = api._transport.app.state.news_repository
+    await repo.set_runtime_state("news_last_listing_success", datetime.now(UTC).isoformat())
+    await repo.set_runtime_state("news_last_detail_error", "SourcePageError")
+    response = await api.get("/api/v2/status", headers={"X-API-Key": "api-secret"})
+    assert response.json()["status"] == "degraded"
+    assert "detail_error" in response.json()["issues"]
+
+
+async def test_status_reports_stale_listing_even_without_recent_exception(api):
+    repo = api._transport.app.state.news_repository
+    await repo.set_runtime_state(
+        "news_last_listing_success", (datetime.now(UTC) - timedelta(hours=2)).isoformat()
+    )
+    response = await api.get("/api/v2/status", headers={"X-API-Key": "api-secret"})
+    assert response.json()["status"] == "degraded"
+    assert "listing_stale" in response.json()["issues"]
+
+
+async def test_status_exposes_backfill_coverage_and_reason(api):
+    import json
+
+    repo = api._transport.app.state.news_repository
+    await repo.set_runtime_state("news_backfill:latest", json.dumps({
+        "complete": True, "reached_cutoff": False, "stop_reason": "source_exhausted",
+        "oldest_published_at": "2026-09-01T00:00:00Z",
+    }))
+    response = await api.get("/api/v2/status", headers={"X-API-Key": "api-secret"})
+    coverage = response.json()["backfill"]["latest"]
+    assert coverage["reached_cutoff"] is False
+    assert coverage["stop_reason"] == "source_exhausted"

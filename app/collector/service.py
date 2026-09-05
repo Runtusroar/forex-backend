@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from typing import Protocol
 
+from app.collector.snapshots import SourceSnapshots, capture_snapshot
 from app.domain import CalendarObservation
 from app.parsers import parse_calendar, parse_news_detail, parse_news_listing
 from app.repository import Repository
@@ -33,7 +34,11 @@ class Collector:
         source_timezone: tzinfo = UTC,
         horizon_days: int = 8,
         schedule_interval: int = 600,
+        lookback_days: int = 2,
+        snapshot_store: SourceSnapshots | None = None,
     ) -> None:
+        if lookback_days < 0:
+            raise ValueError("lookback_days must not be negative")
         if horizon_days <= 0:
             raise ValueError("horizon_days must be positive")
         if schedule_interval <= 0:
@@ -42,58 +47,88 @@ class Collector:
         self.repository = repository
         self.source_timezone = source_timezone
         self.horizon_days = horizon_days
+        self.lookback_days = lookback_days
+        self.snapshot_store = snapshot_store
         self.schedule_interval = schedule_interval
         self.lock = asyncio.Lock()
         self._next_schedule_refresh_at: datetime | None = None
 
-    async def _collect_calendar(
-        self, observed_at: datetime
-    ) -> list[CalendarObservation]:
+    async def _collect_calendar(self, observed_at: datetime) -> list[CalendarObservation]:
         local_day = observed_at.astimezone(self.source_timezone).date()
         full_refresh = (
-            self._next_schedule_refresh_at is None
-            or observed_at >= self._next_schedule_refresh_at
+            self._next_schedule_refresh_at is None or observed_at >= self._next_schedule_refresh_at
+        )
+        lookback_due = self.lookback_days > 0 and (
+            await self.repository.get_runtime_state("calendar_last_lookback_date")
+            != local_day.isoformat()
         )
         requested_days = (
             [local_day + timedelta(days=offset) for offset in range(self.horizon_days)]
             if full_refresh
             else [local_day]
         )
+        if lookback_due:
+            requested_days = [
+                local_day - timedelta(days=offset) for offset in range(self.lookback_days, 0, -1)
+            ] + requested_days
         observations: list[CalendarObservation] = []
         try:
             for day in requested_days:
-                html = await self.browser.calendar_html(day)
-                observations.extend(
-                    parse_calendar(
+                html = None
+                try:
+                    html = await self.browser.calendar_html(day)
+                    observations.extend(
+                        parse_calendar(
+                            html,
+                            observed_at,
+                            source_timezone=self.source_timezone,
+                            expected_date=day,
+                            require_source_payload=True,
+                        )
+                    )
+                except Exception as error:
+                    await capture_snapshot(
+                        self.snapshot_store,
+                        "calendar",
+                        day.isoformat(),
+                        html or getattr(error, "source_html", None),
+                        observed_at,
+                        error,
+                    )
+                    raise
+                else:
+                    await capture_snapshot(
+                        self.snapshot_store,
+                        "calendar",
+                        day.isoformat(),
                         html,
                         observed_at,
-                        source_timezone=self.source_timezone,
-                        expected_date=day,
                     )
-                )
             unique = list({item.source_id: item for item in observations}.values())
             window_start = datetime.combine(
-                local_day, time.min, tzinfo=self.source_timezone
+                requested_days[0], time.min, tzinfo=self.source_timezone
             ).astimezone(UTC)
             window_days = self.horizon_days if full_refresh else 1
-            window_end = window_start + timedelta(days=window_days)
-            await self.repository.replace_calendar_window(
-                unique, window_start, window_end
-            )
+            window_end = datetime.combine(
+                local_day + timedelta(days=window_days), time.min, tzinfo=self.source_timezone
+            ).astimezone(UTC)
+            await self.repository.replace_calendar_window(unique, window_start, window_end)
         except Exception as error:
             await self.repository.set_runtime_state(
                 "calendar_last_error", f"{type(error).__name__}: {error}"
             )
             raise
 
+        if lookback_due:
+            await self.repository.set_runtime_state(
+                "calendar_last_lookback_date", local_day.isoformat()
+            )
         success_at = observed_at.astimezone(UTC).isoformat().replace("+00:00", "Z")
         await self.repository.set_runtime_state("calendar_last_success", success_at)
         await self.repository.set_runtime_state("calendar_last_count", str(len(unique)))
         await self.repository.set_runtime_state("calendar_last_error", "")
         if full_refresh:
-            self._next_schedule_refresh_at = observed_at + timedelta(
-                seconds=self.schedule_interval
-            )
+            self._next_schedule_refresh_at = observed_at + timedelta(seconds=self.schedule_interval)
         return unique
 
     async def run_calendar_cycle(self, now: datetime | None = None) -> int:

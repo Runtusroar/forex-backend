@@ -8,6 +8,12 @@ HTML = (Path(__file__).parents[1] / "fixtures/news_v2/detail_alloy.html").read_t
 TRUTH_SOCIAL_HTML = (
     Path(__file__).parents[1] / "fixtures/news_v2/detail_truth_social.html"
 ).read_text()
+VIDEO_HTML = (
+    Path(__file__).parents[1] / "fixtures/news_v2/detail_video_audit_1416136.html"
+).read_text()
+PARTIAL_HTML = (
+    Path(__file__).parents[1] / "fixtures/news_v2/detail_partial_unrecognized_audit.html"
+).read_text()
 NOW = datetime(2026, 9, 3, tzinfo=UTC)
 
 
@@ -93,3 +99,28 @@ def test_comment_time_without_year_uses_observation_year_and_ignores_relative_su
 
     assert detail.comments[0].published_at == datetime(2026, 9, 4, 12, 33, tzinfo=UTC)
     assert detail.comments[0].published_at_source_text == "Sep 4, 8:33pm (15 hr ago)"
+
+
+def test_real_video_page_becomes_watchable_link_segment() -> None:
+    detail = parse_news_detail_v2(VIDEO_HTML, "1416136", NOW, ZoneInfo("Asia/Shanghai"))
+
+    assert len(detail.segments) == 1
+    segment = detail.segments[0]
+    assert segment.segment_type == "link"
+    assert segment.text_en == (
+        "Interest Rate Announcement \N{EN DASH} Press conference by Governor Tiff Macklem "
+        "and Senior Deputy Governor Carolyn Rogers."
+    )
+    assert segment.source_url == (
+        "https://www.bankofcanada.ca/multimedia/"
+        "press-conference-policy-rate-announcement-september-2026/"
+    )
+    assert segment.external_action_label == "Watch Video"
+    assert detail.is_complete is True
+
+
+def test_unrecognized_article_node_makes_detail_partial() -> None:
+    detail = parse_news_detail_v2(PARTIAL_HTML, "partial", NOW, ZoneInfo("Asia/Shanghai"))
+
+    assert [segment.text_en for segment in detail.segments] == ["First recognized segment."]
+    assert detail.is_complete is False

@@ -190,8 +190,42 @@ async def test_status_is_degraded_when_calendar_detail_collection_failed(
     await database.close()
 
     assert response.json()["status"] == "degraded"
+
     assert response.json()["calendar"]["detail_last_error"] == "TimeoutError"
     assert response.json()["calendar"]["detail_jobs"]["failed"] == 1
+
+
+async def test_calendar_api_cannot_read_an_uncommitted_worker_write(tmp_path: Path) -> None:
+    client, repository, database = await make_client(tmp_path)
+    at = datetime(2026, 9, 5, 12, tzinfo=UTC)
+    await repository.upsert_calendar([
+        CalendarObservation("1", at, "USD", "high", "Committed", None, None, None)
+    ])
+    await database.connection.execute(
+        "UPDATE calendar_events SET title_en='Uncommitted' WHERE source_id='1'"
+    )
+    try:
+        async with client:
+            response = await client.get(
+                "/api/v1/calendar?from=2026-09-05T00:00:00Z&to=2026-09-06T00:00:00Z",
+                headers={"X-API-Key": "api-secret"},
+            )
+        assert response.json()["items"][0]["title_en"] == "Committed"
+    finally:
+        await database.connection.rollback()
+        await database.close()
+
+
+async def test_calendar_status_reports_stale_collection(tmp_path: Path) -> None:
+    client, repository, database = await make_client(tmp_path)
+    await repository.set_runtime_state(
+        "calendar_last_success", (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    )
+    async with client:
+        response = await client.get("/api/v1/status", headers={"X-API-Key": "api-secret"})
+    await database.close()
+    assert response.json()["status"] == "degraded"
+    assert "calendar_stale" in response.json()["issues"]
 
 
 async def test_calendar_api_exposes_forex_factory_time_label_and_order(

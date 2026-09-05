@@ -3,9 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable
-from datetime import UTC, datetime, timedelta
-from functools import wraps
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
+
+import aiosqlite
 
 from app.db import Database
 from app.domain import (
@@ -20,19 +21,8 @@ from app.domain import (
     NewsRecord,
     TranslationJob,
 )
-
-
-def _serialized_write(method):
-    @wraps(method)
-    async def wrapper(self, *args, **kwargs):
-        async with self.write_lock:
-            try:
-                return await method(self, *args, **kwargs)
-            except Exception:
-                await self.db.rollback()
-                raise
-
-    return wrapper
+from app.transactions import serialized_write as _serialized_write
+from app.transactions import snapshot_read as _snapshot_read
 
 
 def _now() -> datetime:
@@ -65,9 +55,11 @@ def _calendar_detail_source_hash(
 
 
 class Repository:
-    def __init__(self, database: Database) -> None:
+    def __init__(self, database: Database, reader: aiosqlite.Connection | None = None) -> None:
         assert database.connection is not None
-        self.db = database.connection
+        self.database = database
+        self.reader = reader
+        self.db = self._writer_db = database.connection
         self.write_lock = database.write_lock
 
     async def _upsert_calendar(self, items: list[CalendarObservation], now: str) -> None:
@@ -104,8 +96,8 @@ class Repository:
             await self.db.execute(
                 """INSERT INTO calendar_events
                    (source_id,event_at,currency,impact,title_en,actual,forecast,previous,
-                    source_time_text,source_position,source_hash,updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    source_time_text,source_position,source_hash,updated_at,source_date)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(source_id) DO UPDATE SET
                      event_at=excluded.event_at,currency=excluded.currency,impact=excluded.impact,
                      title_en=excluded.title_en,actual=excluded.actual,forecast=excluded.forecast,
@@ -113,7 +105,8 @@ class Repository:
                      source_position=excluded.source_position,source_hash=excluded.source_hash,
                      title_zh=CASE WHEN calendar_events.title_en=excluded.title_en
                                    THEN calendar_events.title_zh ELSE NULL END,
-                     updated_at=excluded.updated_at""",
+                     updated_at=excluded.updated_at,
+                     source_date=COALESCE(excluded.source_date,calendar_events.source_date)""",
                 (
                     item.source_id,
                     _iso(item.event_at),
@@ -127,6 +120,7 @@ class Repository:
                     item.source_position,
                     source_hash,
                     now,
+                    item.source_date.isoformat() if item.source_date else None,
                 ),
             )
             if changed:
@@ -196,6 +190,7 @@ class Repository:
         )
         await self.db.commit()
 
+    @_snapshot_read
     async def get_runtime_state(self, key: str) -> str | None:
         rows = await self.db.execute_fetchall("SELECT value FROM runtime_state WHERE key=?", (key,))
         return str(rows[0]["value"]) if rows else None
@@ -279,8 +274,8 @@ class Repository:
         )
         if rows:
             await self.db.executemany(
-                "UPDATE translation_jobs SET state='processing' WHERE id=?",
-                [(row["id"],) for row in rows],
+                "UPDATE translation_jobs SET state='processing',next_attempt_at=? WHERE id=?",
+                [(_iso(_now() + timedelta(minutes=5)), row["id"]) for row in rows],
             )
             await self.db.commit()
         return [
@@ -338,10 +333,12 @@ class Repository:
         )
         await self.db.commit()
 
+    @_snapshot_read
     async def translation_job_count(self) -> int:
         row = await self.db.execute_fetchall("SELECT count(*) AS count FROM translation_jobs")
         return int(row[0]["count"])
 
+    @_snapshot_read
     async def list_calendar(self, start: datetime, end: datetime) -> list[CalendarRecord]:
         rows = await self.db.execute_fetchall(
             """SELECT * FROM calendar_events
@@ -350,6 +347,7 @@ class Repository:
         )
         return [self._calendar(row) for row in rows]
 
+    @_snapshot_read
     async def get_calendar(self, source_id: str) -> CalendarRecord | None:
         rows = await self.db.execute_fetchall(
             "SELECT * FROM calendar_events WHERE source_id=?", (source_id,)
@@ -366,7 +364,7 @@ class Repository:
         await self.db.execute("BEGIN IMMEDIATE")
         try:
             rows = await self.db.execute_fetchall(
-                """SELECT j.*,e.event_at FROM calendar_detail_jobs j
+                """SELECT j.*,e.event_at,e.source_date FROM calendar_detail_jobs j
                    JOIN calendar_events e ON e.source_id=j.source_id
                    WHERE (j.state='pending' AND j.next_attempt_at<=?)
                       OR (j.state='processing' AND j.claimed_at<?)
@@ -387,6 +385,7 @@ class Repository:
             CalendarDetailJob(
                 source_id=str(row["source_id"]),
                 event_at=_dt(str(row["event_at"])),
+                source_date=date.fromisoformat(row["source_date"]) if row["source_date"] else None,
                 desired_source_hash=str(row["desired_source_hash"]),
                 priority=int(row["priority"]),
                 attempts=int(row["attempts"]),
@@ -396,12 +395,19 @@ class Repository:
         ]
 
     @_serialized_write
-    async def complete_calendar_detail_job(self, source_id: str, desired_source_hash: str) -> None:
+    async def complete_calendar_detail_job(
+        self,
+        source_id: str,
+        desired_source_hash: str,
+        *,
+        unavailable_reason: str | None = None,
+        checked_at: datetime | None = None,
+    ) -> None:
         await self.db.execute(
             """UPDATE calendar_detail_jobs SET state='done',attempts=0,
-               claimed_at=NULL,last_error=NULL
+               claimed_at=NULL,last_error=NULL,unavailable_reason=?,last_checked_at=?
                WHERE source_id=? AND desired_source_hash=?""",
-            (source_id, desired_source_hash),
+            (unavailable_reason, _iso(checked_at or _now()), source_id, desired_source_hash),
         )
         await self.db.commit()
 
@@ -458,7 +464,7 @@ class Repository:
         rows = await self.db.execute_fetchall(
             """SELECT e.source_id,e.event_at,e.currency,e.impact,e.title_en,
                       e.actual,e.forecast,e.previous,d.source_id AS detail_id,
-                      d.last_success_at
+                      d.last_success_at,j.unavailable_reason,j.last_checked_at
                FROM calendar_events e
                LEFT JOIN calendar_event_details d ON d.source_id=e.source_id
                LEFT JOIN calendar_detail_jobs j ON j.source_id=e.source_id
@@ -477,6 +483,12 @@ class Repository:
             event_at = _dt(row["event_at"])
             last_success_at = _dt(row["last_success_at"])
             if event_at is None:
+                continue
+            if (
+                row["unavailable_reason"]
+                and row["last_checked_at"]
+                and _dt(row["last_checked_at"]) > observed_at - refresh_interval
+            ):
                 continue
             distance = event_at - observed_at
             if -timedelta(hours=6) <= distance <= timedelta(hours=6):
@@ -520,6 +532,7 @@ class Repository:
         await self.db.commit()
         return len(selected)
 
+    @_snapshot_read
     async def calendar_detail_job_counts(self) -> dict[str, int]:
         rows = await self.db.execute_fetchall(
             """SELECT state,count(*) AS count FROM calendar_detail_jobs
@@ -662,6 +675,7 @@ class Repository:
         await self.db.commit()
         return True
 
+    @_snapshot_read
     async def get_calendar_detail(self, source_id: str) -> CalendarDetailRecord | None:
         rows = await self.db.execute_fetchall(
             "SELECT * FROM calendar_event_details WHERE source_id=?", (source_id,)
@@ -729,6 +743,7 @@ class Repository:
             updated_at=_dt(row["updated_at"]),
         )  # type: ignore[arg-type]
 
+    @_snapshot_read
     async def list_news(self, limit: int = 50, before: datetime | None = None) -> list[NewsRecord]:
         if before:
             rows = await self.db.execute_fetchall(
@@ -744,6 +759,7 @@ class Repository:
             )
         return [self._news(row) for row in rows]
 
+    @_snapshot_read
     async def get_news(self, source_id: str) -> NewsRecord | None:
         rows = await self.db.execute_fetchall(
             "SELECT * FROM news_items WHERE source_id=?", (source_id,)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import aiosqlite
 
-LATEST_SCHEMA_VERSION = 7
+LATEST_SCHEMA_VERSION = 8
 
 MIGRATION_2 = """
 BEGIN IMMEDIATE;
@@ -474,6 +474,20 @@ COMMIT;
 """
 
 
+MIGRATION_8 = """
+BEGIN IMMEDIATE;
+ALTER TABLE calendar_events ADD COLUMN source_date TEXT;
+ALTER TABLE calendar_detail_jobs ADD COLUMN unavailable_reason TEXT;
+ALTER TABLE calendar_detail_jobs ADD COLUMN last_checked_at TEXT;
+ALTER TABLE news_articles ADD COLUMN comments_source_complete INTEGER NOT NULL DEFAULT 0
+  CHECK (comments_source_complete IN (0,1));
+ALTER TABLE news_articles ADD COLUMN comments_visible_count INTEGER;
+INSERT INTO runtime_state(key,value) VALUES ('schema_version','8')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+COMMIT;
+"""
+
+
 async def migrate(connection: aiosqlite.Connection) -> None:
     rows = await connection.execute_fetchall(
         "SELECT value FROM runtime_state WHERE key='schema_version'"
@@ -497,3 +511,6 @@ async def migrate(connection: aiosqlite.Connection) -> None:
     if version < 7:
         await connection.executescript(MIGRATION_7)
         version = 7
+
+    if version < 8:
+        await connection.executescript(MIGRATION_8)

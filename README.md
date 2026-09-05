@@ -50,25 +50,31 @@ docker compose up -d --build
 docker compose down
 ```
 
-Create a consistent SQLite backup and copy it to the current directory:
+Create and verify a consistent database, referenced media, and source snapshot backup on the
+Linux Docker host (Python 3.11+ and `flock` required):
 
 ```bash
-docker compose exec -T api python -c 'import sqlite3; source=sqlite3.connect("/app/data/forex_factory.sqlite3"); backup=sqlite3.connect("/app/data/backup.sqlite3"); source.backup(backup); backup.close(); source.close()'
-docker compose cp api:/app/data/backup.sqlite3 ./forex_factory-backup.sqlite3
-docker compose exec -T api rm /app/data/backup.sqlite3
-docker compose cp api:/app/data/media ./forex-media-backup
+bash scripts/backup.sh
 ```
 
-Before every News V2 deployment, keep both the SQLite backup and media directory until the new
-container passes `/health` and the V2 smoke check. To roll back a migration, stop the API, restore
-the pre-migration database, restore its matching media directory, and start it again:
+The backup contains checksums and a manifest. It refuses missing canonical media, retains 14 days
+of `daily-*` backups, and preserves separately named pre-deployment backups. Schedule this command
+in the host crontab, for example daily at 02:15. Copy verified backups to another machine or disk
+as well; a second directory on the server does not survive server disk loss.
+
+Verify or rehearse restoration into a **new, empty** directory:
 
 ```bash
-docker compose stop api
-docker compose cp ./forex_factory-backup.sqlite3 api:/app/data/forex_factory.sqlite3
-docker compose cp ./forex-media-backup/. api:/app/data/media
-docker compose start api
+python3 app/maintenance.py verify backups/daily-<timestamp>
+python3 app/maintenance.py restore backups/daily-<timestamp> --output /tmp/forex-restore-check
 ```
+
+Restore rewrites media and snapshot paths to the new location. Before every deployment, keep a
+verified pre-migration backup and the previous Docker image until `/health` and the V2 smoke check
+pass. For rollback, stop the API first. Use the previous image with its matching pre-migration
+backup; never copy a SQLite file over a running database or leave newer `-wal`/`-shm` files beside
+an older restored database. The restore tool only prepares an isolated directory; switching the
+production data volume is an explicit operational action.
 
 `docker compose down` retains all data. Do not run `docker compose down -v`: it permanently
 destroys the SQLite database, cached media, source snapshots, and Chrome profile.
@@ -77,7 +83,8 @@ destroys the SQLite database, cached media, source snapshots, and Chrome profile
 
 Playwright connects to the persistent Chromium process instead of launching a disposable browser.
 Calendar collection uses explicit daily pages: the current UTC+8 day refreshes on the normal
-collection interval, while the complete eight-day schedule refreshes every ten minutes. Only a
+collection interval, while the complete eight-day schedule refreshes every ten minutes. A bounded
+lookback repairs the previous two days once per source-local day (`CALENDAR_LOOKBACK_DAYS`, 0–7). Only a
 fully validated set of daily pages replaces its database window, so an incomplete page keeps the
 last complete snapshot. Event detail work is queued when an event is new or its source fields
 change, and a freshness audit requeues missing or stale details. Future static details refresh
@@ -94,8 +101,8 @@ downstream failure cannot remove the English listing data.
 Detail pages are stored as ordered article/social/update segments with genuine content attachments.
 Comments have their own persistent jobs. A job is created for a new article, a changed declared
 comment count, or a Latest Comments observation. The browser expands `More` and `Show All` controls,
-waits for a stable DOM count, and marks the collection complete only when the declared and unique
-parsed counts agree. Partial runs upsert what was observed but never delete older current comments.
+waits for settled loading and stable content with no remaining expansion control, and marks the
+collection complete only when the declared, visible, and unique parsed counts also agree. Partial runs upsert what was observed but never delete older current comments.
 Complete runs reconcile removed comments. Jobs record whether the expected count came from an
 explicit numeric listing value or an audit's older value: listing-confirmed decreases can converge,
 while an unparseable count or audit-only empty/mismatched DOM cannot remove previously collected
@@ -105,12 +112,17 @@ even when the listing count did not change. Listing previews have lower quality 
 and cannot overwrite a complete author, body, timestamp, or reaction count.
 
 Media is downloaded with type, signature, and size validation, then deduplicated by SHA-256.
-Changed/error HTML snapshots are retained for 30 days. A low-priority, checkpointed browser
-backfill follows each section's visible `More` control up to 30 days and yields whenever live detail
-work is waiting.
+Content changes and failures are snapshotted for 30 days; unchanged content keeps one sample per
+UTC day. Calendar/detail and expanded comments are included. If a fully expanded source reports a
+different declared count, both counts are retained and the record remains partial; it is revisited
+by the periodic audit without an endless immediate retry loop. A low-priority, checkpointed browser
+backfill follows each section's visible `More` control toward a 30-day target and yields whenever
+live detail work is waiting. Checkpoints reopen daily and distinguish reaching the target from
+source exhaustion or stalled pagination; source exhaustion does not prove 30-day coverage.
 
 Forex Factory `full story` anchors are stored as structured segment links, not flattened into
-paragraph text. Visible terminal ellipses remain part of the Forex Factory prose. Selecting the
+paragraph text. Video-only articles preserve their caption and playback URL as a `link` segment
+with `Watch Video`; no video binary download is required. Visible terminal ellipses remain part of the Forex Factory prose. Selecting the
 link in the iPhone app opens the publisher URL; the backend never requests or stores the publisher
 article. Social blocks retain Forex Factory's full/clamped display mode and external action.
 
@@ -126,7 +138,8 @@ articles every `NEWS_COMMENT_AUDIT_INTERVAL_SECONDS` (default `21600`). Calendar
 runs every `CALENDAR_DETAIL_INTERVAL_SECONDS` (default `2`) with a default batch size of `16`.
 
 SQLite remains the intended database for the single API/collector process. Writes are serialized,
-WAL mode permits concurrent reads, and durable job tables carry leases, retries, and desired source
+API reads use independent committed WAL snapshots, canceled writes roll back before releasing the
+writer lock, and durable job tables carry leases, retries, and desired source
 versions across restarts. PostgreSQL becomes appropriate when collectors are deliberately split
 across multiple hosts/processes, or when high-frequency market history is retained; changing the
 database alone would not repair incomplete source capture or incorrect reconciliation.
@@ -151,6 +164,10 @@ News V2 endpoints used by the new iPhone client:
 - `GET /api/v2/news/{source_id}/comments`
 - `GET /api/v2/news/media/{media_id}`
 - `GET /api/v2/status`
+
+Status endpoints return `degraded` for collection errors or stale observations. V2 adds issue
+reasons, backfill coverage, and comment declared/visible/source-completeness metadata. Schema v8
+is additive; existing client fields remain available.
 
 Chinese fields can be `null` while translation is pending or unavailable. Timestamps are UTC
 ISO-8601 values. V1 News remains backed by V2 compatibility serialization until the installed
