@@ -12,6 +12,7 @@ from app.config import Settings
 from app.db import Database
 from app.news.models import (
     ArticleObservation,
+    CommentCollectionObservation,
     CommentObservation,
     DetailObservation,
     LocalizedTextJob,
@@ -40,6 +41,7 @@ async def seed(repository: NewsRepository) -> None:
     article = ArticleObservation(
         "1", "https://www.forexfactory.com/news/1-x", "Dollar rises", NOW,
         teaser_en="Treasury yields advanced.",
+        comment_count=1,
     )
     await repository.apply_listing(
         NewsListingBatch(
@@ -53,7 +55,15 @@ async def seed(repository: NewsRepository) -> None:
             NOW,
             "detail",
             segments=(SegmentObservation("body", 0, "article", text_en="Full story"),),
-            comments=(
+        ),
+    )
+    comment_job = (await repository.claim_comment_jobs(1, NOW))[0]
+    await repository.replace_comments(
+        CommentCollectionObservation(
+            "1",
+            NOW,
+            1,
+            (
                 CommentObservation(
                     "10",
                     "1",
@@ -63,7 +73,12 @@ async def seed(repository: NewsRepository) -> None:
                     NOW,
                 ),
             ),
+            True,
         ),
+        claimed_expected_count=comment_job.expected_count,
+    )
+    await repository.complete_comment_job(
+        "1", NOW, claimed_expected_count=comment_job.expected_count, collected_count=1
     )
 
 

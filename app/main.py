@@ -1,5 +1,4 @@
 import hmac
-import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, time, timedelta, tzinfo
@@ -10,24 +9,22 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 
 from app.binance import BinanceFuturesContract, BinanceFuturesMarket, BinanceMarketError
 from app.collector import BrowserSession, Collector
+from app.collector.calendar_details import CalendarDetailCollector
 from app.config import Settings, get_settings
 from app.db import Database
 from app.domain import CalendarDetailRecord, CalendarRecord, NewsRecord
 from app.news.api import create_news_router
 from app.news.backfill import NewsBackfill
 from app.news.collector import NewsCollector
+from app.news.comments import CommentCollector
 from app.news.compat import v1_news_detail, v1_news_list
 from app.news.media import MediaWorker
 from app.news.repository import NewsRepository
 from app.news.snapshots import SnapshotStore
-from app.parsers import parse_calendar_detail
-from app.parsers.errors import SourcePageError
 from app.repository import Repository
 from app.runtime import BackgroundRuntime
 from app.translation import KimiTranslator
 from app.translation.worker import NewsTranslationWorker, TranslationWorker
-
-logger = logging.getLogger(__name__)
 
 
 def _calendar_json(item: CalendarRecord) -> dict:
@@ -152,9 +149,7 @@ def _calendar_default_range(
     now: datetime, source_timezone: tzinfo, horizon_days: int
 ) -> tuple[datetime, datetime]:
     local_day = now.astimezone(source_timezone).date()
-    start = datetime.combine(
-        local_day, time.min, tzinfo=source_timezone
-    ).astimezone(UTC)
+    start = datetime.combine(local_day, time.min, tzinfo=source_timezone).astimezone(UTC)
     return start, start + timedelta(days=horizon_days)
 
 
@@ -177,9 +172,7 @@ def create_app(
             await database.initialize()
             live_repository = Repository(database)
             app.state.repository = live_repository
-            news_repository = NewsRepository(
-                live_repository.db, live_repository.write_lock
-            )
+            news_repository = NewsRepository(live_repository.db, live_repository.write_lock)
             app.state.news_repository = news_repository
             browser = BrowserSession(configured.cdp_url)
             app.state.calendar_browser = browser
@@ -190,6 +183,14 @@ def create_app(
                 configured.calendar_horizon_days,
                 configured.calendar_schedule_interval_seconds,
             )
+            calendar_detail_collector = CalendarDetailCollector(
+                browser,
+                live_repository,
+                ZoneInfo(configured.calendar_source_timezone),
+                configured.calendar_detail_batch_size,
+                configured.news_detail_max_attempts,
+                timedelta(seconds=configured.calendar_detail_refresh_interval_seconds),
+            )
             snapshot_store = SnapshotStore(configured.news_snapshot_dir, news_repository)
             news_collector = NewsCollector(
                 browser,
@@ -198,6 +199,14 @@ def create_app(
                 configured.news_detail_max_attempts,
                 snapshot_store,
             )
+            comment_collector = CommentCollector(
+                browser,
+                news_repository,
+                ZoneInfo(configured.news_source_timezone),
+                configured.news_detail_max_attempts,
+                timedelta(seconds=configured.news_comment_audit_interval_seconds),
+                timedelta(days=configured.news_comment_audit_days),
+            )
             media_worker = MediaWorker(
                 news_repository,
                 configured.news_media_dir,
@@ -205,9 +214,7 @@ def create_app(
             )
             kimi = KimiTranslator(configured)
             translator = TranslationWorker(live_repository, kimi)
-            news_translator = NewsTranslationWorker(
-                news_repository, kimi, configured.kimi_model
-            )
+            news_translator = NewsTranslationWorker(news_repository, kimi, configured.kimi_model)
             backfill = NewsBackfill(
                 browser,
                 news_repository,
@@ -219,11 +226,17 @@ def create_app(
                     lambda stop: calendar_collector.run_calendar(
                         stop, configured.collect_interval_seconds
                     ),
+                    lambda stop: calendar_detail_collector.run(
+                        stop, configured.calendar_detail_interval_seconds
+                    ),
                     lambda stop: news_collector.run_listing(
                         stop, configured.collect_interval_seconds
                     ),
                     lambda stop: news_collector.run_details(
                         stop, configured.news_detail_interval_seconds
+                    ),
+                    lambda stop: comment_collector.run(
+                        stop, configured.news_comment_interval_seconds
                     ),
                     media_worker.run,
                     translator.run,
@@ -283,9 +296,7 @@ def create_app(
             configured.calendar_horizon_days,
         )
         start = start or default_start
-        end = end or (
-            default_end if start == default_start else start + timedelta(days=7)
-        )
+        end = end or (default_end if start == default_start else start + timedelta(days=7))
         if end <= start or end - start > timedelta(days=31):
             raise HTTPException(status_code=422, detail="Invalid date range")
         items = await repository.list_calendar(start, end)
@@ -296,31 +307,8 @@ def create_app(
     async def calendar_detail(
         source_id: str,
         repository: Annotated[Repository, Depends(repo)],
-        request: Request,
     ) -> dict:
         detail = await repository.get_calendar_detail(source_id)
-        event = await repository.get_calendar(source_id)
-        browser = getattr(request.app.state, "calendar_browser", None)
-        if event is not None and browser is not None:
-            event_day = event.event_at.astimezone(
-                ZoneInfo(configured.calendar_source_timezone)
-            ).date()
-            try:
-                html = await browser.calendar_detail_html(event_day, source_id)
-                parsed = parse_calendar_detail(html, source_id, datetime.now(UTC))
-            except SourcePageError as exc:
-                if detail is None:
-                    raise HTTPException(status_code=502, detail=str(exc)) from exc
-                logger.warning("Calendar detail refresh rejected for %s: %s", source_id, exc)
-            except Exception as exc:
-                if detail is None:
-                    raise HTTPException(
-                        status_code=502, detail="Calendar source unavailable"
-                    ) from exc
-                logger.exception("Calendar detail refresh failed for %s", source_id)
-            else:
-                await repository.replace_calendar_detail(parsed)
-                detail = await repository.get_calendar_detail(source_id)
         if detail is None:
             raise HTTPException(status_code=404, detail="Not found")
         return _calendar_detail_json(detail)
@@ -356,9 +344,7 @@ def create_app(
     async def binance_top_contracts(
         binance: Annotated[BinanceFuturesMarket, Depends(market)],
         limit: Annotated[int, Query(ge=1, le=50)] = 20,
-        market_type: Annotated[
-            str, Query(pattern="^(all|crypto|traditional)$")
-        ] = "all",
+        market_type: Annotated[str, Query(pattern="^(all|crypto|traditional)$")] = "all",
     ) -> dict:
         try:
             items = await binance.top_contracts(
@@ -376,13 +362,25 @@ def create_app(
         last_success = await repository.get_runtime_state("calendar_last_success")
         last_count = await repository.get_runtime_state("calendar_last_count")
         last_error = await repository.get_runtime_state("calendar_last_error")
+        detail_last_success = await repository.get_runtime_state(
+            "calendar_detail_last_success"
+        )
+        detail_last_error = await repository.get_runtime_state("calendar_detail_last_error")
+        detail_jobs = await repository.calendar_detail_job_counts()
         return {
-            "status": "degraded" if last_error else "ok",
+            "status": (
+                "degraded"
+                if last_error or detail_last_error or detail_jobs.get("failed", 0)
+                else "ok"
+            ),
             "model": configured.kimi_model,
             "calendar": {
                 "last_success": last_success,
                 "last_count": int(last_count) if last_count is not None else None,
                 "last_error": last_error or None,
+                "detail_last_success": detail_last_success,
+                "detail_last_error": detail_last_error or None,
+                "detail_jobs": detail_jobs,
             },
         }
 

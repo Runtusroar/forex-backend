@@ -19,12 +19,18 @@ def test_settings_have_mvp_defaults(tmp_path: Path) -> None:
     assert settings.calendar_source_timezone == "Asia/Singapore"
     assert settings.calendar_horizon_days == 8
     assert settings.calendar_schedule_interval_seconds == 600
+    assert settings.calendar_detail_interval_seconds == 2
+    assert settings.calendar_detail_refresh_interval_seconds == 86_400
+    assert settings.calendar_detail_batch_size == 16
     assert settings.kimi_base_url == "https://api.kimi.com/coding/v1"
     assert settings.kimi_model == "k3-256k"
     assert settings.kimi_timeout_seconds == 120
     assert settings.news_source_timezone == "Asia/Shanghai"
     assert settings.news_detail_interval_seconds == 2
     assert settings.news_detail_max_attempts == 8
+    assert settings.news_comment_interval_seconds == 2
+    assert settings.news_comment_audit_interval_seconds == 21_600
+    assert settings.news_comment_audit_days == 30
     assert settings.news_snapshot_dir == Path("data/snapshots")
     assert settings.news_snapshot_retention_days == 30
     assert settings.news_media_dir == Path("data/media")

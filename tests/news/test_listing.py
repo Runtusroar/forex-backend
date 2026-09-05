@@ -15,9 +15,7 @@ def test_all_sections_are_typed_and_duplicates_are_merged() -> None:
     assert len([item for item in batch.articles if item.source_id == "100"]) == 1
     assert article.teaser_en == "Richer category preview."
     assert article.listing_thumbnail_url == "https://assets.example/yen.jpg"
-    assert {row.category for row in batch.categories if row.article_id == "100"} == {
-        "fundamental"
-    }
+    assert {row.category for row in batch.categories if row.article_id == "100"} == {"fundamental"}
     assert batch.observed_sections == frozenset(
         {
             "hot",
@@ -49,6 +47,7 @@ def test_listing_parses_time_impact_hot_and_latest_comment() -> None:
     ]
     assert batch.comments[0].comment_id == "90001"
     assert batch.comments[0].article_id == "100"
+    assert batch.comments[0].author_name == "Alice"
     assert batch.comments[0].text_en == "Useful update"
     assert batch.comments[0].feed_rank == 0
 
@@ -80,6 +79,30 @@ def test_latest_comment_can_reference_an_article_outside_story_panels() -> None:
     assert {article.source_id for article in batch.articles} == {"1", "2"}
 
 
+def test_latest_comment_author_excludes_status_and_relative_time() -> None:
+    html = """
+    <div class="news-block"><h2>News / Latest Stories</h2>
+      <div class="news-block__item"><div class="news-block__title">
+        <a href="/news/1-one">One</a></div></div>
+    </div>
+    <div class="news-block"><h2>News / Latest Comments</h2>
+      <div class="news-block__item news-block__item--comment">
+        <div class="news-block__commenter">
+          <a href="/news/2-two/comment/20">
+            <span>W0lfram</span> commented <span>3 min ago</span>
+          </a>
+        </div>
+        <span class="news-block__preview">Useful</span>
+        <a class="news-block__title" href="/news/2-two">Two</a>
+      </div>
+    </div>
+    """
+
+    batch = parse_news_listing_v2(html, NOW, ZoneInfo("Asia/Shanghai"))
+
+    assert batch.comments[0].author_name == "W0lfram"
+
+
 def test_empty_title_attribute_does_not_break_live_listing_parse() -> None:
     html = """
     <div class="hot-stories"><div class="hot-story">
@@ -96,3 +119,24 @@ def test_empty_title_attribute_does_not_break_live_listing_parse() -> None:
 
     hot = next(article for article in batch.articles if article.source_id == "2")
     assert hot.published_at is None
+
+
+def test_comment_count_is_observed_only_when_numeric_value_is_parsed() -> None:
+    html = """
+    <div class="news-block"><h2>News / Latest Stories</h2>
+      <div class="news-block__item"><div class="news-block__title">
+        <a href="/news/1-one">One</a></div>
+        <a data-comments-link>0 Comments</a>
+      </div>
+      <div class="news-block__item"><div class="news-block__title">
+        <a href="/news/2-two">Two</a></div>
+        <a data-comments-link>Comments unavailable</a>
+      </div>
+    </div>
+    """
+
+    batch = parse_news_listing_v2(html, NOW, ZoneInfo("Asia/Shanghai"))
+    articles = {article.source_id: article for article in batch.articles}
+
+    assert (articles["1"].comment_count, articles["1"].comment_count_observed) == (0, True)
+    assert (articles["2"].comment_count, articles["2"].comment_count_observed) == (0, False)

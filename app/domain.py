@@ -94,6 +94,16 @@ class CalendarDetailRecord(CalendarDetailObservation):
 
 
 @dataclass(frozen=True, slots=True)
+class CalendarDetailJob:
+    source_id: str
+    event_at: datetime
+    desired_source_hash: str
+    priority: int
+    attempts: int
+    claimed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class NewsRecord(NewsObservation):
     title_zh: str | None
     summary_zh: str | None

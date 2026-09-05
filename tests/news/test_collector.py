@@ -4,8 +4,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from app.collector.browser import NewsCommentCapture
 from app.db import Database
 from app.news.collector import NewsCollector
+from app.news.comments import CommentCollector
 from app.news.repository import NewsRepository
 from app.parsers import ChallengePageError
 
@@ -34,6 +36,19 @@ class FailingDetailBrowser(FakeBrowser):
     async def news_detail_html(self, url: str) -> str:
         self.detail_urls.append(url)
         raise TimeoutError("private source detail omitted")
+
+
+class CommentBrowser(FakeBrowser):
+    def __init__(self, declared_count: int, collected_count: int) -> None:
+        super().__init__(listing=LISTING.replace("16 comments", f"{declared_count} comments"))
+        self.declared_count = declared_count
+        self.collected_count = collected_count
+
+    async def news_comments_html(
+        self, url: str, expected_comment_count: int | None = None
+    ) -> NewsCommentCapture:
+        self.detail_urls.append(url)
+        return NewsCommentCapture(self.detail, self.declared_count, self.collected_count)
 
 
 @pytest.fixture
@@ -110,3 +125,99 @@ async def test_successful_cycles_capture_listing_and_detail_snapshots(
     await collector.run_detail_cycle(NOW)
 
     assert await news_repository.snapshot_count() == 2
+
+
+async def test_comment_collector_completes_only_when_source_count_matches(
+    news_repository: NewsRepository,
+) -> None:
+    browser = CommentBrowser(declared_count=2, collected_count=2)
+    listing = NewsCollector(browser, news_repository, ZoneInfo("Asia/Shanghai"))
+    await listing.run_listing_cycle(NOW)
+    collector = CommentCollector(browser, news_repository, ZoneInfo("Asia/Shanghai"))
+
+    assert await collector.run_cycle(NOW) == 1
+    assert await news_repository.comment_count("100") == 2
+    assert await news_repository.comment_job_state("100") == "done"
+    assert await news_repository.get_runtime_state("news_last_comment_success") == (
+        NOW.isoformat()
+    )
+
+
+async def test_comment_collector_retries_stable_count_mismatch(
+    news_repository: NewsRepository,
+) -> None:
+    browser = CommentBrowser(declared_count=3, collected_count=2)
+    listing = NewsCollector(browser, news_repository, ZoneInfo("Asia/Shanghai"))
+    await listing.run_listing_cycle(NOW)
+    collector = CommentCollector(browser, news_repository, ZoneInfo("Asia/Shanghai"))
+
+    assert await collector.run_cycle(NOW) == 0
+    assert await news_repository.comment_count("100") == 2
+    assert await news_repository.comment_job_state("100") == "pending"
+    assert await news_repository.get_runtime_state("news_last_comment_error") == (
+        "CommentCountMismatch"
+    )
+
+
+async def test_zero_capture_does_not_remove_previously_collected_comments(
+    news_repository: NewsRepository,
+) -> None:
+    initial_browser = CommentBrowser(declared_count=2, collected_count=2)
+    listing = NewsCollector(initial_browser, news_repository, ZoneInfo("Asia/Shanghai"))
+    await listing.run_listing_cycle(NOW)
+    initial_collector = CommentCollector(
+        initial_browser, news_repository, ZoneInfo("Asia/Shanghai")
+    )
+    assert await initial_collector.run_cycle(NOW) == 1
+
+    zero_browser = CommentBrowser(declared_count=0, collected_count=0)
+    zero_browser.detail = (
+        '<article class="news__article"><div class="news__copy"><p>Story</p></div></article>'
+    )
+    await news_repository.db.execute(
+        """UPDATE news_articles SET comment_count=0,comments_checked_at=?
+           WHERE source_id='100'""",
+        ((NOW.replace(year=2025)).isoformat().replace("+00:00", "Z"),),
+    )
+    await news_repository.db.commit()
+    await news_repository.enqueue_due_comment_audits(
+        NOW, audit_interval=NOW - NOW, recent_window=NOW - NOW.replace(year=2025)
+    )
+
+    result = await CommentCollector(
+        zero_browser, news_repository, ZoneInfo("Asia/Shanghai")
+    ).run_cycle(NOW)
+
+    assert result == 0
+    assert await news_repository.comment_count("100") == 2
+    assert await news_repository.comment_job_state("100") == "pending"
+
+
+async def test_explicit_listing_zero_can_confirm_all_comments_removed(
+    news_repository: NewsRepository,
+) -> None:
+    initial_browser = CommentBrowser(declared_count=2, collected_count=2)
+    await NewsCollector(
+        initial_browser, news_repository, ZoneInfo("Asia/Shanghai")
+    ).run_listing_cycle(NOW)
+    assert (
+        await CommentCollector(
+            initial_browser, news_repository, ZoneInfo("Asia/Shanghai")
+        ).run_cycle(NOW)
+        == 1
+    )
+    zero_browser = CommentBrowser(declared_count=0, collected_count=0)
+    zero_browser.detail = (
+        '<article class="news__article"><div class="news__copy"><p>Story</p></div></article>'
+    )
+    await NewsCollector(
+        zero_browser, news_repository, ZoneInfo("Asia/Shanghai")
+    ).run_listing_cycle(NOW)
+
+    result = await CommentCollector(
+        zero_browser, news_repository, ZoneInfo("Asia/Shanghai")
+    ).run_cycle(NOW)
+
+    assert result == 1
+    assert await news_repository.comment_count("100") == 0
+    assert await news_repository.comment_job_state("100") == "done"

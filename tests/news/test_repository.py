@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -8,6 +9,8 @@ from app.db import Database
 from app.news.models import (
     ArticleObservation,
     CategoryObservation,
+    CommentCollectionObservation,
+    CommentObservation,
     DetailObservation,
     FeedObservation,
     MediaObservation,
@@ -35,6 +38,8 @@ def batch(
     rank: int | None = 0,
     categories: tuple[str, ...] = ("fundamental", "technical"),
     observed_at: datetime = NOW,
+    comment_count: int = 0,
+    comments: tuple[CommentObservation, ...] = (),
 ) -> NewsListingBatch:
     article = ArticleObservation(
         source_id="1416149",
@@ -43,6 +48,7 @@ def batch(
         observed_at=observed_at,
         published_at=NOW - timedelta(minutes=10),
         breaking_impact="high",
+        comment_count=comment_count,
     )
     return NewsListingBatch(
         articles=(article,),
@@ -59,6 +65,7 @@ def batch(
         source_hash=f"page-{observed_at.timestamp()}",
         source_timezone="Asia/Shanghai",
         observed_sections=frozenset({"latest", *categories}),
+        comments=comments,
     )
 
 
@@ -145,7 +152,9 @@ async def test_complete_detail_reorders_without_duplicating_segments(
     assert await news_repository.segment_count("1416149") == 2
 
 
-async def test_detail_persists_media_and_comments(news_repository: NewsRepository) -> None:
+async def test_article_detail_persists_media_without_owning_comments(
+    news_repository: NewsRepository,
+) -> None:
     from app.news.models import CommentObservation
 
     await news_repository.apply_listing(batch())
@@ -182,7 +191,7 @@ async def test_detail_persists_media_and_comments(news_repository: NewsRepositor
     assert [(job.article_id, job.original_url) for job in jobs] == [
         ("1416149", "https://assets.example/chart.png")
     ]
-    assert await news_repository.comment_count("1416149") == 1
+    assert await news_repository.comment_count("1416149") == 0
 
 
 async def test_detail_stores_presentation_and_link_without_publisher_document(
@@ -200,14 +209,16 @@ async def test_detail_stores_presentation_and_link_without_publisher_document(
         external_action_label="Show More",
     )
     link = SegmentLinkObservation(
-        "full-story", "body", 0, "full_story", "full story",
+        "full-story",
+        "body",
+        0,
+        "full_story",
+        "full story",
         "https://publisher.example/story",
     )
     await news_repository.replace_detail(
         "1416149",
-        DetailObservation(
-            "1416149", NOW, "detail-1", segments=(segment,), links=(link,)
-        ),
+        DetailObservation("1416149", NOW, "detail-1", segments=(segment,), links=(link,)),
     )
 
     detail = await news_repository.detail_data("1416149")
@@ -216,9 +227,7 @@ async def test_detail_stores_presentation_and_link_without_publisher_document(
     assert detail["segments"][0]["display_mode"] == "clamped"
     assert detail["segments"][0]["max_lines"] == 10
     assert detail["segments"][0]["external_action_label"] == "Show More"
-    assert detail["segments"][0]["links"][0]["original_url"] == (
-        "https://publisher.example/story"
-    )
+    assert detail["segments"][0]["links"][0]["original_url"] == ("https://publisher.example/story")
 
 
 async def test_concurrent_listing_transactions_are_serialized(
@@ -275,3 +284,434 @@ async def test_delayed_detail_retry_does_not_block_low_priority_backfill(
 
     assert await news_repository.ready_detail_job_count(NOW) == 0
     assert await news_repository.ready_detail_job_count(NOW + timedelta(minutes=1)) == 1
+
+
+async def test_listing_persists_source_comment_count_decrease(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=5))
+    await news_repository.apply_listing(
+        batch(comment_count=3, observed_at=NOW + timedelta(minutes=1))
+    )
+
+    article = await news_repository.get_article("1416149")
+
+    assert article is not None
+    assert article.comment_count == 3
+
+
+async def test_listing_comment_does_not_downgrade_detail_comment(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=1))
+    detail_comment = CommentObservation(
+        "comment-1",
+        "1416149",
+        "Alice",
+        "Full comment",
+        "https://www.forexfactory.com/comment/1",
+        NOW,
+        published_at=NOW - timedelta(minutes=2),
+        observation_quality="detail",
+    )
+    await news_repository.replace_comments(
+        CommentCollectionObservation("1416149", NOW, 1, (detail_comment,), is_complete=True)
+    )
+    listing_comment = CommentObservation(
+        "comment-1",
+        "1416149",
+        "Unknown",
+        "",
+        "https://www.forexfactory.com/comment/1",
+        NOW + timedelta(minutes=1),
+        feed_rank=0,
+        observation_quality="listing",
+    )
+
+    await news_repository.apply_listing(
+        batch(
+            comment_count=1,
+            observed_at=NOW + timedelta(minutes=1),
+            comments=(listing_comment,),
+        )
+    )
+    rows, _ = await news_repository.list_comments("1416149", 10)
+
+    assert [(row["author_name"], row["text_en"]) for row in rows] == [("Alice", "Full comment")]
+
+
+async def test_only_complete_comment_collection_deactivates_missing_rows(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=2))
+    first = CommentObservation("comment-1", "1416149", "Alice", "One", "https://ff.test/1", NOW)
+    second = CommentObservation(
+        "comment-2",
+        "1416149",
+        "Bob",
+        "Two",
+        "https://ff.test/2",
+        NOW,
+        position=1,
+    )
+    await news_repository.replace_comments(
+        CommentCollectionObservation("1416149", NOW, 2, (first, second), True)
+    )
+    await news_repository.replace_comments(
+        CommentCollectionObservation("1416149", NOW + timedelta(minutes=1), 2, (first,), False)
+    )
+    assert await news_repository.comment_count("1416149") == 2
+
+    await news_repository.replace_comments(
+        CommentCollectionObservation("1416149", NOW + timedelta(minutes=2), 1, (first,), True)
+    )
+
+    assert await news_repository.comment_count("1416149") == 1
+
+
+async def test_comment_jobs_track_latest_expected_count_and_priority(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=2))
+    first = (await news_repository.claim_comment_jobs(1, NOW))[0]
+    await news_repository.replace_comments(
+        CommentCollectionObservation(
+            "1416149",
+            NOW,
+            2,
+            (
+                CommentObservation(
+                    "comment-1", "1416149", "A", "One", "https://ff.test/1", NOW
+                ),
+                CommentObservation(
+                    "comment-2",
+                    "1416149",
+                    "B",
+                    "Two",
+                    "https://ff.test/2",
+                    NOW,
+                    position=1,
+                ),
+            ),
+            True,
+        )
+    )
+    await news_repository.complete_comment_job(first.article_id, NOW)
+
+    await news_repository.apply_listing(
+        batch(comment_count=3, observed_at=NOW + timedelta(minutes=1))
+    )
+    jobs = await news_repository.claim_comment_jobs(1, NOW + timedelta(minutes=1))
+
+    assert len(jobs) == 1
+    assert jobs[0].article_id == "1416149"
+    assert jobs[0].expected_count == 3
+    assert jobs[0].priority == 100
+    assert await news_repository.comment_collection_state("1416149") == "pending"
+
+
+async def test_identical_latest_comment_does_not_reset_processing_job(
+    news_repository: NewsRepository,
+) -> None:
+    preview = CommentObservation(
+        "comment-2",
+        "1416149",
+        "B",
+        "Preview",
+        "https://ff.test/2",
+        NOW,
+        feed_rank=0,
+        observation_quality="listing",
+    )
+    await news_repository.apply_listing(batch(comment_count=2, comments=(preview,)))
+    await news_repository.claim_comment_jobs(1, NOW)
+
+    repeated = CommentObservation(
+        "comment-2",
+        "1416149",
+        "B",
+        "Preview",
+        "https://ff.test/2",
+        NOW + timedelta(seconds=30),
+        feed_rank=0,
+        observation_quality="listing",
+    )
+    await news_repository.apply_listing(
+        batch(
+            comment_count=2,
+            comments=(repeated,),
+            observed_at=NOW + timedelta(seconds=30),
+        )
+    )
+
+    assert await news_repository.comment_job_state("1416149") == "processing"
+    assert await news_repository.claim_comment_jobs(1, NOW + timedelta(seconds=30)) == []
+
+
+async def test_identical_latest_comment_does_not_reset_failed_job_backoff(
+    news_repository: NewsRepository,
+) -> None:
+    preview = CommentObservation(
+        "comment-2",
+        "1416149",
+        "B",
+        "Preview",
+        "https://ff.test/2",
+        NOW,
+        feed_rank=0,
+        observation_quality="listing",
+    )
+    await news_repository.apply_listing(batch(comment_count=2, comments=(preview,)))
+    job = (await news_repository.claim_comment_jobs(1, NOW))[0]
+    await news_repository.fail_comment_job(
+        job.article_id,
+        ValueError("bad page"),
+        NOW,
+        max_attempts=1,
+        claimed_expected_count=job.expected_count,
+    )
+
+    repeated = CommentObservation(
+        "comment-2",
+        "1416149",
+        "B",
+        "Preview",
+        "https://ff.test/2",
+        NOW + timedelta(seconds=30),
+        feed_rank=0,
+        observation_quality="listing",
+    )
+    await news_repository.apply_listing(
+        batch(
+            comment_count=2,
+            comments=(repeated,),
+            observed_at=NOW + timedelta(seconds=30),
+        )
+    )
+
+    assert await news_repository.comment_job_state("1416149") == "failed"
+    assert await news_repository.claim_comment_jobs(1, NOW + timedelta(seconds=30)) == []
+
+
+async def test_zero_comment_article_is_queued_for_detail_verification(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=0))
+
+    jobs = await news_repository.claim_comment_jobs(1, NOW)
+    assert [job.expected_count for job in jobs] == [0]
+    assert await news_repository.comment_collection_state("1416149") == "pending"
+
+
+async def test_listing_zero_does_not_hide_comments_before_detail_verification(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=1))
+    job = (await news_repository.claim_comment_jobs(1, NOW))[0]
+    comment = CommentObservation("comment-1", "1416149", "A", "One", "https://ff.test/1", NOW)
+    await news_repository.replace_comments(
+        CommentCollectionObservation("1416149", NOW, 1, (comment,), True),
+        claimed_expected_count=job.expected_count,
+    )
+    await news_repository.complete_comment_job(
+        job.article_id, NOW, claimed_expected_count=job.expected_count, collected_count=1
+    )
+
+    await news_repository.apply_listing(
+        batch(comment_count=0, observed_at=NOW + timedelta(minutes=1))
+    )
+
+    assert await news_repository.comment_count("1416149") == 1
+    assert await news_repository.comment_collection_state("1416149") == "pending"
+
+
+async def test_latest_comment_preview_cannot_reactivate_removed_detail_comment(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=1))
+    first_job = (await news_repository.claim_comment_jobs(1, NOW))[0]
+    comment = CommentObservation("comment-1", "1416149", "A", "One", "https://ff.test/1", NOW)
+    await news_repository.replace_comments(
+        CommentCollectionObservation("1416149", NOW, 1, (comment,), True),
+        claimed_expected_count=first_job.expected_count,
+    )
+    await news_repository.complete_comment_job(
+        first_job.article_id,
+        NOW,
+        claimed_expected_count=first_job.expected_count,
+        collected_count=1,
+    )
+    await news_repository.apply_listing(
+        batch(comment_count=0, observed_at=NOW + timedelta(minutes=1))
+    )
+    removal_job = (
+        await news_repository.claim_comment_jobs(1, NOW + timedelta(minutes=1))
+    )[0]
+    await news_repository.replace_comments(
+        CommentCollectionObservation(
+            "1416149", NOW + timedelta(minutes=1), 0, (), True
+        ),
+        claimed_expected_count=removal_job.expected_count,
+    )
+    await news_repository.complete_comment_job(
+        removal_job.article_id,
+        NOW + timedelta(minutes=1),
+        claimed_expected_count=removal_job.expected_count,
+        collected_count=0,
+    )
+    stale_preview = CommentObservation(
+        "comment-1",
+        "1416149",
+        "A",
+        "One",
+        "https://ff.test/1",
+        NOW + timedelta(minutes=2),
+        feed_rank=0,
+        observation_quality="listing",
+    )
+
+    await news_repository.apply_listing(
+        batch(
+            comment_count=0,
+            observed_at=NOW + timedelta(minutes=2),
+            comments=(stale_preview,),
+        )
+    )
+
+    assert await news_repository.comment_count("1416149") == 0
+
+
+async def test_stale_comment_worker_cannot_complete_newer_job(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=2))
+    stale_job = (await news_repository.claim_comment_jobs(1, NOW))[0]
+
+    await news_repository.apply_listing(
+        batch(comment_count=3, observed_at=NOW + timedelta(minutes=1))
+    )
+    stored = await news_repository.replace_comments(
+        CommentCollectionObservation(
+            "1416149",
+            NOW + timedelta(minutes=1),
+            2,
+            (
+                CommentObservation(
+                    "comment-1", "1416149", "A", "One", "https://ff.test/1", NOW
+                ),
+                CommentObservation(
+                    "comment-2", "1416149", "B", "Two", "https://ff.test/2", NOW
+                ),
+            ),
+            True,
+        ),
+        claimed_expected_count=stale_job.expected_count,
+    )
+    completed = await news_repository.complete_comment_job(
+        stale_job.article_id,
+        NOW + timedelta(minutes=1),
+        claimed_expected_count=stale_job.expected_count,
+        collected_count=2,
+    )
+
+    article = await news_repository.get_article("1416149")
+    assert stored is False
+    assert completed is False
+    assert article is not None
+    assert article.comment_count == 3
+    assert await news_repository.comment_count("1416149") == 0
+    assert await news_repository.comment_job_state("1416149") == "pending"
+    current_job = (await news_repository.claim_comment_jobs(1, NOW + timedelta(minutes=1)))[0]
+    assert current_job.expected_count == 3
+
+
+async def test_stale_comment_worker_cannot_fail_newer_job(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=2))
+    stale_job = (await news_repository.claim_comment_jobs(1, NOW))[0]
+
+    await news_repository.apply_listing(
+        batch(comment_count=3, observed_at=NOW + timedelta(minutes=1))
+    )
+    failed = await news_repository.fail_comment_job(
+        stale_job.article_id,
+        ValueError("stale page"),
+        NOW + timedelta(minutes=1),
+        claimed_expected_count=stale_job.expected_count,
+    )
+
+    assert failed is False
+    current_job = (await news_repository.claim_comment_jobs(1, NOW + timedelta(minutes=1)))[0]
+    assert current_job.expected_count == 3
+    assert current_job.attempts == 0
+
+
+async def test_comment_job_failure_rolls_back_partial_state_update(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=1))
+    job = (await news_repository.claim_comment_jobs(1, NOW))[0]
+    await news_repository.db.executescript(
+        """
+        CREATE TRIGGER reject_comment_state_update
+        BEFORE UPDATE OF comments_state ON news_articles
+        BEGIN
+          SELECT RAISE(ABORT, 'forced state failure');
+        END;
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced state failure"):
+        await news_repository.fail_comment_job(
+            job.article_id,
+            ValueError("bad page"),
+            NOW,
+            claimed_expected_count=job.expected_count,
+        )
+
+    assert await news_repository.comment_job_state(job.article_id) == "processing"
+    await news_repository.db.execute("DROP TRIGGER reject_comment_state_update")
+    await news_repository.db.commit()
+    assert await news_repository.complete_comment_job(
+        job.article_id,
+        NOW,
+        claimed_expected_count=job.expected_count,
+        collected_count=1,
+    )
+
+
+async def test_due_comment_audit_requeues_recent_completed_article(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=1))
+    job = (await news_repository.claim_comment_jobs(1, NOW))[0]
+    comment = CommentObservation("comment-1", "1416149", "Alice", "One", "https://ff.test/1", NOW)
+    await news_repository.replace_comments(
+        CommentCollectionObservation("1416149", NOW, 1, (comment,), True)
+    )
+    await news_repository.complete_comment_job(job.article_id, NOW)
+
+    queued = await news_repository.enqueue_due_comment_audits(
+        NOW + timedelta(hours=7), audit_interval=timedelta(hours=6)
+    )
+    jobs = await news_repository.claim_comment_jobs(1, NOW + timedelta(hours=7))
+
+    assert queued == 1
+    assert [item.article_id for item in jobs] == ["1416149"]
+
+
+async def test_comment_audit_respects_failed_job_retry_time(
+    news_repository: NewsRepository,
+) -> None:
+    await news_repository.apply_listing(batch(comment_count=1))
+    job = (await news_repository.claim_comment_jobs(1, NOW))[0]
+    await news_repository.fail_comment_job(
+        job.article_id, ValueError("bad comments"), NOW, max_attempts=1
+    )
+
+    queued = await news_repository.enqueue_due_comment_audits(
+        NOW, audit_interval=timedelta(0)
+    )
+
+    assert queued == 0

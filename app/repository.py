@@ -9,6 +9,7 @@ from typing import Any
 
 from app.db import Database
 from app.domain import (
+    CalendarDetailJob,
     CalendarDetailObservation,
     CalendarDetailRecord,
     CalendarHistoryObservation,
@@ -25,7 +26,11 @@ def _serialized_write(method):
     @wraps(method)
     async def wrapper(self, *args, **kwargs):
         async with self.write_lock:
-            return await method(self, *args, **kwargs)
+            try:
+                return await method(self, *args, **kwargs)
+            except Exception:
+                await self.db.rollback()
+                raise
 
     return wrapper
 
@@ -47,6 +52,18 @@ def _hash(values: Iterable[str | None]) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()
 
 
+def _calendar_detail_source_hash(
+    event_at: str | None,
+    currency: str | None,
+    impact: str | None,
+    title: str | None,
+    actual: str | None,
+    forecast: str | None,
+    previous: str | None,
+) -> str:
+    return _hash((event_at, currency, impact, title, actual, forecast, previous))
+
+
 class Repository:
     def __init__(self, database: Database) -> None:
         assert database.connection is not None
@@ -56,10 +73,34 @@ class Repository:
     async def _upsert_calendar(self, items: list[CalendarObservation], now: str) -> None:
         for item in items:
             source_hash = _hash([item.title_en])
-            current = await self.db.execute_fetchall(
-                "SELECT source_hash FROM calendar_events WHERE source_id = ?", (item.source_id,)
+            detail_hash = _calendar_detail_source_hash(
+                _iso(item.event_at),
+                item.currency,
+                item.impact,
+                item.title_en,
+                item.actual,
+                item.forecast,
+                item.previous,
             )
-            changed = not current or current[0]["source_hash"] != source_hash
+            current = await self.db.execute_fetchall(
+                """SELECT source_hash,title_en,event_at,currency,impact,actual,forecast,previous
+                   FROM calendar_events WHERE source_id = ?""",
+                (item.source_id,),
+            )
+            changed = (
+                not current
+                or _calendar_detail_source_hash(
+                    current[0]["event_at"],
+                    current[0]["currency"],
+                    current[0]["impact"],
+                    current[0]["title_en"],
+                    current[0]["actual"],
+                    current[0]["forecast"],
+                    current[0]["previous"],
+                )
+                != detail_hash
+            )
+            title_changed = not current or current[0]["title_en"] != item.title_en
             await self.db.execute(
                 """INSERT INTO calendar_events
                    (source_id,event_at,currency,impact,title_en,actual,forecast,previous,
@@ -70,7 +111,7 @@ class Repository:
                      title_en=excluded.title_en,actual=excluded.actual,forecast=excluded.forecast,
                      previous=excluded.previous,source_time_text=excluded.source_time_text,
                      source_position=excluded.source_position,source_hash=excluded.source_hash,
-                     title_zh=CASE WHEN calendar_events.source_hash=excluded.source_hash
+                     title_zh=CASE WHEN calendar_events.title_en=excluded.title_en
                                    THEN calendar_events.title_zh ELSE NULL END,
                      updated_at=excluded.updated_at""",
                 (
@@ -89,8 +130,24 @@ class Repository:
                 ),
             )
             if changed:
+                priority = 100 if item.impact == "high" else 50 if item.impact == "medium" else 10
+                await self.db.execute(
+                    """INSERT INTO calendar_detail_jobs
+                       (source_id,desired_source_hash,priority,state,attempts,next_attempt_at)
+                       VALUES (?,?,?,'pending',0,?)
+                       ON CONFLICT(source_id) DO UPDATE SET
+                         desired_source_hash=excluded.desired_source_hash,
+                         priority=max(calendar_detail_jobs.priority,excluded.priority),
+                         state='pending',attempts=0,next_attempt_at=excluded.next_attempt_at,
+                         claimed_at=NULL,last_error=NULL""",
+                    (item.source_id, detail_hash, priority, now),
+                )
+            if title_changed:
                 await self._enqueue(
-                    "calendar", item.source_id, source_hash, {"title": item.title_en}
+                    "calendar",
+                    item.source_id,
+                    source_hash,
+                    {"title": item.title_en},
                 )
 
     @_serialized_write
@@ -140,9 +197,7 @@ class Repository:
         await self.db.commit()
 
     async def get_runtime_state(self, key: str) -> str | None:
-        rows = await self.db.execute_fetchall(
-            "SELECT value FROM runtime_state WHERE key=?", (key,)
-        )
+        rows = await self.db.execute_fetchall("SELECT value FROM runtime_state WHERE key=?", (key,))
         return str(rows[0]["value"]) if rows else None
 
     @_serialized_write
@@ -302,7 +357,191 @@ class Repository:
         return self._calendar(rows[0]) if rows else None
 
     @_serialized_write
-    async def replace_calendar_detail(self, detail: CalendarDetailObservation) -> None:
+    async def claim_calendar_detail_jobs(
+        self, limit: int, now: datetime | None = None
+    ) -> list[CalendarDetailJob]:
+        claimed_at = now or _now()
+        ready_at = _iso(claimed_at)
+        expired_lease = _iso(claimed_at - timedelta(minutes=5))
+        await self.db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = await self.db.execute_fetchall(
+                """SELECT j.*,e.event_at FROM calendar_detail_jobs j
+                   JOIN calendar_events e ON e.source_id=j.source_id
+                   WHERE (j.state='pending' AND j.next_attempt_at<=?)
+                      OR (j.state='processing' AND j.claimed_at<?)
+                   ORDER BY j.priority DESC,e.event_at,j.source_id LIMIT ?""",
+                (ready_at, expired_lease, limit),
+            )
+            if rows:
+                await self.db.executemany(
+                    """UPDATE calendar_detail_jobs SET state='processing',claimed_at=?
+                       WHERE source_id=?""",
+                    [(ready_at, row["source_id"]) for row in rows],
+                )
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            raise
+        return [
+            CalendarDetailJob(
+                source_id=str(row["source_id"]),
+                event_at=_dt(str(row["event_at"])),
+                desired_source_hash=str(row["desired_source_hash"]),
+                priority=int(row["priority"]),
+                attempts=int(row["attempts"]),
+                claimed_at=claimed_at,
+            )
+            for row in rows
+        ]
+
+    @_serialized_write
+    async def complete_calendar_detail_job(self, source_id: str, desired_source_hash: str) -> None:
+        await self.db.execute(
+            """UPDATE calendar_detail_jobs SET state='done',attempts=0,
+               claimed_at=NULL,last_error=NULL
+               WHERE source_id=? AND desired_source_hash=?""",
+            (source_id, desired_source_hash),
+        )
+        await self.db.commit()
+
+    @_serialized_write
+    async def fail_calendar_detail_job(
+        self,
+        source_id: str,
+        error: Exception,
+        now: datetime | None = None,
+        max_attempts: int = 8,
+        *,
+        desired_source_hash: str | None = None,
+    ) -> bool:
+        failed_at = now or _now()
+        if desired_source_hash is None:
+            rows = await self.db.execute_fetchall(
+                """SELECT attempts FROM calendar_detail_jobs
+                   WHERE source_id=? AND state='processing'""",
+                (source_id,),
+            )
+        else:
+            rows = await self.db.execute_fetchall(
+                """SELECT attempts FROM calendar_detail_jobs
+                   WHERE source_id=? AND state='processing' AND desired_source_hash=?""",
+                (source_id, desired_source_hash),
+            )
+        if not rows:
+            return False
+        attempts = int(rows[0]["attempts"]) + 1
+        delay_minutes = (1, 5, 30, 120, 360)[min(attempts - 1, 4)]
+        state = "failed" if attempts >= max_attempts else "pending"
+        await self.db.execute(
+            """UPDATE calendar_detail_jobs SET state=?,attempts=?,next_attempt_at=?,
+               claimed_at=NULL,last_error=? WHERE source_id=?""",
+            (
+                state,
+                attempts,
+                _iso(failed_at + timedelta(minutes=delay_minutes)),
+                type(error).__name__,
+                source_id,
+            ),
+        )
+        await self.db.commit()
+        return True
+
+    @_serialized_write
+    async def enqueue_due_calendar_detail_refreshes(
+        self,
+        now: datetime | None = None,
+        refresh_interval: timedelta = timedelta(days=1),
+        limit: int = 16,
+    ) -> int:
+        observed_at = now or _now()
+        rows = await self.db.execute_fetchall(
+            """SELECT e.source_id,e.event_at,e.currency,e.impact,e.title_en,
+                      e.actual,e.forecast,e.previous,d.source_id AS detail_id,
+                      d.last_success_at
+               FROM calendar_events e
+               LEFT JOIN calendar_event_details d ON d.source_id=e.source_id
+               LEFT JOIN calendar_detail_jobs j ON j.source_id=e.source_id
+               WHERE e.event_at>=? AND e.event_at<?
+                 AND (j.source_id IS NULL OR j.state='done'
+                      OR (j.state='failed' AND j.next_attempt_at<=?))
+               ORDER BY e.event_at,e.source_position""",
+            (
+                _iso(observed_at - timedelta(days=2)),
+                _iso(observed_at + timedelta(days=31)),
+                _iso(observed_at),
+            ),
+        )
+        selected = []
+        for row in rows:
+            event_at = _dt(row["event_at"])
+            last_success_at = _dt(row["last_success_at"])
+            if event_at is None:
+                continue
+            distance = event_at - observed_at
+            if -timedelta(hours=6) <= distance <= timedelta(hours=6):
+                event_refresh_interval = min(refresh_interval, timedelta(minutes=15))
+            elif -timedelta(days=2) <= distance < -timedelta(hours=6):
+                event_refresh_interval = min(refresh_interval, timedelta(hours=1))
+            else:
+                event_refresh_interval = refresh_interval
+            if (
+                row["detail_id"] is None
+                or last_success_at is None
+                or last_success_at <= observed_at - event_refresh_interval
+            ):
+                selected.append(row)
+            if len(selected) >= limit:
+                break
+        ready = _iso(observed_at)
+        for row in selected:
+            priority = 100 if row["impact"] == "high" else 50 if row["impact"] == "medium" else 10
+            desired_source_hash = _calendar_detail_source_hash(
+                row["event_at"],
+                row["currency"],
+                row["impact"],
+                row["title_en"],
+                row["actual"],
+                row["forecast"],
+                row["previous"],
+            )
+            await self.db.execute(
+                """INSERT INTO calendar_detail_jobs
+                   (source_id,desired_source_hash,priority,state,attempts,next_attempt_at)
+                   VALUES (?,?,?,'pending',0,?)
+                   ON CONFLICT(source_id) DO UPDATE SET
+                     desired_source_hash=excluded.desired_source_hash,
+                     priority=max(calendar_detail_jobs.priority,excluded.priority),
+                     state='pending',attempts=0,next_attempt_at=excluded.next_attempt_at,
+                     claimed_at=NULL,last_error=NULL
+                   WHERE calendar_detail_jobs.state IN ('done','failed')""",
+                (row["source_id"], desired_source_hash, priority, ready),
+            )
+        await self.db.commit()
+        return len(selected)
+
+    async def calendar_detail_job_counts(self) -> dict[str, int]:
+        rows = await self.db.execute_fetchall(
+            """SELECT state,count(*) AS count FROM calendar_detail_jobs
+               GROUP BY state"""
+        )
+        return {str(row["state"]): int(row["count"]) for row in rows}
+
+    @_serialized_write
+    async def replace_calendar_detail(
+        self,
+        detail: CalendarDetailObservation,
+        *,
+        desired_source_hash: str | None = None,
+    ) -> bool:
+        if desired_source_hash is not None:
+            jobs = await self.db.execute_fetchall(
+                """SELECT 1 FROM calendar_detail_jobs
+                   WHERE source_id=? AND state='processing' AND desired_source_hash=?""",
+                (detail.source_id, desired_source_hash),
+            )
+            if not jobs:
+                return False
         now = _iso(_now())
         assert now is not None
         await self.db.execute(
@@ -310,9 +549,10 @@ class Repository:
                  source_id,title_en,currency,currency_name,impact,actual,forecast,previous,
                  actual_state,previous_state,previous_revised_from,ff_url,source_name,
                  source_url,latest_release_url,measures,usual_effect,frequency,
-                 next_release_text,next_release_url,ff_notes,why_traders_care,updated_at
+                 next_release_text,next_release_url,ff_notes,why_traders_care,updated_at,
+                 source_hash,last_success_at
                )
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(source_id) DO UPDATE SET
                  title_en=excluded.title_en,currency=excluded.currency,
                  currency_name=excluded.currency_name,impact=excluded.impact,
@@ -329,7 +569,8 @@ class Repository:
                  next_release_url=excluded.next_release_url,
                  ff_notes=excluded.ff_notes,
                  why_traders_care=excluded.why_traders_care,
-                 updated_at=excluded.updated_at""",
+                 updated_at=excluded.updated_at,source_hash=excluded.source_hash,
+                 last_success_at=excluded.last_success_at""",
             (
                 detail.source_id,
                 detail.title_en,
@@ -353,6 +594,19 @@ class Repository:
                 detail.next_release_url,
                 detail.ff_notes,
                 detail.why_traders_care,
+                now,
+                _hash(
+                    [
+                        detail.title_en,
+                        detail.source_name,
+                        detail.measures,
+                        detail.usual_effect,
+                        detail.frequency,
+                        detail.next_release_text,
+                        detail.ff_notes,
+                        detail.why_traders_care,
+                    ]
+                ),
                 now,
             ),
         )
@@ -406,6 +660,7 @@ class Repository:
             ],
         )
         await self.db.commit()
+        return True
 
     async def get_calendar_detail(self, source_id: str) -> CalendarDetailRecord | None:
         rows = await self.db.execute_fetchall(

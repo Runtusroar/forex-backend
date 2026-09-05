@@ -12,6 +12,7 @@ from app.main import create_app
 from app.news.models import (
     ArticleObservation,
     CategoryObservation,
+    CommentCollectionObservation,
     CommentObservation,
     DetailObservation,
     FeedObservation,
@@ -81,13 +82,20 @@ async def api(tmp_path: Path):
             ),
             links=(
                 SegmentLinkObservation(
-                    "source-link", "body", 0, "full_story", "full story",
+                    "source-link",
+                    "body",
+                    0,
+                    "full_story",
+                    "full story",
                     "https://publisher.example/story",
                 ),
             ),
             media=(
                 MediaObservation(
-                    "chart", 0, "chart", "https://assets.example/chart.png",
+                    "chart",
+                    0,
+                    "chart",
+                    "https://assets.example/chart.png",
                     segment_key="body",
                 ),
             ),
@@ -102,6 +110,26 @@ async def api(tmp_path: Path):
                 ),
             ),
         ),
+    )
+    await news.replace_comments(
+        CommentCollectionObservation(
+            "100",
+            NOW,
+            1,
+            (
+                CommentObservation(
+                    "700",
+                    "100",
+                    "Alice",
+                    "Useful",
+                    "https://www.forexfactory.com/comment/700",
+                    NOW,
+                    position=0,
+                    depth=0,
+                ),
+            ),
+            True,
+        )
     )
     title_job = (await news.claim_localized_jobs(1, NOW))[0]
     await news.complete_localized_job(title_job, "日元上涨", "k3-256k")
@@ -118,9 +146,7 @@ async def api(tmp_path: Path):
         "abc",
     )
     app = create_app(settings, repository=legacy)
-    client = httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    )
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
     yield client
     await client.aclose()
     await database.close()
@@ -134,19 +160,21 @@ async def test_v2_routes_require_authentication(api: httpx.AsyncClient) -> None:
 async def test_sections_and_latest_are_stable_and_bilingual(api: httpx.AsyncClient) -> None:
     headers = {"X-API-Key": "api-secret"}
     sections = await api.get("/api/v2/news/sections", headers=headers)
-    listing = await api.get(
-        "/api/v2/news?section=latest&impact=high&limit=1", headers=headers
-    )
+    listing = await api.get("/api/v2/news?section=latest&impact=high&limit=1", headers=headers)
 
     assert sections.status_code == 200, sections.text
     assert [item["id"] for item in sections.json()["items"]] == [
-        "latest", "hot", "fundamental", "technical", "industry",
-        "entertainment", "educational", "latest-comments",
+        "latest",
+        "hot",
+        "fundamental",
+        "technical",
+        "industry",
+        "entertainment",
+        "educational",
+        "latest-comments",
     ]
     assert listing.status_code == 200
-    assert listing.json()["items"][0]["title"] == {
-        "en": "Yen rises", "zh_hans": "日元上涨"
-    }
+    assert listing.json()["items"][0]["title"] == {"en": "Yen rises", "zh_hans": "日元上涨"}
     assert listing.json()["items"][0]["breaking_impact"] == "high"
     assert listing.json()["items"][0]["thumbnail_url"] == "https://assets.example/yen.png"
 
@@ -169,13 +197,15 @@ async def test_detail_comments_and_media_contract(api: httpx.AsyncClient) -> Non
         "max_lines": None,
         "action_label": None,
     }
-    assert detail.json()["segments"][1]["text"]["en"] == (
-        "Forex Factory excerpt..."
-    )
+    assert detail.json()["segments"][1]["text"]["en"] == ("Forex Factory excerpt...")
     assert "full story" not in detail.json()["segments"][1]["text"]["en"].lower()
     assert "local_path" not in detail.text
-    assert detail.json()["comments_complete"] is False
+    assert detail.json()["comments_complete"] is True
+    assert detail.json()["comments_state"] == "complete"
     assert comments.json()["items"][0]["parent_comment_id"] is None
+    assert comments.json()["items"][0]["position"] == 0
+    assert comments.json()["items"][0]["depth"] == 0
+    assert comments.json()["comments_complete"] is True
     assert media.status_code == 200
     assert media.headers["content-type"] == "image/png"
     assert media.headers["etag"] == '"abc"'
@@ -190,9 +220,7 @@ async def test_detail_comments_and_media_contract(api: httpx.AsyncClient) -> Non
 async def test_invalid_section_cursor_and_missing_article(api: httpx.AsyncClient) -> None:
     headers = {"X-API-Key": "api-secret"}
     invalid_section = await api.get("/api/v2/news?section=other", headers=headers)
-    invalid_cursor = await api.get(
-        "/api/v2/news?section=latest&cursor=not-valid", headers=headers
-    )
+    invalid_cursor = await api.get("/api/v2/news?section=latest&cursor=not-valid", headers=headers)
     missing = await api.get("/api/v2/news/999", headers=headers)
 
     assert invalid_section.status_code == 422
@@ -209,9 +237,7 @@ async def test_v1_news_is_derived_from_v2_during_client_migration(
     detail = await api.get("/api/v1/news/100", headers=headers)
 
     assert listing.json()["items"][0]["title_en"] == "Yen rises"
-    assert listing.json()["items"][0]["body_en"] == (
-        "First alert\n\nForex Factory excerpt..."
-    )
+    assert listing.json()["items"][0]["body_en"] == ("First alert\n\nForex Factory excerpt...")
     assert detail.json()["title_zh"] == "日元上涨"
     assert detail.json()["body_en"] == "First alert\n\nForex Factory excerpt..."
     assert "local_path" not in detail.text
@@ -220,12 +246,13 @@ async def test_v1_news_is_derived_from_v2_during_client_migration(
 async def test_status_exposes_schema_queues_and_sanitized_collector_state(
     api: httpx.AsyncClient,
 ) -> None:
-    response = await api.get(
-        "/api/v2/status", headers={"X-API-Key": "api-secret"}
-    )
+    response = await api.get("/api/v2/status", headers={"X-API-Key": "api-secret"})
 
     assert response.status_code == 200
-    assert response.json()["schema_version"] == 6
+    assert response.json()["schema_version"] == 7
     assert "detail_jobs" in response.json()
+    assert "comment_jobs" in response.json()
+    assert "last_comment_success" in response.json()
+    assert "last_comment_error" in response.json()
     assert "source_documents" not in response.json()
     assert response.json()["last_listing_error"] is None

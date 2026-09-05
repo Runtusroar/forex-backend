@@ -67,10 +67,28 @@ def _impact(node: Node) -> BreakingImpact | None:
     return None
 
 
-def _comment_count(node: Node) -> int:
+def _comment_count(node: Node) -> int | None:
     text = _text(node, "a[data-comments-link]") or ""
     match = re.search(r"(\d[\d,]*)\s+comments?", text, re.I)
-    return int(match.group(1).replace(",", "")) if match else 0
+    return int(match.group(1).replace(",", "")) if match else None
+
+
+def _comment_author(node: Node) -> str:
+    commenter = node.css_first(".news-block__commenter")
+    if commenter:
+        username = commenter.css_first("a[href*='/member/'], a")
+        if username:
+            raw_username = re.sub(
+                r"\s+", " ", username.text(separator=" ", strip=True)
+            ).strip()
+            name = re.sub(r"\s*commented\b.*$", "", raw_username, flags=re.I).strip()
+            if name:
+                return name
+        raw = re.sub(r"\s+", " ", commenter.text(separator=" ", strip=True)).strip()
+        name = re.sub(r"\s*commented\b.*$", "", raw, flags=re.I).strip()
+        if name:
+            return name
+    return _text(node, ".news-block__comment-author") or "Unknown"
 
 
 def _article(node: Node, observed_at: datetime, zone: ZoneInfo) -> ArticleObservation | None:
@@ -88,6 +106,7 @@ def _article(node: Node, observed_at: datetime, zone: ZoneInfo) -> ArticleObserv
     )
     image = node.css_first(".news-block__image img")
     image_url = urljoin(SOURCE_ROOT, image.attributes.get("src", "")) if image else None
+    comment_count = _comment_count(node)
     return ArticleObservation(
         source_id=_source_id(href),
         ff_url=urljoin(SOURCE_ROOT, href),
@@ -102,7 +121,8 @@ def _article(node: Node, observed_at: datetime, zone: ZoneInfo) -> ArticleObserv
         published_at_source_text=source_text,
         source_timezone=zone.key,
         breaking_impact=_impact(node),
-        comment_count=_comment_count(node),
+        comment_count=comment_count or 0,
+        comment_count_observed=comment_count is not None,
         listing_thumbnail_url=image_url,
     )
 
@@ -116,7 +136,8 @@ def _merge(old: ArticleObservation, new: ArticleObservation) -> ArticleObservati
         published_at=new.published_at or old.published_at,
         published_at_source_text=new.published_at_source_text or old.published_at_source_text,
         breaking_impact=new.breaking_impact or old.breaking_impact,
-        comment_count=max(old.comment_count, new.comment_count),
+        comment_count=(new.comment_count if new.comment_count_observed else old.comment_count),
+        comment_count_observed=(old.comment_count_observed or new.comment_count_observed),
         listing_thumbnail_url=new.listing_thumbnail_url or old.listing_thumbnail_url,
     )
 
@@ -142,10 +163,9 @@ def parse_news_listing_v2(
         published_at, source_text = _published(node, source_timezone)
         source_link = node.css_first(".hot-story__details a[href*='/hit']")
         source_name = (
-            source_link.text(strip=True).removeprefix("From ").strip()
-            if source_link
-            else None
+            source_link.text(strip=True).removeprefix("From ").strip() if source_link else None
         )
+        comment_count = _comment_count(node)
         article = ArticleObservation(
             source_id=article_id,
             ff_url=urljoin(SOURCE_ROOT, href),
@@ -159,7 +179,8 @@ def parse_news_listing_v2(
             published_at_source_text=source_text,
             source_timezone=source_timezone.key,
             breaking_impact=_impact(node),
-            comment_count=_comment_count(node),
+            comment_count=comment_count or 0,
+            comment_count_observed=comment_count is not None,
         )
         articles[article_id] = article
         feeds.append(FeedObservation(article_id, "hot", rank, observed_at))
@@ -189,16 +210,22 @@ def parse_news_listing_v2(
                         title_en=re.sub(r"\s+", " ", article_link.text(strip=True)).strip(),
                         observed_at=observed_at,
                         source_timezone=source_timezone.key,
+                        comment_count_observed=False,
                     )
                 comments.append(
                     CommentObservation(
                         comment_id=comment_match.group(1),
                         article_id=article_id,
-                        author_name=_text(node, ".news-block__comment-author") or "Unknown",
-                        text_en=_text(node, ".news-block__comment-message") or "",
+                        author_name=_comment_author(node),
+                        text_en=(
+                            _text(node, ".news-block__preview")
+                            or _text(node, ".news-block__comment-message")
+                            or ""
+                        ),
                         permalink=urljoin(SOURCE_ROOT, link.attributes.get("href", "")),
                         observed_at=observed_at,
                         feed_rank=rank,
+                        observation_quality="listing",
                     )
                 )
             continue

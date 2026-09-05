@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date
 
@@ -27,15 +28,18 @@ class NewsContinuationPage:
     terminal: bool
 
 
+@dataclass(frozen=True, slots=True)
+class NewsCommentCapture:
+    html: str
+    declared_count: int
+    collected_count: int
+
+
 async def _source_ids(block: Locator) -> frozenset[str]:
     hrefs = await block.locator("a[href*='/news/']").evaluate_all(
         "links => links.map(link => link.getAttribute('href') || '')"
     )
-    return frozenset(
-        match.group(1)
-        for href in hrefs
-        if (match := re.search(r"/news/(\d+)", href))
-    )
+    return frozenset(match.group(1) for href in hrefs if (match := re.search(r"/news/(\d+)", href)))
 
 
 class BrowserSession:
@@ -91,6 +95,41 @@ class BrowserSession:
             )
             return await self.calendar_page.content()
 
+    async def calendar_details_html(self, day: date, source_ids: Sequence[str]) -> dict[str, str]:
+        await self.connect()
+        async with self._calendar_lock:
+            assert self.calendar_page is not None
+            slug = f"{day:%b}{day.day}.{day.year}".lower()
+            await self.calendar_page.goto(
+                f"https://www.forexfactory.com/calendar?day={slug}",
+                wait_until="domcontentloaded",
+            )
+            await self.calendar_page.wait_for_selector(
+                ".calendar__row--day-breaker, tr.calendar__row[data-event-id]",
+                state="attached",
+                timeout=20_000,
+            )
+            expanded: list[str] = []
+            details = self.calendar_page.locator("tr.calendar__details--detail")
+            for source_id in dict.fromkeys(source_ids):
+                if not re.fullmatch(r"\d+", source_id):
+                    continue
+                link = self.calendar_page.locator(
+                    f"tr.calendar__row[data-event-id='{source_id}'] "
+                    ".calendar__cell.calendar__detail .calendar__detail-link"
+                )
+                if not await link.count():
+                    continue
+                before = await details.count()
+                await link.click()
+                for _ in range(20):
+                    if await details.count() > before:
+                        expanded.append(source_id)
+                        break
+                    await self.calendar_page.wait_for_timeout(100)
+            html = await self.calendar_page.content()
+            return {source_id: html for source_id in expanded}
+
     async def news_html(self) -> str:
         await self.connect()
         async with self._news_lock:
@@ -103,14 +142,69 @@ class BrowserSession:
             )
             return await self.news_page.content()
 
-    async def news_detail_html(self, url: str) -> str:
+    async def news_detail_html(self, url: str, expected_comment_count: int | None = None) -> str:
+        capture = await self._news_detail_capture(
+            url, expected_comment_count, expand_comments=expected_comment_count is not None
+        )
+        return capture.html
+
+    async def news_comments_html(
+        self, url: str, expected_comment_count: int | None = None
+    ) -> NewsCommentCapture:
+        return await self._news_detail_capture(
+            url, expected_comment_count, expand_comments=True
+        )
+
+    async def _news_detail_capture(
+        self,
+        url: str,
+        expected_comment_count: int | None,
+        *,
+        expand_comments: bool,
+    ) -> NewsCommentCapture:
         await self.connect()
         assert self.browser is not None
         page = await self.browser.contexts[0].new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded")
             await page.wait_for_selector(".news__article", state="attached", timeout=20_000)
-            return await page.content()
+            if not expand_comments:
+                return NewsCommentCapture(await page.content(), 0, 0)
+            await page.wait_for_selector(".news-comments", state="attached", timeout=5_000)
+            more = page.locator(".news-comments .foot li.more a")
+            declared_count = expected_comment_count or 0
+            has_more = bool(await more.count())
+            if has_more:
+                text = await more.inner_text()
+                match = re.search(r"([\d,]+)\s+Comments?", text, re.I)
+                if match:
+                    declared_count = int(match.group(1).replace(",", ""))
+                await more.click()
+            comments = page.locator(".news-comments__list .news-comment")
+            previous = -1
+            stable_reads = 0
+            target_count = declared_count if has_more else 0
+            for _ in range(60):
+                current = await comments.count()
+                if current == previous:
+                    stable_reads += 1
+                else:
+                    stable_reads = 0
+                reached_target = target_count > 0 and current >= target_count
+                if (reached_target and stable_reads >= 1) or (
+                    target_count == 0 and stable_reads >= 2
+                ):
+                    break
+                previous = current
+                await page.wait_for_timeout(250)
+            collected_count = await comments.count()
+            if not has_more:
+                declared_count = max(expected_comment_count or 0, collected_count)
+            return NewsCommentCapture(
+                html=await page.content(),
+                declared_count=declared_count or collected_count,
+                collected_count=collected_count,
+            )
         finally:
             await page.close()
 
@@ -163,9 +257,7 @@ class BrowserSession:
                         terminal = True
                         break
                 else:
-                    raise SourcePageError(
-                        f"news continuation added no source IDs: {section_slug}"
-                    )
+                    raise SourcePageError(f"news continuation added no source IDs: {section_slug}")
                 if terminal:
                     break
             if not terminal:

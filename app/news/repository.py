@@ -13,6 +13,8 @@ from app.news.models import (
     ArticleObservation,
     ArticleRecord,
     CachedMedia,
+    CommentCollectionObservation,
+    CommentJob,
     CommentObservation,
     DetailJob,
     DetailObservation,
@@ -28,7 +30,11 @@ def _serialized_write(method):
     @wraps(method)
     async def wrapper(self, *args, **kwargs):
         async with self.write_lock:
-            return await method(self, *args, **kwargs)
+            try:
+                return await method(self, *args, **kwargs)
+            except Exception:
+                await self.db.rollback()
+                raise
 
     return wrapper
 
@@ -49,7 +55,7 @@ def _hash(article: ArticleObservation) -> str:
         article.source_url,
         _iso(article.published_at),
         article.breaking_impact,
-        str(article.comment_count),
+        str(article.comment_count) if article.comment_count_observed else None,
         article.listing_thumbnail_url,
     )
     return hashlib.sha256("\n".join(value or "" for value in values).encode()).hexdigest()
@@ -68,6 +74,7 @@ class NewsRepository:
     async def apply_listing(self, batch: NewsListingBatch) -> ListingApplyResult:
         new_ids: list[str] = []
         changed_ids: list[str] = []
+        comment_job_ids: set[str] = set()
         await self.db.execute("BEGIN IMMEDIATE")
         try:
             hashes: dict[str, str] = {}
@@ -75,14 +82,27 @@ class NewsRepository:
                 source_hash = _hash(article)
                 hashes[article.source_id] = source_hash
                 current = await self.db.execute_fetchall(
-                    "SELECT source_hash FROM news_articles WHERE source_id=?",
+                    "SELECT source_hash,comment_count FROM news_articles WHERE source_id=?",
                     (article.source_id,),
                 )
                 if not current:
                     new_ids.append(article.source_id)
+                    if article.comment_count_observed:
+                        comment_job_ids.add(article.source_id)
                 elif current[0]["source_hash"] != source_hash:
                     changed_ids.append(article.source_id)
+                if (
+                    current
+                    and article.comment_count_observed
+                    and int(current[0]["comment_count"]) != article.comment_count
+                ):
+                    comment_job_ids.add(article.source_id)
                 await self._upsert_article(article, source_hash)
+                if article.comment_count_observed:
+                    await self.db.execute(
+                        "UPDATE news_articles SET comment_count_observed_at=? WHERE source_id=?",
+                        (_iso(article.observed_at), article.source_id),
+                    )
 
             for category in batch.categories:
                 observed = _iso(category.observed_at)
@@ -99,7 +119,19 @@ class NewsRepository:
                     "UPDATE news_comment_feed SET is_current=0 WHERE is_current=1"
                 )
             for comment in batch.comments:
+                existing_comments = await self.db.execute_fetchall(
+                    """SELECT source_hash,observation_quality FROM news_comments
+                       WHERE comment_id=?""",
+                    (comment.comment_id,),
+                )
+                preview_hash = hashlib.sha256(comment.text_en.encode()).hexdigest()
+                comment_changed = not existing_comments or (
+                    existing_comments[0]["observation_quality"] == "listing"
+                    and existing_comments[0]["source_hash"] != preview_hash
+                )
                 await self._upsert_comment(comment)
+                if comment_changed:
+                    comment_job_ids.add(comment.article_id)
                 if comment.feed_rank is not None:
                     await self.db.execute(
                         """INSERT INTO news_comment_feed
@@ -134,6 +166,46 @@ class NewsRepository:
                          desired_source_hash=excluded.desired_source_hash,last_error=NULL""",
                     (article_id, priority, observed, hashes[article_id]),
                 )
+            articles_by_id = {item.source_id: item for item in batch.articles}
+            latest_comment_articles = {item.article_id for item in batch.comments}
+            for article_id in comment_job_ids:
+                rows = await self.db.execute_fetchall(
+                    "SELECT comment_count FROM news_articles WHERE source_id=?",
+                    (article_id,),
+                )
+                if not rows:
+                    continue
+                article = articles_by_id.get(article_id)
+                priority = (
+                    100
+                    if article_id in latest_comment_articles
+                    or (article and article.breaking_impact == "high")
+                    else 10
+                )
+                await self.db.execute(
+                    """INSERT INTO news_comment_jobs
+                       (article_id,priority,state,attempts,expected_count,
+                        expected_count_observed,next_attempt_at)
+                       VALUES (?,?,'pending',0,?,?,?)
+                       ON CONFLICT(article_id) DO UPDATE SET
+                         priority=max(news_comment_jobs.priority,excluded.priority),
+                         state='pending',attempts=0,
+                         expected_count=excluded.expected_count,
+                         expected_count_observed=excluded.expected_count_observed,
+                         next_attempt_at=excluded.next_attempt_at,
+                         claimed_at=NULL,last_error=NULL""",
+                    (
+                        article_id,
+                        priority,
+                        int(rows[0]["comment_count"]),
+                        int(bool(article and article.comment_count_observed)),
+                        observed,
+                    ),
+                )
+                await self.db.execute(
+                    "UPDATE news_articles SET comments_state='pending' WHERE source_id=?",
+                    (article_id,),
+                )
             await self.db.commit()
         except Exception:
             await self.db.rollback()
@@ -163,7 +235,8 @@ class NewsRepository:
                    excluded.published_at_source_text,news_articles.published_at_source_text),
                  source_timezone=COALESCE(excluded.source_timezone,news_articles.source_timezone),
                  breaking_impact=COALESCE(excluded.breaking_impact,news_articles.breaking_impact),
-                 comment_count=max(excluded.comment_count,news_articles.comment_count),
+                 comment_count=CASE WHEN ? THEN excluded.comment_count
+                   ELSE news_articles.comment_count END,
                  is_excerpt=excluded.is_excerpt,
                  listing_thumbnail_url=COALESCE(
                    excluded.listing_thumbnail_url,news_articles.listing_thumbnail_url),
@@ -187,6 +260,7 @@ class NewsRepository:
                 observed,
                 observed,
                 observed,
+                int(article.comment_count_observed),
             ),
         )
         await self._enqueue_localized(
@@ -278,9 +352,7 @@ class NewsRepository:
         return int(rows[0]["count"])
 
     @_serialized_write
-    async def claim_detail_jobs(
-        self, limit: int, now: datetime | None = None
-    ) -> list[DetailJob]:
+    async def claim_detail_jobs(self, limit: int, now: datetime | None = None) -> list[DetailJob]:
         claimed_at = now or datetime.now(UTC)
         ready_at = _iso(claimed_at)
         expired_lease = _iso(claimed_at - timedelta(minutes=5))
@@ -426,9 +498,7 @@ class NewsRepository:
         await self.db.commit()
 
     async def snapshot_count(self) -> int:
-        rows = await self.db.execute_fetchall(
-            "SELECT count(*) AS count FROM source_snapshots"
-        )
+        rows = await self.db.execute_fetchall("SELECT count(*) AS count FROM source_snapshots")
         return int(rows[0]["count"])
 
     async def expired_snapshots(self, cutoff: datetime) -> list[tuple[int, str]]:
@@ -607,8 +677,6 @@ class NewsRepository:
                         "UPDATE news_media SET is_current=0 WHERE article_id=?",
                         (article_id,),
                     )
-            for comment in detail.comments:
-                await self._upsert_comment(comment)
             await self.db.execute(
                 """UPDATE news_articles SET detail_state=?,is_excerpt=?,updated_at=?
                    WHERE source_id=?""",
@@ -631,15 +699,60 @@ class NewsRepository:
             """INSERT INTO news_comments
                (comment_id,article_id,parent_comment_id,author_name,published_at,
                 published_at_source_text,text_en,permalink,reaction_count,source_hash,
-                first_seen_at,last_seen_at,updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                first_seen_at,last_seen_at,updated_at,position,depth,is_current,
+                observation_quality)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?)
                ON CONFLICT(comment_id) DO UPDATE SET
-                 parent_comment_id=excluded.parent_comment_id,
-                 author_name=excluded.author_name,published_at=excluded.published_at,
-                 published_at_source_text=excluded.published_at_source_text,
-                 text_en=excluded.text_en,permalink=excluded.permalink,
-                 reaction_count=excluded.reaction_count,source_hash=excluded.source_hash,
-                 last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at""",
+                 parent_comment_id=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.parent_comment_id ELSE excluded.parent_comment_id END,
+                 author_name=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.author_name ELSE excluded.author_name END,
+                 published_at=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.published_at ELSE excluded.published_at END,
+                 published_at_source_text=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.published_at_source_text
+                   ELSE excluded.published_at_source_text END,
+                 text_en=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.text_en ELSE excluded.text_en END,
+                 permalink=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.permalink ELSE excluded.permalink END,
+                 reaction_count=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.reaction_count ELSE excluded.reaction_count END,
+                 source_hash=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.source_hash ELSE excluded.source_hash END,
+                 position=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.position ELSE excluded.position END,
+                 depth=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.depth ELSE excluded.depth END,
+                 observation_quality=CASE
+                   WHEN news_comments.observation_quality='detail'
+                   THEN 'detail' ELSE excluded.observation_quality END,
+                 is_current=CASE
+                   WHEN news_comments.observation_quality='detail'
+                    AND excluded.observation_quality='listing'
+                   THEN news_comments.is_current ELSE 1 END,
+                 last_seen_at=excluded.last_seen_at,
+                 updated_at=excluded.updated_at""",
             (
                 comment.comment_id,
                 comment.article_id,
@@ -654,11 +767,249 @@ class NewsRepository:
                 observed,
                 observed,
                 observed,
+                comment.position,
+                comment.depth,
+                comment.observation_quality,
             ),
         )
         await self._enqueue_localized(
             "comment", comment.comment_id, "text", comment.text_en, observed
         )
+
+    @_serialized_write
+    async def replace_comments(
+        self,
+        collection: CommentCollectionObservation,
+        *,
+        claimed_expected_count: int | None = None,
+    ) -> bool:
+        observed = _iso(collection.observed_at)
+        await self.db.execute("BEGIN IMMEDIATE")
+        try:
+            if claimed_expected_count is not None:
+                jobs = await self.db.execute_fetchall(
+                    """SELECT 1 FROM news_comment_jobs
+                       WHERE article_id=? AND state='processing' AND expected_count=?""",
+                    (collection.article_id, claimed_expected_count),
+                )
+                if not jobs:
+                    await self.db.rollback()
+                    return False
+            current_ids: set[str] = set()
+            for comment in collection.comments:
+                current_ids.add(comment.comment_id)
+                await self._upsert_comment(comment)
+            if collection.is_complete:
+                if current_ids:
+                    placeholders = ",".join("?" for _ in current_ids)
+                    await self.db.execute(
+                        f"""UPDATE news_comments SET is_current=0
+                            WHERE article_id=? AND comment_id NOT IN ({placeholders})""",
+                        (collection.article_id, *sorted(current_ids)),
+                    )
+                else:
+                    await self.db.execute(
+                        "UPDATE news_comments SET is_current=0 WHERE article_id=?",
+                        (collection.article_id,),
+                    )
+            await self.db.execute(
+                """UPDATE news_articles SET comments_state=?,comments_checked_at=?,
+                   comments_completed_at=CASE WHEN ? THEN ? ELSE comments_completed_at END,
+                   comment_count=?,updated_at=? WHERE source_id=?""",
+                (
+                    "complete" if collection.is_complete else "partial",
+                    observed,
+                    int(collection.is_complete),
+                    observed,
+                    collection.expected_count,
+                    observed,
+                    collection.article_id,
+                ),
+            )
+            await self.db.commit()
+            return True
+        except Exception:
+            await self.db.rollback()
+            raise
+
+    @_serialized_write
+    async def claim_comment_jobs(self, limit: int, now: datetime | None = None) -> list[CommentJob]:
+        claimed_at = now or datetime.now(UTC)
+        ready_at = _iso(claimed_at)
+        expired_lease = _iso(claimed_at - timedelta(minutes=5))
+        await self.db.execute("BEGIN IMMEDIATE")
+        try:
+            rows = await self.db.execute_fetchall(
+                """SELECT j.*,a.ff_url FROM news_comment_jobs j
+                   JOIN news_articles a ON a.source_id=j.article_id
+                   WHERE (j.state='pending' AND j.next_attempt_at<=?)
+                      OR (j.state='processing' AND j.claimed_at<?)
+                   ORDER BY j.priority DESC,j.next_attempt_at,j.article_id LIMIT ?""",
+                (ready_at, expired_lease, limit),
+            )
+            if rows:
+                await self.db.executemany(
+                    """UPDATE news_comment_jobs SET state='processing',claimed_at=?
+                       WHERE article_id=?""",
+                    [(ready_at, row["article_id"]) for row in rows],
+                )
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            raise
+        return [
+            CommentJob(
+                article_id=str(row["article_id"]),
+                ff_url=str(row["ff_url"]),
+                expected_count=int(row["expected_count"]),
+                expected_count_observed=bool(row["expected_count_observed"]),
+                priority=int(row["priority"]),
+                attempts=int(row["attempts"]),
+                claimed_at=claimed_at,
+            )
+            for row in rows
+        ]
+
+    @_serialized_write
+    async def complete_comment_job(
+        self,
+        article_id: str,
+        completed_at: datetime | None = None,
+        *,
+        claimed_expected_count: int | None = None,
+        collected_count: int | None = None,
+    ) -> bool:
+        now = _iso(completed_at or datetime.now(UTC))
+        if claimed_expected_count is None:
+            cursor = await self.db.execute(
+                """UPDATE news_comment_jobs SET state='done',attempts=0,claimed_at=NULL,
+                   last_error=NULL,next_attempt_at=?,expected_count=COALESCE(?,expected_count)
+                   WHERE article_id=? AND state='processing'""",
+                (now, collected_count, article_id),
+            )
+        else:
+            cursor = await self.db.execute(
+                """UPDATE news_comment_jobs SET state='done',attempts=0,claimed_at=NULL,
+                   last_error=NULL,next_attempt_at=?,expected_count=COALESCE(?,expected_count)
+                   WHERE article_id=? AND state='processing' AND expected_count=?""",
+                (now, collected_count, article_id, claimed_expected_count),
+            )
+        await self.db.commit()
+        return cursor.rowcount == 1
+
+    @_serialized_write
+    async def fail_comment_job(
+        self,
+        article_id: str,
+        error: Exception,
+        now: datetime | None = None,
+        max_attempts: int = 8,
+        *,
+        claimed_expected_count: int | None = None,
+    ) -> bool:
+        failed_at = now or datetime.now(UTC)
+        if claimed_expected_count is None:
+            rows = await self.db.execute_fetchall(
+                """SELECT attempts FROM news_comment_jobs
+                   WHERE article_id=? AND state='processing'""",
+                (article_id,),
+            )
+        else:
+            rows = await self.db.execute_fetchall(
+                """SELECT attempts FROM news_comment_jobs
+                   WHERE article_id=? AND state='processing' AND expected_count=?""",
+                (article_id, claimed_expected_count),
+            )
+        if not rows:
+            return False
+        attempts = int(rows[0]["attempts"]) + 1
+        delay_minutes = (1, 5, 30, 120, 360)[min(attempts - 1, 4)]
+        state = "failed" if attempts >= max_attempts else "pending"
+        params = (
+            state,
+            attempts,
+            _iso(failed_at + timedelta(minutes=delay_minutes)),
+            type(error).__name__,
+            article_id,
+        )
+        if claimed_expected_count is None:
+            await self.db.execute(
+                """UPDATE news_comment_jobs SET state=?,attempts=?,next_attempt_at=?,
+                   claimed_at=NULL,last_error=?
+                   WHERE article_id=? AND state='processing'""",
+                params,
+            )
+        else:
+            await self.db.execute(
+                """UPDATE news_comment_jobs SET state=?,attempts=?,next_attempt_at=?,
+                   claimed_at=NULL,last_error=?
+                   WHERE article_id=? AND state='processing' AND expected_count=?""",
+                (*params, claimed_expected_count),
+            )
+        await self.db.execute(
+            "UPDATE news_articles SET comments_state=? WHERE source_id=?",
+            ("failed" if state == "failed" else "partial", article_id),
+        )
+        await self.db.commit()
+        return True
+
+    async def comment_job_state(self, article_id: str) -> str | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT state FROM news_comment_jobs WHERE article_id=?", (article_id,)
+        )
+        return str(rows[0]["state"]) if rows else None
+
+    @_serialized_write
+    async def enqueue_due_comment_audits(
+        self,
+        now: datetime | None = None,
+        audit_interval: timedelta = timedelta(hours=6),
+        recent_window: timedelta = timedelta(days=30),
+        limit: int = 10,
+    ) -> int:
+        observed_at = now or datetime.now(UTC)
+        rows = await self.db.execute_fetchall(
+            """SELECT a.source_id,a.comment_count
+               FROM news_articles a
+               LEFT JOIN news_comment_jobs j ON j.article_id=a.source_id
+               WHERE (a.comment_count>0 OR EXISTS (
+                   SELECT 1 FROM news_comments c
+                   WHERE c.article_id=a.source_id AND c.is_current=1
+                     AND c.observation_quality='detail'
+                 ))
+                 AND COALESCE(a.published_at,a.first_seen_at)>=?
+                 AND (a.comments_checked_at IS NULL OR a.comments_checked_at<=?)
+                 AND (j.article_id IS NULL OR j.state='done'
+                      OR (j.state='failed' AND j.next_attempt_at<=?))
+               ORDER BY COALESCE(a.comments_checked_at,a.first_seen_at),a.source_id
+               LIMIT ?""",
+            (
+                _iso(observed_at - recent_window),
+                _iso(observed_at - audit_interval),
+                _iso(observed_at),
+                limit,
+            ),
+        )
+        ready = _iso(observed_at)
+        for row in rows:
+            await self.db.execute(
+                """INSERT INTO news_comment_jobs
+                   (article_id,priority,state,attempts,expected_count,
+                    expected_count_observed,next_attempt_at)
+                   VALUES (?,1,'pending',0,?,0,?)
+                   ON CONFLICT(article_id) DO UPDATE SET
+                     state='pending',attempts=0,expected_count=excluded.expected_count,
+                     expected_count_observed=0,
+                     next_attempt_at=excluded.next_attempt_at,claimed_at=NULL,last_error=NULL
+                   WHERE news_comment_jobs.state IN ('done','failed')""",
+                (row["source_id"], int(row["comment_count"]), ready),
+            )
+            await self.db.execute(
+                "UPDATE news_articles SET comments_state='pending' WHERE source_id=?",
+                (row["source_id"],),
+            )
+        await self.db.commit()
+        return len(rows)
 
     async def _enqueue_localized(
         self,
@@ -766,9 +1117,7 @@ class NewsRepository:
     async def complete_localized_job(
         self, job: LocalizedTextJob, translated_text: str, model: str
     ) -> bool:
-        current = await self._localized_source_text(
-            job.entity_type, job.entity_id, job.field_name
-        )
+        current = await self._localized_source_text(job.entity_type, job.entity_id, job.field_name)
         current_hash = hashlib.sha256((current or "").strip().encode()).hexdigest()
         now = _iso(datetime.now(UTC))
         if current is None or current_hash != job.source_hash:
@@ -804,9 +1153,7 @@ class NewsRepository:
         )
         await self.db.commit()
 
-    async def localized_text(
-        self, entity_type: str, entity_id: str, field_name: str
-    ) -> str | None:
+    async def localized_text(self, entity_type: str, entity_id: str, field_name: str) -> str | None:
         source_text = await self._localized_source_text(entity_type, entity_id, field_name)
         if source_text is None:
             return None
@@ -837,9 +1184,7 @@ class NewsRepository:
         return str(rows[0]["status"]) if rows else None
 
     @_serialized_write
-    async def claim_media_jobs(
-        self, limit: int, now: datetime | None = None
-    ) -> list[MediaJob]:
+    async def claim_media_jobs(self, limit: int, now: datetime | None = None) -> list[MediaJob]:
         claimed = now or datetime.now(UTC)
         ready = _iso(claimed)
         lease = _iso(claimed + timedelta(minutes=5))
@@ -958,9 +1303,17 @@ class NewsRepository:
 
     async def comment_count(self, article_id: str) -> int:
         rows = await self.db.execute_fetchall(
-            "SELECT count(*) AS count FROM news_comments WHERE article_id=?", (article_id,)
+            """SELECT count(*) AS count FROM news_comments
+               WHERE article_id=? AND is_current=1 AND observation_quality='detail'""",
+            (article_id,),
         )
         return int(rows[0]["count"])
+
+    async def comment_collection_state(self, article_id: str) -> str:
+        rows = await self.db.execute_fetchall(
+            "SELECT comments_state FROM news_articles WHERE source_id=?", (article_id,)
+        )
+        return str(rows[0]["comments_state"]) if rows else "pending"
 
     async def current_segment_keys(self, article_id: str) -> tuple[str, ...]:
         rows = await self.db.execute_fetchall(
@@ -1016,9 +1369,7 @@ class NewsRepository:
         )
         return tuple(str(row["article_id"]) for row in rows)
 
-    async def feed_event_types(
-        self, article_id: str, feed_type: FeedType
-    ) -> tuple[str, ...]:
+    async def feed_event_types(self, article_id: str, feed_type: FeedType) -> tuple[str, ...]:
         rows = await self.db.execute_fetchall(
             """SELECT event_type FROM news_feed_events
                WHERE article_id=? AND feed_type=? ORDER BY id""",
@@ -1081,9 +1432,7 @@ class NewsRepository:
             sort_value = "COALESCE(a.published_at,a.first_seen_at)"
             cursor_sql = ""
             if cursor:
-                cursor_sql = (
-                    f" AND ({sort_value}<? OR ({sort_value}=? AND a.source_id<?))"
-                )
+                cursor_sql = f" AND ({sort_value}<? OR ({sort_value}=? AND a.source_id<?))"
                 parameters.extend((cursor["time"], cursor["time"], cursor["id"]))
             rows = await self.db.execute_fetchall(
                 f"""SELECT a.*,{sort_value} AS sort_time FROM news_articles a
@@ -1096,9 +1445,7 @@ class NewsRepository:
         selected = rows[:limit]
         items = [dict(row) for row in selected]
         translations = await self._current_translations("article", items)
-        categories = await self._categories_for(
-            [str(item["source_id"]) for item in items]
-        )
+        categories = await self._categories_for([str(item["source_id"]) for item in items])
         for item in items:
             item["title_zh"] = translations.get((item["source_id"], "title"))
             item["teaser_zh"] = translations.get((item["source_id"], "teaser"))
@@ -1243,16 +1590,13 @@ class NewsRepository:
                 parameters.extend((cursor["rank"], cursor["rank"], cursor["id"]))
         else:
             source = "news_comments c"
-            where = "c.article_id=?"
+            where = "c.article_id=? AND c.is_current=1 AND c.observation_quality='detail'"
             parameters.append(article_id)
-            sort_value = "COALESCE(c.published_at,c.first_seen_at)"
-            order = f"{sort_value} DESC,c.comment_id DESC"
-            fields = f"c.*,{sort_value} AS sort_time"
+            order = "c.position,c.comment_id"
+            fields = "c.*,c.position AS sort_position"
             if cursor:
-                where += (
-                    f" AND ({sort_value}<? OR ({sort_value}=? AND c.comment_id<?))"
-                )
-                parameters.extend((cursor["time"], cursor["time"], cursor["id"]))
+                where += " AND (c.position>? OR (c.position=? AND c.comment_id>?))"
+                parameters.extend((cursor["position"], cursor["position"], cursor["id"]))
         rows = await self.db.execute_fetchall(
             f"SELECT {fields} FROM {source} WHERE {where} ORDER BY {order} LIMIT ?",
             (*parameters, limit + 1),
@@ -1267,7 +1611,7 @@ class NewsRepository:
             next_cursor = (
                 {"rank": last["sort_rank"], "id": last["comment_id"]}
                 if article_id is None
-                else {"time": last["sort_time"], "id": last["comment_id"]}
+                else {"position": last["sort_position"], "id": last["comment_id"]}
             )
         return selected, next_cursor
 
@@ -1275,6 +1619,7 @@ class NewsRepository:
         result: dict[str, Any] = {"sections": await self.section_counts()}
         for table, column, key in (
             ("news_detail_jobs", "state", "detail_jobs"),
+            ("news_comment_jobs", "state", "comment_jobs"),
             ("news_media", "download_state", "media_jobs"),
             ("localized_texts", "status", "translation_jobs"),
         ):
@@ -1291,6 +1636,8 @@ class NewsRepository:
             "news_last_listing_error",
             "news_last_detail_success",
             "news_last_detail_error",
+            "news_last_comment_success",
+            "news_last_comment_error",
             "news_last_translation_success",
         ):
             result[key.removeprefix("news_")] = await self.get_runtime_state(key)
@@ -1323,9 +1670,7 @@ class NewsRepository:
         return items
 
     async def get_runtime_state(self, key: str) -> str | None:
-        rows = await self.db.execute_fetchall(
-            "SELECT value FROM runtime_state WHERE key=?", (key,)
-        )
+        rows = await self.db.execute_fetchall("SELECT value FROM runtime_state WHERE key=?", (key,))
         return str(rows[0]["value"]) if rows else None
 
     @_serialized_write

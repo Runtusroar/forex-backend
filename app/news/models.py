@@ -12,6 +12,7 @@ SegmentType = Literal["article", "social", "update", "quote", "link"]
 SegmentLinkType = Literal["full_story"]
 SegmentDisplayMode = Literal["full", "clamped"]
 MediaType = Literal["image", "chart", "attachment"]
+CommentObservationQuality = Literal["listing", "detail"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,7 @@ class ArticleObservation:
     source_timezone: str | None = None
     breaking_impact: BreakingImpact | None = None
     comment_count: int = 0
+    comment_count_observed: bool = True
     is_excerpt: bool = False
     listing_thumbnail_url: str | None = None
 
@@ -60,6 +62,9 @@ class CommentObservation:
     published_at_source_text: str | None = None
     reaction_count: int | None = None
     feed_rank: int | None = None
+    position: int = 0
+    depth: int = 0
+    observation_quality: CommentObservationQuality = "detail"
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +117,15 @@ class DetailObservation:
 
 
 @dataclass(frozen=True, slots=True)
+class CommentCollectionObservation:
+    article_id: str
+    observed_at: datetime
+    expected_count: int
+    comments: tuple[CommentObservation, ...] = ()
+    is_complete: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class NewsListingBatch:
     articles: tuple[ArticleObservation, ...]
     observed_at: datetime
@@ -135,6 +149,17 @@ class DetailJob:
     article_id: str
     ff_url: str
     desired_source_hash: str
+    priority: int
+    attempts: int
+    claimed_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CommentJob:
+    article_id: str
+    ff_url: str
+    expected_count: int
+    expected_count_observed: bool
     priority: int
     attempts: int
     claimed_at: datetime

@@ -36,9 +36,7 @@ def _absolute_url(value: str | None) -> str | None:
 
 def _impact(node: Node) -> str:
     impact = node.css_first(".calendar__impact")
-    classes = " ".join(
-        child.attributes.get("class") or "" for child in impact.css("*") if impact
-    )
+    classes = " ".join(child.attributes.get("class") or "" for child in impact.css("*") if impact)
     if "red" in classes:
         return "high"
     if "ora" in classes:
@@ -53,9 +51,7 @@ def _impact(node: Node) -> str:
 def _value_state(node: Node | None) -> str | None:
     if node is None:
         return None
-    classes = " ".join(
-        child.attributes.get("class") or "" for child in [node, *node.css("*")]
-    )
+    classes = " ".join(child.attributes.get("class") or "" for child in [node, *node.css("*")])
     if "better" in classes:
         return "better"
     if "worse" in classes:
@@ -254,7 +250,18 @@ def parse_calendar_detail(
     reject_challenge(html)
     tree = HTMLParser(html)
     active = tree.css_first(f"tr.calendar__row[data-event-id='{source_id}']")
-    detail = tree.css_first("tr.calendar__details--detail")
+    detail = None
+    sibling = active.next if active else None
+    while sibling is not None:
+        classes = sibling.attributes.get("class", "").split()
+        if "calendar__details--detail" in classes:
+            detail = sibling
+            break
+        if sibling.attributes.get("data-event-id"):
+            break
+        sibling = sibling.next
+    if detail is None and active is None:
+        detail = tree.css_first("tr.calendar__details--detail")
     if detail is None:
         raise SourcePageError("calendar detail row is missing")
 

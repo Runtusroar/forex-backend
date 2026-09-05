@@ -26,8 +26,7 @@ def test_full_story_anchor_is_structured_and_not_flattened_into_prose() -> None:
 
     assert detail.segments[2].text_en == "Full Forex Factory excerpt..."
     assert [
-        (link.kind, link.label, link.url, link.segment_key, link.position)
-        for link in detail.links
+        (link.kind, link.label, link.url, link.segment_key, link.position) for link in detail.links
     ] == [
         (
             "full_story",
@@ -40,9 +39,7 @@ def test_full_story_anchor_is_structured_and_not_flattened_into_prose() -> None:
 
 
 def test_truth_social_show_more_preserves_ff_text_and_presentation() -> None:
-    detail = parse_news_detail_v2(
-        TRUTH_SOCIAL_HTML, "101", NOW, ZoneInfo("Asia/Shanghai")
-    )
+    detail = parse_news_detail_v2(TRUTH_SOCIAL_HTML, "101", NOW, ZoneInfo("Asia/Shanghai"))
 
     assert len(detail.segments) == 2
     social = detail.segments[1]
@@ -50,9 +47,7 @@ def test_truth_social_show_more_preserves_ff_text_and_presentation() -> None:
     assert social.author_name == "Donald J. Trump"
     assert social.author_handle == "@realDonaldTrump"
     assert social.published_at_source_text == "Sep 3, 2026 10:56pm"
-    assert social.source_url == (
-        "https://truthsocial.com/@realDonaldTrump/117207687594983323"
-    )
+    assert social.source_url == ("https://truthsocial.com/@realDonaldTrump/117207687594983323")
     assert social.text_en == (
         "For the treasonous SCUM that refuses to accurately report on our Military "
         "Operation in Iran, we have virtually unlimited amounts of ammunition."
@@ -69,8 +64,32 @@ def test_content_media_and_nested_comments_are_preserved() -> None:
             "image",
             "https://assets.faireconomy.media/nfs/npd/2026/09/03/chart.png",
         ),
-        ("chart", "https://www.forexfactory.com/attachment/image/55")
+        ("chart", "https://www.forexfactory.com/attachment/image/55"),
     ]
     assert [item.comment_id for item in detail.comments] == ["700", "701"]
     assert detail.comments[1].parent_comment_id == "700"
+    assert [(item.position, item.depth) for item in detail.comments] == [(0, 0), (1, 1)]
+    assert detail.comments[0].published_at == datetime(2026, 9, 2, 14, 15, tzinfo=UTC)
+    assert detail.comments[0].published_at_source_text == "Sep 2, 2026 10:15pm"
+    assert detail.comments[0].reaction_count == 12
     assert all("avatar" not in item.original_url for item in detail.media)
+
+
+def test_comment_time_without_year_uses_observation_year_and_ignores_relative_suffix() -> None:
+    html = """
+    <article class="news__article"><div class="news__copy"><p>Story</p></div></article>
+    <div class="news-comments__list"><div class="news-comment">
+      <div class="news-comment__header-username">Alice</div>
+      <div class="news-comment__header-date">
+        <span title="Sep 4, 8:33pm (15 hr ago)">15 hr ago</span>
+      </div>
+      <a href="/news/100-x/comment/700#post700">Permalink</a>
+      <div class="news-comment__comment-message">Message</div>
+    </div></div>
+    """
+    observed_at = datetime(2026, 9, 5, tzinfo=UTC)
+
+    detail = parse_news_detail_v2(html, "100", observed_at, ZoneInfo("Asia/Shanghai"))
+
+    assert detail.comments[0].published_at == datetime(2026, 9, 4, 12, 33, tzinfo=UTC)
+    assert detail.comments[0].published_at_source_text == "Sep 4, 8:33pm (15 hr ago)"

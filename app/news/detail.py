@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -28,14 +28,31 @@ def _key(*values: str | None) -> str:
     return hashlib.sha256("\n".join(value or "" for value in values).encode()).hexdigest()
 
 
-def _published(source_text: str | None, zone: ZoneInfo) -> datetime | None:
+def _published(
+    source_text: str | None,
+    zone: ZoneInfo,
+    observed_at: datetime | None = None,
+) -> datetime | None:
     if not source_text:
         return None
+    absolute_text = re.sub(r"\s*\([^)]*ago\)\s*$", "", source_text, flags=re.I).strip()
     for pattern in ("%b %d, %Y %I:%M%p", "%b %d, %Y, %I:%M%p"):
         try:
-            return datetime.strptime(source_text, pattern).replace(tzinfo=zone).astimezone(UTC)
+            return datetime.strptime(absolute_text, pattern).replace(tzinfo=zone).astimezone(UTC)
         except ValueError:
             continue
+    if observed_at is not None:
+        observed_local = observed_at.astimezone(zone)
+        for pattern in ("%b %d, %I:%M%p", "%b %d %I:%M%p"):
+            try:
+                parsed = datetime.strptime(absolute_text, pattern).replace(
+                    year=observed_local.year, tzinfo=zone
+                )
+            except ValueError:
+                continue
+            if parsed > observed_local + timedelta(days=1):
+                parsed = parsed.replace(year=parsed.year - 1)
+            return parsed.astimezone(UTC)
     return None
 
 
@@ -55,6 +72,44 @@ def _parent_comment_id(node: Node) -> str | None:
             identity = _comment_id(parent)
             return identity[0] if identity else None
         parent = parent.parent
+    return None
+
+
+def _comment_depth(node: Node) -> int:
+    depth = 0
+    parent = node.parent
+    while parent is not None:
+        if "news-comment" in parent.attributes.get("class", "").split():
+            depth += 1
+        parent = parent.parent
+    return depth
+
+
+def _comment_source_time(node: Node | None) -> str | None:
+    if node is None:
+        return None
+    absolute = node.css_first("[title]")
+    if absolute:
+        source = absolute.attributes.get("title", "").strip()
+        if source:
+            return source
+    return _clean(node.text(strip=True)) or None
+
+
+def _reaction_count(node: Node) -> int | None:
+    for reaction in node.css(
+        ".like__count--like, .news-comment__like-count, "
+        ".news-comment__likes-count, .news-comment__reaction-count"
+    ):
+        owner = reaction.parent
+        while owner is not None and "news-comment" not in owner.attributes.get(
+            "class", ""
+        ).split():
+            owner = owner.parent
+        if owner != node:
+            continue
+        match = re.search(r"\d[\d,]*", reaction.text(strip=True))
+        return int(match.group().replace(",", "")) if match else None
     return None
 
 
@@ -107,8 +162,7 @@ def parse_news_detail_v2(
             classes = article.css_first(".truthsocial-post")
             is_clamped = bool(
                 classes
-                and "truthsocial-post--show-more"
-                in classes.attributes.get("class", "").split()
+                and "truthsocial-post--show-more" in classes.attributes.get("class", "").split()
             )
             segment = SegmentObservation(
                 stable_key=_key("social", source_url, text),
@@ -137,10 +191,7 @@ def parse_news_detail_v2(
             link_label = _clean(full_story.text(separator=" ", strip=True)) if full_story else None
             if full_story:
                 full_story.decompose()
-            paragraphs = [
-                _clean(node.text(separator=" ", strip=True))
-                for node in copy.css("p")
-            ]
+            paragraphs = [_clean(node.text(separator=" ", strip=True)) for node in copy.css("p")]
             text = "\n\n".join(value for value in paragraphs if value) or _clean(
                 copy.text(separator=" ", strip=True)
             )
@@ -210,14 +261,14 @@ def parse_news_detail_v2(
         raise SourcePageError("news detail contains no story segments")
 
     comments: list[CommentObservation] = []
-    for node in tree.css(".news-comments__list .news-comment"):
+    for position, node in enumerate(tree.css(".news-comments__list .news-comment")):
         identity = _comment_id(node)
         message = node.css_first(".news-comment__comment-message")
         if not identity or not message:
             continue
         author = node.css_first(".news-comment__header-username")
         source_time = node.css_first(".news-comment__header-date")
-        source_time_text = _clean(source_time.text(strip=True)) if source_time else None
+        source_time_text = _comment_source_time(source_time)
         comments.append(
             CommentObservation(
                 comment_id=identity[0],
@@ -227,8 +278,11 @@ def parse_news_detail_v2(
                 text_en=_clean(message.text(separator=" ", strip=True)),
                 permalink=identity[1],
                 observed_at=observed_at,
-                published_at=_published(source_time_text, source_timezone),
+                published_at=_published(source_time_text, source_timezone, observed_at),
                 published_at_source_text=source_time_text,
+                reaction_count=_reaction_count(node),
+                position=position,
+                depth=_comment_depth(node),
             )
         )
     return DetailObservation(

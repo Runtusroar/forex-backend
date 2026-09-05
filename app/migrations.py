@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import aiosqlite
 
-LATEST_SCHEMA_VERSION = 6
+LATEST_SCHEMA_VERSION = 7
 
 MIGRATION_2 = """
 BEGIN IMMEDIATE;
@@ -402,6 +402,77 @@ ON CONFLICT(key) DO UPDATE SET value=excluded.value;
 COMMIT;
 """
 
+MIGRATION_7 = """
+BEGIN IMMEDIATE;
+
+ALTER TABLE news_articles ADD COLUMN comments_state TEXT NOT NULL DEFAULT 'pending'
+  CHECK (comments_state IN ('pending','partial','complete','failed'));
+ALTER TABLE news_articles ADD COLUMN comments_checked_at TEXT;
+ALTER TABLE news_articles ADD COLUMN comments_completed_at TEXT;
+ALTER TABLE news_articles ADD COLUMN comment_count_observed_at TEXT;
+
+ALTER TABLE news_comments ADD COLUMN position INTEGER NOT NULL DEFAULT 0
+  CHECK (position >= 0);
+ALTER TABLE news_comments ADD COLUMN depth INTEGER NOT NULL DEFAULT 0
+  CHECK (depth >= 0);
+ALTER TABLE news_comments ADD COLUMN is_current INTEGER NOT NULL DEFAULT 1
+  CHECK (is_current IN (0,1));
+ALTER TABLE news_comments ADD COLUMN observation_quality TEXT NOT NULL DEFAULT 'detail'
+  CHECK (observation_quality IN ('listing','detail'));
+UPDATE news_comments SET observation_quality='listing'
+WHERE author_name='Unknown' OR trim(text_en)='';
+CREATE INDEX idx_news_comments_current_order
+  ON news_comments(article_id,is_current,position,comment_id);
+
+CREATE TABLE news_comment_jobs (
+  article_id TEXT PRIMARY KEY REFERENCES news_articles(source_id) ON DELETE CASCADE,
+  priority INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'pending'
+    CHECK (state IN ('pending','processing','done','failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  expected_count INTEGER NOT NULL DEFAULT 0 CHECK (expected_count >= 0),
+  expected_count_observed INTEGER NOT NULL DEFAULT 0
+    CHECK (expected_count_observed IN (0,1)),
+  next_attempt_at TEXT NOT NULL,
+  claimed_at TEXT,
+  last_error TEXT
+);
+CREATE INDEX idx_news_comment_jobs_ready
+  ON news_comment_jobs(state,next_attempt_at,priority DESC);
+
+ALTER TABLE calendar_event_details ADD COLUMN source_hash TEXT;
+ALTER TABLE calendar_event_details ADD COLUMN last_success_at TEXT;
+
+CREATE TABLE calendar_detail_jobs (
+  source_id TEXT PRIMARY KEY REFERENCES calendar_events(source_id) ON DELETE CASCADE,
+  desired_source_hash TEXT NOT NULL,
+  priority INTEGER NOT NULL DEFAULT 0,
+  state TEXT NOT NULL DEFAULT 'pending'
+    CHECK (state IN ('pending','processing','done','failed')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL,
+  claimed_at TEXT,
+  last_error TEXT
+);
+CREATE INDEX idx_calendar_detail_jobs_ready
+  ON calendar_detail_jobs(state,next_attempt_at,priority DESC);
+
+INSERT INTO news_comment_jobs (
+  article_id,priority,state,attempts,expected_count,expected_count_observed,next_attempt_at
+)
+SELECT source_id,0,'pending',0,comment_count,0,updated_at FROM news_articles;
+
+INSERT INTO calendar_detail_jobs (
+  source_id,desired_source_hash,priority,state,attempts,next_attempt_at
+)
+SELECT source_id,source_hash,0,'pending',0,updated_at FROM calendar_events;
+
+INSERT INTO runtime_state(key,value) VALUES ('schema_version','7')
+ON CONFLICT(key) DO UPDATE SET value=excluded.value;
+
+COMMIT;
+"""
+
 
 async def migrate(connection: aiosqlite.Connection) -> None:
     rows = await connection.execute_fetchall(
@@ -423,3 +494,6 @@ async def migrate(connection: aiosqlite.Connection) -> None:
     if version < 6:
         await connection.executescript(MIGRATION_6)
         version = 6
+    if version < 7:
+        await connection.executescript(MIGRATION_7)
+        version = 7

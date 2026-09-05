@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from app.collector import Collector
+from app.collector.calendar_details import CalendarDetailCollector
 from app.db import Database
 from app.domain import CalendarObservation, NewsObservation
 from app.repository import Repository
@@ -74,6 +75,23 @@ class CurrentCalendarBrowser(FakeBrowser):
     async def calendar_html(self, day: date) -> str:
         self.calendar_days.append(day)
         return (FIXTURES / "calendar_current.html").read_text()
+
+
+class CalendarDetailBatchBrowser(FakeBrowser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.detail_batches: list[tuple[date, tuple[str, ...]]] = []
+
+    async def calendar_details_html(self, day: date, source_ids: list[str]) -> dict[str, str]:
+        self.detail_batches.append((day, tuple(source_ids)))
+        html = (FIXTURES / "calendar_detail.html").read_text()
+        return {source_id: html for source_id in source_ids}
+
+
+class PartialCalendarDetailBatchBrowser(CalendarDetailBatchBrowser):
+    async def calendar_details_html(self, day: date, source_ids: list[str]) -> dict[str, str]:
+        self.detail_batches.append((day, tuple(source_ids)))
+        return {"149673": (FIXTURES / "calendar_detail.html").read_text()}
 
 
 def daily_calendar_html(day: date, source_id: str) -> str:
@@ -216,3 +234,60 @@ async def test_translation_failure_is_delayed_without_changing_english(
     assert immediate_retry == TranslationRunResult(0, 0)
     assert (await repository.get_news("9002")).title_en == "Gold rises"
     assert (await repository.get_news("9002")).title_zh is None
+
+
+async def test_calendar_detail_worker_prefetches_queued_detail(
+    repository: Repository,
+) -> None:
+    event_at = datetime(2026, 8, 31, 7, 50, tzinfo=UTC)
+    await repository.upsert_calendar(
+        [
+            CalendarObservation(
+                "149673",
+                event_at,
+                "JPY",
+                "low",
+                "Prelim Industrial Production m/m",
+                "0.1%",
+                "-0.7%",
+                "1.9%",
+            )
+        ]
+    )
+    browser = CalendarDetailBatchBrowser()
+    worker = CalendarDetailCollector(browser, repository, source_timezone=UTC)
+
+    assert await worker.run_cycle() == 1
+    assert browser.detail_batches == [(event_at.date(), ("149673",))]
+    detail = await repository.get_calendar_detail("149673")
+    assert detail is not None
+    assert detail.source_name == "METI"
+
+
+async def test_calendar_detail_worker_keeps_error_when_batch_is_partially_successful(
+    repository: Repository,
+) -> None:
+    event_at = datetime(2026, 8, 31, 7, 50, tzinfo=UTC)
+    await repository.upsert_calendar(
+        [
+            CalendarObservation(
+                source_id,
+                event_at,
+                "JPY",
+                "low",
+                f"Event {source_id}",
+                None,
+                None,
+                None,
+            )
+            for source_id in ("149673", "149674")
+        ]
+    )
+    worker = CalendarDetailCollector(
+        PartialCalendarDetailBatchBrowser(), repository, source_timezone=UTC
+    )
+
+    completed = await worker.run_cycle(datetime.now(UTC) + timedelta(seconds=1))
+
+    assert completed == 1
+    assert await repository.get_runtime_state("calendar_detail_last_error") == "KeyError"

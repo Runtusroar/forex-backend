@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -143,15 +143,15 @@ async def test_calendar_api_reports_last_successful_snapshot_time(tmp_path: Path
     await repository.set_runtime_state("calendar_last_success", "2026-09-04T13:15:00Z")
     await repository.set_runtime_state("calendar_last_count", "14")
     await repository.set_runtime_state("calendar_last_error", "")
+    await repository.set_runtime_state("calendar_detail_last_success", "2026-09-04T13:16:00Z")
+    await repository.set_runtime_state("calendar_detail_last_error", "")
 
     async with client:
         calendar = await client.get(
             "/api/v1/calendar?from=2026-09-04T00:00:00Z&to=2026-09-05T00:00:00Z",
             headers={"X-API-Key": "api-secret"},
         )
-        status = await client.get(
-            "/api/v1/status", headers={"X-API-Key": "api-secret"}
-        )
+        status = await client.get("/api/v1/status", headers={"X-API-Key": "api-secret"})
     await database.close()
 
     assert calendar.json()["generated_at"] == "2026-09-04T13:15:00Z"
@@ -159,7 +159,39 @@ async def test_calendar_api_reports_last_successful_snapshot_time(tmp_path: Path
         "last_success": "2026-09-04T13:15:00Z",
         "last_count": 14,
         "last_error": None,
+        "detail_last_success": "2026-09-04T13:16:00Z",
+        "detail_last_error": None,
+        "detail_jobs": {},
     }
+
+
+async def test_status_is_degraded_when_calendar_detail_collection_failed(
+    tmp_path: Path,
+) -> None:
+    client, repository, database = await make_client(tmp_path)
+    await repository.set_runtime_state("calendar_last_error", "")
+    await repository.set_runtime_state("calendar_detail_last_error", "TimeoutError")
+    item = CalendarObservation(
+        "1", datetime.now(UTC), "USD", "high", "Event", None, None, None
+    )
+    await repository.upsert_calendar([item])
+    claimed_at = datetime.now(UTC) + timedelta(seconds=1)
+    job = (await repository.claim_calendar_detail_jobs(1, claimed_at))[0]
+    await repository.fail_calendar_detail_job(
+        job.source_id,
+        TimeoutError("source timeout"),
+        claimed_at,
+        max_attempts=1,
+        desired_source_hash=job.desired_source_hash,
+    )
+
+    async with client:
+        response = await client.get("/api/v1/status", headers={"X-API-Key": "api-secret"})
+    await database.close()
+
+    assert response.json()["status"] == "degraded"
+    assert response.json()["calendar"]["detail_last_error"] == "TimeoutError"
+    assert response.json()["calendar"]["detail_jobs"]["failed"] == 1
 
 
 async def test_calendar_api_exposes_forex_factory_time_label_and_order(
@@ -252,9 +284,7 @@ async def test_calendar_detail_api_returns_cached_specs_history_and_related_stor
     )
 
     async with client:
-        response = await client.get(
-            "/api/v1/calendar/1", headers={"X-API-Key": "api-secret"}
-        )
+        response = await client.get("/api/v1/calendar/1", headers={"X-API-Key": "api-secret"})
     await database.close()
 
     assert response.status_code == 200, response.text
@@ -266,7 +296,7 @@ async def test_calendar_detail_api_returns_cached_specs_history_and_related_stor
     assert payload["related_stories"][0]["title_en"] == "Factories expanded"
 
 
-async def test_calendar_detail_api_collects_and_caches_missing_detail(
+async def test_calendar_detail_api_returns_not_found_while_background_prefetch_is_pending(
     tmp_path: Path,
 ) -> None:
     settings = Settings(
@@ -300,25 +330,19 @@ async def test_calendar_detail_api_collects_and_caches_missing_detail(
         (Path(__file__).parent / "fixtures/calendar_detail.html").read_text()
     )
     app.state.calendar_browser = fake_browser
-    client = httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    )
+    client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test")
 
     async with client:
-        response = await client.get(
-            "/api/v1/calendar/149673", headers={"X-API-Key": "api-secret"}
-        )
-    cached = await repository.get_calendar_detail("149673")
+        response = await client.get("/api/v1/calendar/149673", headers={"X-API-Key": "api-secret"})
     await database.close()
 
-    assert response.status_code == 200, response.text
-    assert fake_browser.calls == [(event_at.date(), "149673")]
-    assert response.json()["source_name"] == "METI"
-    assert cached is not None
-    assert cached.ff_url == "https://www.forexfactory.com/calendar/225-jn-prelim-industrial-production-mm"
+    assert response.status_code == 404
+    assert fake_browser.calls == []
 
 
-async def test_calendar_detail_api_refreshes_existing_cache(tmp_path: Path) -> None:
+async def test_calendar_detail_api_returns_existing_cache_without_source_request(
+    tmp_path: Path,
+) -> None:
     browser = FakeCalendarBrowser(
         (Path(__file__).parent / "fixtures/calendar_detail.html").read_text()
     )
@@ -327,19 +351,15 @@ async def test_calendar_detail_api_refreshes_existing_cache(tmp_path: Path) -> N
     await repository.upsert_calendar(
         [CalendarObservation("149673", event_at, "JPY", "low", "Event", None, None, None)]
     )
-    await repository.replace_calendar_detail(
-        minimal_calendar_detail("149673", "Stale source")
-    )
+    await repository.replace_calendar_detail(minimal_calendar_detail("149673", "Stale source"))
 
     async with client:
-        response = await client.get(
-            "/api/v1/calendar/149673", headers={"X-API-Key": "api-secret"}
-        )
+        response = await client.get("/api/v1/calendar/149673", headers={"X-API-Key": "api-secret"})
     await database.close()
 
     assert response.status_code == 200, response.text
-    assert browser.calls == [(event_at.date(), "149673")]
-    assert response.json()["source_name"] == "METI"
+    assert browser.calls == []
+    assert response.json()["source_name"] == "Stale source"
 
 
 async def test_calendar_detail_api_returns_cached_detail_when_refresh_fails(
@@ -354,17 +374,15 @@ async def test_calendar_detail_api_returns_cached_detail_when_refresh_fails(
     await repository.replace_calendar_detail(minimal_calendar_detail("1", "Cached source"))
 
     async with client:
-        response = await client.get(
-            "/api/v1/calendar/1", headers={"X-API-Key": "api-secret"}
-        )
+        response = await client.get("/api/v1/calendar/1", headers={"X-API-Key": "api-secret"})
     await database.close()
 
     assert response.status_code == 200, response.text
-    assert browser.calls == [(event_at.date(), "1")]
+    assert browser.calls == []
     assert response.json()["source_name"] == "Cached source"
 
 
-async def test_calendar_detail_api_maps_uncached_browser_failure_to_bad_gateway(
+async def test_calendar_detail_api_does_not_call_browser_when_cache_is_missing(
     tmp_path: Path,
 ) -> None:
     browser = FailingCalendarBrowser()
@@ -375,10 +393,8 @@ async def test_calendar_detail_api_maps_uncached_browser_failure_to_bad_gateway(
     )
 
     async with client:
-        response = await client.get(
-            "/api/v1/calendar/1", headers={"X-API-Key": "api-secret"}
-        )
+        response = await client.get("/api/v1/calendar/1", headers={"X-API-Key": "api-secret"})
     await database.close()
 
-    assert response.status_code == 502
-    assert response.json()["detail"] == "Calendar source unavailable"
+    assert response.status_code == 404
+    assert browser.calls == []

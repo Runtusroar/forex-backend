@@ -34,15 +34,17 @@ async def test_migration_creates_news_v2_without_losing_calendar(tmp_path: Path)
         "news_media",
         "news_comments",
         "news_comment_feed",
+        "news_comment_jobs",
         "localized_texts",
         "news_detail_jobs",
         "source_snapshots",
         "calendar_event_details",
         "calendar_event_history",
         "calendar_event_related_stories",
+        "calendar_detail_jobs",
     } <= names
     assert "news_source_documents" not in names
-    assert version[0]["value"] == "6"
+    assert version[0]["value"] == "7"
     calendar_columns = await database.connection.execute_fetchall(
         "PRAGMA table_info(calendar_events)"
     )
@@ -55,6 +57,20 @@ async def test_migration_creates_news_v2_without_losing_calendar(tmp_path: Path)
         "display_mode",
         "max_lines",
         "external_action_label",
+    }
+    article_columns = await database.connection.execute_fetchall("PRAGMA table_info(news_articles)")
+    assert {row["name"] for row in article_columns} >= {
+        "comments_state",
+        "comments_checked_at",
+        "comments_completed_at",
+        "comment_count_observed_at",
+    }
+    comment_columns = await database.connection.execute_fetchall("PRAGMA table_info(news_comments)")
+    assert {row["name"] for row in comment_columns} >= {
+        "position",
+        "depth",
+        "is_current",
+        "observation_quality",
     }
     await database.close()
 
@@ -165,16 +181,14 @@ async def test_v3_upgrade_removes_source_documents_and_their_translations(
     source_translations = await database.connection.execute_fetchall(
         "SELECT id FROM localized_texts WHERE entity_type='source_document'"
     )
-    assert version[0]["value"] == "6"
+    assert version[0]["value"] == "7"
     assert {
         "calendar_event_details",
         "calendar_event_history",
         "calendar_event_related_stories",
     } <= names
     assert "news_source_documents" not in names
-    assert [tuple(row) for row in segment] == [
-        ("Forex Factory excerpt...", "full", None, None)
-    ]
+    assert [tuple(row) for row in segment] == [("Forex Factory excerpt...", "full", None, None)]
     assert [tuple(row) for row in links] == [
         ("full_story", "full story", "https://publisher.example/story")
     ]
@@ -231,4 +245,9 @@ async def test_migration_imports_legacy_news_and_is_idempotent(tmp_path: Path) -
     assert articles[0]["source_id"] == "9001"
     assert articles[0]["teaser_en"] == "A summary"
     assert articles[0]["detail_state"] == "partial"
+    assert articles[0]["comments_state"] == "pending"
+    comment_jobs = await database.connection.execute_fetchall(
+        "SELECT article_id,expected_count FROM news_comment_jobs"
+    )
+    assert [tuple(row) for row in comment_jobs] == [("9001", 0)]
     await database.close()

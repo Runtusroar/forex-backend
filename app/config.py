@@ -14,9 +14,15 @@ class Settings(BaseSettings):
     calendar_source_timezone: str = "Asia/Singapore"
     calendar_horizon_days: int = Field(default=8, gt=0, le=31)
     calendar_schedule_interval_seconds: int = Field(default=600, gt=0)
+    calendar_detail_interval_seconds: int = Field(default=2, gt=0)
+    calendar_detail_refresh_interval_seconds: int = Field(default=86_400, gt=0)
+    calendar_detail_batch_size: int = Field(default=16, gt=0, le=100)
     news_source_timezone: str = "Asia/Shanghai"
     news_detail_interval_seconds: int = Field(default=2, gt=0)
     news_detail_max_attempts: int = Field(default=8, gt=0)
+    news_comment_interval_seconds: int = Field(default=2, gt=0)
+    news_comment_audit_interval_seconds: int = Field(default=21_600, gt=0)
+    news_comment_audit_days: int = Field(default=30, gt=0)
     news_snapshot_dir: Path = Path("data/snapshots")
     news_snapshot_retention_days: int = Field(default=30, gt=0)
     news_media_dir: Path = Path("data/media")

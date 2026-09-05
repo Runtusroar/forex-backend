@@ -1,3 +1,4 @@
+import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -34,6 +35,33 @@ def calendar_item() -> CalendarObservation:
         actual="51.2",
         forecast="50.5",
         previous="49.8",
+    )
+
+
+def calendar_detail(source_id: str, title: str) -> CalendarDetailObservation:
+    return CalendarDetailObservation(
+        source_id=source_id,
+        title_en=title,
+        currency="USD",
+        currency_name=None,
+        impact="high",
+        actual=None,
+        forecast=None,
+        previous=None,
+        actual_state=None,
+        previous_state=None,
+        previous_revised_from=None,
+        ff_url=None,
+        source_name=None,
+        source_url=None,
+        latest_release_url=None,
+        measures=None,
+        usual_effect=None,
+        frequency=None,
+        next_release_text=None,
+        next_release_url=None,
+        ff_notes=None,
+        why_traders_care=None,
     )
 
 
@@ -189,6 +217,123 @@ async def test_calendar_detail_round_trips_specs_history_and_related_stories(
     assert detail.history[0].release_date_text == "Sep 1, 2026"
     assert detail.history[0].previous_state == "worse"
     assert detail.related_stories[0].title_en == "US factory activity expanded"
+
+
+async def test_calendar_detail_replace_rolls_back_on_child_insert_failure(
+    repository: Repository,
+) -> None:
+    item = calendar_item()
+    await repository.upsert_calendar([item])
+    old_detail = replace(
+        calendar_detail(item.source_id, "Old detail"),
+        history=(CalendarHistoryObservation("Old release", None, None, None, None),),
+    )
+    await repository.replace_calendar_detail(old_detail)
+    invalid_detail = replace(
+        calendar_detail(item.source_id, "Incomplete replacement"),
+        history=(
+            CalendarHistoryObservation(None, None, None, None, None),  # type: ignore[arg-type]
+        ),
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        await repository.replace_calendar_detail(invalid_detail)
+
+    stored = await repository.get_calendar_detail(item.source_id)
+    assert stored is not None
+    assert stored.title_en == "Old detail"
+    assert [row.release_date_text for row in stored.history] == ["Old release"]
+
+
+async def test_calendar_change_enqueues_durable_detail_refresh(
+    repository: Repository,
+) -> None:
+    item = calendar_item()
+    await repository.upsert_calendar([item])
+    first = (await repository.claim_calendar_detail_jobs(1))[0]
+    await repository.complete_calendar_detail_job(first.source_id, first.desired_source_hash)
+
+    changed = replace(item, actual="52.0")
+    await repository.upsert_calendar([changed])
+    jobs = await repository.claim_calendar_detail_jobs(1)
+
+    assert len(jobs) == 1
+    assert jobs[0].source_id == item.source_id
+    assert jobs[0].event_at == item.event_at
+    assert jobs[0].priority == 100
+
+
+async def test_stale_calendar_detail_worker_cannot_mutate_newer_job(
+    repository: Repository,
+) -> None:
+    item = calendar_item()
+    await repository.upsert_calendar([item])
+    stale_job = (await repository.claim_calendar_detail_jobs(1))[0]
+
+    await repository.upsert_calendar([replace(item, actual="52.0")])
+    stored = await repository.replace_calendar_detail(
+        calendar_detail(item.source_id, "Stale detail"),
+        desired_source_hash=stale_job.desired_source_hash,
+    )
+    failed = await repository.fail_calendar_detail_job(
+        stale_job.source_id,
+        ValueError("stale page"),
+        desired_source_hash=stale_job.desired_source_hash,
+    )
+
+    assert stored is False
+    assert failed is False
+    assert await repository.get_calendar_detail(item.source_id) is None
+    current_job = (await repository.claim_calendar_detail_jobs(1))[0]
+    assert current_job.desired_source_hash != stale_job.desired_source_hash
+    assert current_job.attempts == 0
+
+
+async def test_due_calendar_detail_refresh_requeues_future_event(
+    repository: Repository,
+) -> None:
+    current = datetime.now(UTC)
+    item = replace(calendar_item(), event_at=current + timedelta(days=1))
+    await repository.upsert_calendar([item])
+    job = (await repository.claim_calendar_detail_jobs(1))[0]
+    await repository.complete_calendar_detail_job(job.source_id, job.desired_source_hash)
+
+    queued = await repository.enqueue_due_calendar_detail_refreshes(
+        current + timedelta(days=1, minutes=1),
+        refresh_interval=timedelta(days=1),
+    )
+
+    assert queued == 1
+
+
+async def test_calendar_detail_refreshes_near_release_more_frequently(
+    repository: Repository,
+) -> None:
+    now = datetime.now(UTC)
+    near = replace(calendar_item(), source_id="near", event_at=now + timedelta(hours=2))
+    future = replace(calendar_item(), source_id="future", event_at=now + timedelta(days=1))
+    await repository.upsert_calendar([near, future])
+    observed_at = now + timedelta(seconds=1)
+    jobs = await repository.claim_calendar_detail_jobs(2, observed_at)
+    for job in jobs:
+        await repository.replace_calendar_detail(
+            calendar_detail(job.source_id, "Cached detail"),
+            desired_source_hash=job.desired_source_hash,
+        )
+        await repository.complete_calendar_detail_job(job.source_id, job.desired_source_hash)
+    await repository.db.execute(
+        "UPDATE calendar_event_details SET last_success_at=?",
+        ((observed_at - timedelta(minutes=20)).isoformat().replace("+00:00", "Z"),),
+    )
+    await repository.db.commit()
+
+    queued = await repository.enqueue_due_calendar_detail_refreshes(
+        observed_at, refresh_interval=timedelta(days=1), limit=2
+    )
+    refreshed = await repository.claim_calendar_detail_jobs(2, observed_at)
+
+    assert queued == 1
+    assert [job.source_id for job in refreshed] == ["near"]
 
 
 async def test_stale_translation_cannot_overwrite_changed_source(

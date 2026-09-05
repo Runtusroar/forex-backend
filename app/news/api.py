@@ -73,6 +73,8 @@ def _require_cursor_keys(
         raise HTTPException(status_code=422, detail="Invalid cursor")
     if "time" in value and not isinstance(value["time"], str):
         raise HTTPException(status_code=422, detail="Invalid cursor")
+    if "position" in value and not isinstance(value["position"], int):
+        raise HTTPException(status_code=422, detail="Invalid cursor")
     return value
 
 
@@ -122,6 +124,8 @@ def _comment(item: dict[str, Any]) -> dict[str, Any]:
         "text": {"en": item["text_en"], "zh_hans": item.get("text_zh")},
         "permalink": item["permalink"],
         "reaction_count": item.get("reaction_count"),
+        "position": item.get("position", 0),
+        "depth": item.get("depth", 0),
     }
 
 
@@ -170,9 +174,7 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
         cursor: str | None = None,
     ) -> dict:
-        decoded = _require_cursor_keys(
-            _decode_cursor(cursor, "latest-comments"), ("rank", "id")
-        )
+        decoded = _require_cursor_keys(_decode_cursor(cursor, "latest-comments"), ("rank", "id"))
         rows, next_value = await repo.list_comments(None, limit, decoded)
         return {
             "items": [_comment(row) for row in rows],
@@ -211,20 +213,20 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
         if await repo.get_article(source_id) is None:
             raise HTTPException(status_code=404, detail="Not found")
         decoded = _require_cursor_keys(
-            _decode_cursor(cursor, f"comments:{source_id}"), ("time", "id")
+            _decode_cursor(cursor, f"comments:{source_id}"), ("position", "id")
         )
         rows, next_value = await repo.list_comments(source_id, limit, decoded)
+        state = await repo.comment_collection_state(source_id)
         return {
             "items": [_comment(row) for row in rows],
             "next_cursor": _encode_cursor(f"comments:{source_id}", next_value),
-            "comments_complete": False,
+            "comments_complete": state == "complete",
+            "comments_state": state,
             "generated_at": datetime.now(UTC),
         }
 
     @router.get("/news/{source_id}")
-    async def detail(
-        source_id: str, repo: Annotated[NewsRepository, Depends(repository)]
-    ) -> dict:
+    async def detail(source_id: str, repo: Annotated[NewsRepository, Depends(repository)]) -> dict:
         data = await repo.detail_data(source_id)
         if data is None:
             raise HTTPException(status_code=404, detail="Not found")
@@ -241,9 +243,7 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
                         "author_name": segment.get("author_name"),
                         "author_handle": segment.get("author_handle"),
                         "published_at": segment.get("published_at"),
-                        "published_at_source_text": segment.get(
-                            "published_at_source_text"
-                        ),
+                        "published_at_source_text": segment.get("published_at_source_text"),
                         "text": {
                             "en": segment.get("text_en"),
                             "zh_hans": segment.get("text_zh"),
@@ -270,7 +270,8 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
                     for segment in data["segments"]
                 ],
                 "comment_count_collected": data["comment_count_collected"],
-                "comments_complete": False,
+                "comments_state": data["article"].get("comments_state", "pending"),
+                "comments_complete": data["article"].get("comments_state") == "complete",
                 "generated_at": datetime.now(UTC),
             }
         )
