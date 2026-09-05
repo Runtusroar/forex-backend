@@ -226,6 +226,7 @@ class BrowserSession:
                     source_timezone=UTC,
                     expected_date=day,
                     require_source_payload=True,
+                    validate_timezone=False,
                 )
             except SourcePageError as cause:
                 error = cause

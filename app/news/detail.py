@@ -3,7 +3,8 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
+from typing import cast
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
@@ -17,6 +18,7 @@ from app.news.models import (
     SegmentObservation,
 )
 from app.parsers.errors import SourcePageError, reject_challenge
+from app.parsers.source_time import SourceTime, wall_time_utc
 
 SOURCE_ROOT = "https://www.forexfactory.com"
 
@@ -65,21 +67,22 @@ def _published(
     absolute_text = re.sub(r"\s*\([^)]*ago\)\s*$", "", source_text, flags=re.I).strip()
     for pattern in ("%b %d, %Y %I:%M%p", "%b %d, %Y, %I:%M%p"):
         try:
-            return datetime.strptime(absolute_text, pattern).replace(tzinfo=zone).astimezone(UTC)
+            parsed = datetime.strptime(absolute_text, pattern)
         except ValueError:
             continue
+        return wall_time_utc(parsed, zone)
     if observed_at is not None:
         observed_local = observed_at.astimezone(zone)
         for pattern in ("%b %d, %I:%M%p", "%b %d %I:%M%p"):
             try:
                 parsed = datetime.strptime(absolute_text, pattern).replace(
-                    year=observed_local.year, tzinfo=zone
+                    year=observed_local.year
                 )
             except ValueError:
                 continue
-            if parsed > observed_local + timedelta(days=1):
+            if parsed > observed_local.replace(tzinfo=None) + timedelta(days=1):
                 parsed = parsed.replace(year=parsed.year - 1)
-            return parsed.astimezone(UTC)
+            return wall_time_utc(parsed, zone)
     return None
 
 
@@ -207,7 +210,12 @@ def parse_news_comment_collection(
     source_timezone: ZoneInfo,
 ) -> NewsCommentParseResult:
     reject_challenge(html)
-    return _parse_comments(HTMLParser(html), article_id, observed_at, source_timezone)
+    tree = HTMLParser(html)
+    source_clock = SourceTime.from_tree(tree, source_timezone, observed_at)
+    result = _parse_comments(tree, article_id, observed_at, cast(ZoneInfo, source_clock.zone))
+    for comment in result.comments:
+        source_clock.validate(comment.published_at)
+    return result
 
 
 def parse_news_comments(
@@ -229,6 +237,8 @@ def parse_news_detail_v2(
 ) -> DetailObservation:
     reject_challenge(html)
     tree = HTMLParser(html)
+    source_clock = SourceTime.from_tree(tree, source_timezone, observed_at)
+    source_timezone = cast(ZoneInfo, source_clock.zone)
     article_nodes = tree.css(".news__article")
     segments: list[SegmentObservation] = []
     links: list[SegmentLinkObservation] = []
@@ -387,6 +397,10 @@ def parse_news_detail_v2(
     if not segments:
         raise SourcePageError("news detail contains no story segments")
 
+    comments = _parse_comments(tree, article_id, observed_at, source_timezone).comments
+    for item in (*segments, *comments):
+        source_clock.validate(item.published_at)
+
     return DetailObservation(
         article_id=article_id,
         observed_at=observed_at,
@@ -394,6 +408,6 @@ def parse_news_detail_v2(
         segments=tuple(segments),
         links=tuple(links),
         media=tuple(media),
-        comments=_parse_comments(tree, article_id, observed_at, source_timezone).comments,
+        comments=comments,
         is_complete=len(segments) == len(article_nodes),
     )

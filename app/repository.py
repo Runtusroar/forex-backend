@@ -30,6 +30,8 @@ def _now() -> datetime:
 
 
 def _iso(value: datetime | None) -> str | None:
+    if value is not None and value.utcoffset() is None:
+        raise ValueError("datetime must include a timezone")
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z") if value else None
 
 

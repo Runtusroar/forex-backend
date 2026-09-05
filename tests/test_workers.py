@@ -1,5 +1,6 @@
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -415,7 +416,10 @@ async def test_truncated_source_without_payload_cannot_replace_complete_calendar
             return self.html
 
     browser = SourceBrowser()
-    collector = Collector(browser, repository, horizon_days=1, lookback_days=0)
+    collector = Collector(
+        browser, repository, source_timezone=ZoneInfo("Asia/Singapore"),
+        horizon_days=1, lookback_days=0,
+    )
     now = datetime(2026, 9, 1, 12, tzinfo=UTC)
     assert await collector.run_calendar_cycle(now) == 39
     browser.html = tree.html

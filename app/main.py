@@ -6,6 +6,7 @@ from typing import Annotated
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from pydantic import AwareDatetime
 
 from app.binance import BinanceFuturesContract, BinanceFuturesMarket, BinanceMarketError
 from app.collector import BrowserSession, Collector
@@ -150,7 +151,10 @@ def _calendar_default_range(
 ) -> tuple[datetime, datetime]:
     local_day = now.astimezone(source_timezone).date()
     start = datetime.combine(local_day, time.min, tzinfo=source_timezone).astimezone(UTC)
-    return start, start + timedelta(days=horizon_days)
+    end = datetime.combine(
+        local_day + timedelta(days=horizon_days), time.min, tzinfo=source_timezone
+    ).astimezone(UTC)
+    return start, end
 
 
 def create_app(
@@ -293,18 +297,20 @@ def create_app(
     @app.get("/api/v1/calendar", dependencies=[Depends(authorize)])
     async def calendar(
         repository: Annotated[Repository, Depends(repo)],
-        start: Annotated[datetime | None, Query(alias="from")] = None,
-        end: Annotated[datetime | None, Query(alias="to")] = None,
+        start: Annotated[AwareDatetime | None, Query(alias="from")] = None,
+        end: Annotated[AwareDatetime | None, Query(alias="to")] = None,
     ) -> dict:
         now = datetime.now(UTC)
+        source_zone = ZoneInfo(configured.calendar_source_timezone)
         default_start, default_end = _calendar_default_range(
             now,
-            ZoneInfo(configured.calendar_source_timezone),
+            source_zone,
             configured.calendar_horizon_days,
         )
         start = start or default_start
         end = end or (default_end if start == default_start else start + timedelta(days=7))
-        if end <= start or end - start > timedelta(days=31):
+        local_duration = end.astimezone(source_zone) - start.astimezone(source_zone)
+        if end <= start or local_duration > timedelta(days=31):
             raise HTTPException(status_code=422, detail="Invalid date range")
         items = await repository.list_calendar(start, end)
         generated_at = await repository.get_runtime_state("calendar_last_success") or now
@@ -325,7 +331,7 @@ def create_app(
         repository: Annotated[Repository, Depends(repo)],
         request: Request,
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
-        before: datetime | None = None,
+        before: AwareDatetime | None = None,
     ) -> dict:
         news_repository = NewsRepository(
             repository.db, repository.write_lock, reader=repository.reader

@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import cast
 from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
@@ -20,6 +20,7 @@ from app.news.models import (
     NewsListingBatch,
 )
 from app.parsers.errors import SourcePageError, reject_challenge
+from app.parsers.source_time import SourceTime, wall_time_utc
 
 SOURCE_ROOT = "https://www.forexfactory.com"
 CATEGORY_HEADINGS: dict[str, CategorySlug] = {
@@ -52,10 +53,10 @@ def _published(node: Node, zone: ZoneInfo) -> tuple[datetime | None, str | None]
         return None, None
     for pattern in ("%b %d, %Y, %I:%M%p", "%b %d, %Y %I:%M%p"):
         try:
-            parsed = datetime.strptime(source_text, pattern).replace(tzinfo=zone)
-            return parsed.astimezone(UTC), source_text
+            parsed = datetime.strptime(source_text, pattern)
         except ValueError:
             continue
+        return wall_time_utc(parsed, zone), source_text
     return None, source_text
 
 
@@ -147,6 +148,8 @@ def parse_news_listing_v2(
 ) -> NewsListingBatch:
     reject_challenge(html)
     tree = HTMLParser(html)
+    source_time = SourceTime.from_tree(tree, source_timezone, observed_at)
+    source_timezone = cast(ZoneInfo, source_time.zone)
     articles: dict[str, ArticleObservation] = {}
     categories: list[CategoryObservation] = []
     feeds: list[FeedObservation] = []
@@ -251,6 +254,8 @@ def parse_news_listing_v2(
 
     if "latest" not in observed_sections or not any(row.feed_type == "latest" for row in feeds):
         raise SourcePageError("news page contains no Latest Stories")
+    for article in articles.values():
+        source_time.validate(article.published_at)
     return NewsListingBatch(
         articles=tuple(articles.values()),
         categories=tuple(categories),

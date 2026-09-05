@@ -12,6 +12,7 @@ from app.domain import (
     CalendarRelatedStoryObservation,
 )
 from app.parsers.errors import SourcePageError, reject_challenge
+from app.parsers.source_time import SourceTime, wall_time_utc
 
 CLOCK_PATTERN = re.compile(r"\d{1,2}:\d{2}(?:am|pm)", re.IGNORECASE)
 SOURCE_ROOT = "https://www.forexfactory.com"
@@ -168,7 +169,10 @@ def _event_time(
     source_timezone: tzinfo,
     *,
     use_timestamp: bool = True,
+    source_epoch: int | None = None,
 ) -> datetime:
+    if use_timestamp and source_epoch is not None and CLOCK_PATTERN.fullmatch(time_text or ""):
+        return datetime.fromtimestamp(source_epoch, tz=UTC)
     timestamp = row.attributes.get("data-timestamp")
     if use_timestamp and timestamp and timestamp.isdigit():
         return datetime.fromtimestamp(int(timestamp), tz=UTC)
@@ -177,18 +181,20 @@ def _event_time(
         raise SourcePageError("calendar row has no timestamp")
     clock = time_text if CLOCK_PATTERN.fullmatch(time_text) else "12:00am"
     parsed = datetime.strptime(f"{date_text} {now.year} {clock}", "%b %d %Y %I:%M%p")
-    parsed = parsed.replace(tzinfo=source_timezone)
-    local_now = now.astimezone(source_timezone)
+    local_now = now.astimezone(source_timezone).replace(tzinfo=None)
     if parsed - local_now > timedelta(days=180):
         parsed = parsed.replace(year=parsed.year - 1)
     elif local_now - parsed > timedelta(days=180):
         parsed = parsed.replace(year=parsed.year + 1)
-    return parsed.astimezone(UTC)
+    instant = wall_time_utc(parsed, source_timezone)
+    if instant is None:
+        raise SourcePageError("calendar source time is ambiguous or nonexistent")
+    return instant
 
 
-def _embedded_day_events(tree: HTMLParser, marker: str | None) -> set[str] | None:
+def _embedded_day_events(tree: HTMLParser, marker: str | None) -> dict[str, dict] | None:
     """Use the source's JSON payload to distinguish an empty day from its loading shell."""
-    found: set[str] | None = None
+    found: dict[str, dict] | None = None
     for script in tree.css("script"):
         text = script.text()
         if "calendarComponentStates" not in text:
@@ -205,8 +211,8 @@ def _embedded_day_events(tree: HTMLParser, marker: str | None) -> set[str] | Non
                 if not isinstance(day.get("events"), list):
                     raise SourcePageError("calendar source events are incomplete")
                 if found is None:
-                    found = set()
-                found.update(str(event["id"]) for event in day["events"])
+                    found = {}
+                found.update((str(event["id"]), event) for event in day["events"])
     return found
 
 
@@ -217,11 +223,17 @@ def parse_calendar(
     expected_date: date | None = None,
     *,
     require_source_payload: bool = False,
+    validate_timezone: bool = True,
 ) -> list[CalendarObservation]:
     reject_challenge(html)
     tree = HTMLParser(html)
     results: list[CalendarObservation] = []
-    source_timezone = source_timezone or datetime.now().astimezone().tzinfo or UTC
+    source_time = SourceTime.from_tree(
+        tree, source_timezone,
+        datetime.combine(expected_date, datetime.min.time(), UTC) if expected_date else now,
+        validate=validate_timezone,
+    )
+    source_timezone = source_time.zone
     reference = (
         datetime.combine(expected_date, datetime.min.time(), source_timezone)
         if expected_date
@@ -230,6 +242,8 @@ def parse_calendar(
     last_date: str | None = None
     last_time: str | None = None
     expected_marker = f"{expected_date:%b} {expected_date.day}" if expected_date else None
+    embedded_events = _embedded_day_events(tree, expected_marker)
+    embedded_ids = set(embedded_events) if embedded_events is not None else None
     requested_day_seen = False
     source_position = 0
     for row in tree.css("tr.calendar__row"):
@@ -249,10 +263,16 @@ def parse_calendar(
         currency = _text(row, ".calendar__currency")
         if not title or not currency:
             raise SourcePageError("calendar row missing required fields")
+        source_epoch = (embedded_events or {}).get(source_id, {}).get("dateline")
+        source_epoch = int(source_epoch) if str(source_epoch).isdigit() else None
+        event_at = _event_time(
+            row, last_date, last_time, reference, source_timezone, source_epoch=source_epoch
+        )
+        source_time.validate(event_at)
         results.append(
             CalendarObservation(
                 source_id=source_id,
-                event_at=_event_time(row, last_date, last_time, reference, source_timezone),
+                event_at=event_at,
                 currency=currency,
                 impact=_impact(row),
                 title_en=title,
@@ -279,7 +299,6 @@ def parse_calendar(
         source_position += 1
     if expected_date and not requested_day_seen:
         raise SourcePageError("calendar page does not contain requested day")
-    embedded_ids = _embedded_day_events(tree, expected_marker)
     if require_source_payload and embedded_ids is None:
         raise SourcePageError("calendar source payload is missing or unrecognized")
     rendered_ids = {item.source_id for item in results}

@@ -144,6 +144,12 @@ data and collection loop intact; Chinese fields remain nullable until a later re
 Calendar rows show wall-clock time, so the parser converts the explicitly configured
 `CALENDAR_SOURCE_TIMEZONE` (default `Asia/Singapore`) to UTC before storing it. This is independent
 of the server operating-system timezone and proxy exit IP. Singapore and China are both UTC+8.
+The page's `window.FF.timezone_name` is checked against configuration at the relevant dates;
+different names with the same offset are accepted. A mismatch stops ingestion instead of shifting
+timestamps silently. Calendar timed events prefer the source JSON Unix timestamp. Without an epoch,
+DST gaps and repeated wall-clock times are not guessed: calendar capture retries, while news keeps
+the original time text with a nullable timestamp. Standalone parsing uses explicit/page timezone
+metadata, with UTC as the final fallback, never the host timezone.
 `CALENDAR_HORIZON_DAYS` defaults to `8`, and `CALENDAR_SCHEDULE_INTERVAL_SECONDS` defaults to `600`.
 Comment collection runs every `NEWS_COMMENT_INTERVAL_SECONDS` (default `2`) and audits recent
 articles every `NEWS_COMMENT_AUDIT_INTERVAL_SECONDS` (default `21600`). Calendar detail collection
@@ -184,6 +190,11 @@ is additive; existing client fields remain available.
 Chinese fields can be `null` while translation is pending or unavailable. Timestamps are UTC
 ISO-8601 values. V1 News remains backed by V2 compatibility serialization until the installed
 iPhone client has been migrated and verified; no V1 removal is part of this release.
+Calendar `from`/`to` and V1 news `before` require `Z` or a numeric timezone offset; naive timestamps
+return 422. Calendar day ranges use source-local midnight, including 23/25-hour DST days.
+`event_at` and `published_at` represent source event/publication instants; observation, row update,
+and response timestamps have separate meanings. UTC storage must not be manually shifted by eight
+hours; the client formats each instant in UTC+8, including date grouping and cached-data labels.
 
 ## Local development
 
