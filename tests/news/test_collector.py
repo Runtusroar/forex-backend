@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -96,6 +97,42 @@ async def test_challenge_listing_never_mutates_repository(news_repository: NewsR
         await collector.run_listing_cycle(NOW)
 
     assert await news_repository.count_articles() == 0
+
+
+async def test_listing_failure_records_diagnostics_and_logs(
+    news_repository: NewsRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    browser = FakeBrowser(listing=CHALLENGE)
+    collector = NewsCollector(browser, news_repository, ZoneInfo("Asia/Shanghai"))
+
+    with caplog.at_level(logging.WARNING), pytest.raises(ChallengePageError):
+        await collector.run_listing_cycle(NOW)
+
+    assert await news_repository.get_runtime_state("news_last_listing_error") == (
+        "ChallengePageError"
+    )
+    assert await news_repository.get_runtime_state("news_last_listing_error_at") == NOW.isoformat()
+    assert await news_repository.get_runtime_state("news_listing_consecutive_failures") == "1"
+    assert "news listing collection failed" in caplog.text.lower()
+    assert "consecutive_failures=1" in caplog.text
+
+
+async def test_listing_success_logs_recovery_and_resets_failure_state(
+    news_repository: NewsRepository, caplog: pytest.LogCaptureFixture
+) -> None:
+    browser = FakeBrowser(listing=CHALLENGE)
+    collector = NewsCollector(browser, news_repository, ZoneInfo("Asia/Shanghai"))
+    with pytest.raises(ChallengePageError):
+        await collector.run_listing_cycle(NOW)
+    browser.listing = LISTING
+
+    with caplog.at_level(logging.INFO):
+        await collector.run_listing_cycle(NOW)
+
+    assert await news_repository.get_runtime_state("news_last_listing_error") == ""
+    assert await news_repository.get_runtime_state("news_last_listing_error_at") == ""
+    assert await news_repository.get_runtime_state("news_listing_consecutive_failures") == "0"
+    assert "news listing collection recovered" in caplog.text.lower()
 
 
 async def test_detail_failure_is_persisted_and_bounded(news_repository: NewsRepository) -> None:

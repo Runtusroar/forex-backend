@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
 from datetime import UTC, datetime
 from typing import Protocol
@@ -11,6 +12,8 @@ from app.news.listing import parse_news_listing_v2
 from app.news.models import ListingApplyResult
 from app.news.repository import NewsRepository
 from app.news.snapshots import SnapshotStore
+
+logger = logging.getLogger(__name__)
 
 
 class NewsBrowserSource(Protocol):
@@ -48,27 +51,65 @@ class NewsCollector:
                 batch = parse_news_listing_v2(html, observed_at, self.source_timezone)
                 result = await self.repository.apply_listing(batch)
             except Exception as error:
+                html = html or getattr(error, "source_html", None)
                 if html is not None and self.snapshot_store:
                     with suppress(Exception):
                         await self.snapshot_store.capture(
                             "listing", "news", html, observed_at, error
                         )
-                with suppress(Exception):
-                    await self.repository.set_runtime_state(
-                        "news_last_listing_error", type(error).__name__
-                    )
+                failures = await self._record_listing_failure(error, observed_at)
+                logger.warning(
+                    "News listing collection failed error_type=%s "
+                    "consecutive_failures=%d message=%s",
+                    type(error).__name__,
+                    failures,
+                    str(error),
+                    exc_info=failures == 1 or failures % 10 == 0,
+                )
                 raise
             if self.snapshot_store:
                 with suppress(Exception):
                     await self.snapshot_store.capture(
                         "listing", "news", html, observed_at
                     )
+            previous_failures = await self._listing_failure_count()
             with suppress(Exception):
                 await self.repository.set_runtime_state(
                     "news_last_listing_success", observed_at.isoformat()
                 )
                 await self.repository.set_runtime_state("news_last_listing_error", "")
+                await self.repository.set_runtime_state("news_last_listing_error_at", "")
+                await self.repository.set_runtime_state(
+                    "news_listing_consecutive_failures", "0"
+                )
+            if previous_failures:
+                logger.info(
+                    "News listing collection recovered previous_consecutive_failures=%d",
+                    previous_failures,
+                )
             return result
+
+    async def _listing_failure_count(self) -> int:
+        with suppress(Exception):
+            raw = await self.repository.get_runtime_state(
+                "news_listing_consecutive_failures"
+            )
+            return max(0, int(raw or 0))
+        return 0
+
+    async def _record_listing_failure(self, error: Exception, observed_at: datetime) -> int:
+        failures = await self._listing_failure_count() + 1
+        with suppress(Exception):
+            await self.repository.set_runtime_state(
+                "news_last_listing_error", type(error).__name__
+            )
+            await self.repository.set_runtime_state(
+                "news_last_listing_error_at", observed_at.isoformat()
+            )
+            await self.repository.set_runtime_state(
+                "news_listing_consecutive_failures", str(failures)
+            )
+        return failures
 
     async def run_detail_cycle(self, now: datetime | None = None) -> int:
         observed_at = now or datetime.now(UTC)
@@ -129,8 +170,13 @@ class NewsCollector:
 
     async def run_listing(self, stop: asyncio.Event, interval: int) -> None:
         while not stop.is_set():
-            with suppress(Exception):
+            try:
                 await self.run_listing_cycle()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # run_listing_cycle records structured state and a throttled log entry.
+                pass
             try:
                 await asyncio.wait_for(stop.wait(), timeout=interval)
             except TimeoutError:

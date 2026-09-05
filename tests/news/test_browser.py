@@ -1,10 +1,12 @@
 import asyncio
+import logging
 from datetime import date, datetime
 
 import pytest
 
 from app.collector import browser as browser_module
 from app.collector.browser import BrowserSession
+from app.parsers import ChallengePageError, SourcePageError
 
 
 class PageEvents:
@@ -34,6 +36,49 @@ class FakeContext:
         return object()
 
 
+class ListingPage(PageEvents):
+    def __init__(self, html: str | list[str], *, selector_error: Exception | None = None) -> None:
+        self.html = html
+        self.selector_error = selector_error
+        self.goto_calls = 0
+        self.content_reads = 0
+        self.closed = False
+
+    async def goto(self, _url: str, **_kwargs) -> None:
+        self.goto_calls += 1
+
+    async def wait_for_selector(self, _selector: str, **_kwargs) -> None:
+        if self.selector_error:
+            raise self.selector_error
+
+    async def content(self) -> str:
+        if isinstance(self.html, str):
+            return self.html
+        index = min(self.content_reads, len(self.html) - 1)
+        self.content_reads += 1
+        return self.html[index]
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class ListingContext(FakeContext):
+    def __init__(self, pages: list[ListingPage]) -> None:
+        super().__init__()
+        self.pages = pages
+
+    async def new_page(self) -> ListingPage:
+        page = self.pages[self.created]
+        self.created += 1
+        return page
+
+
+class FailingNewPageContext(FakeContext):
+    async def new_page(self):
+        self.created += 1
+        raise ConnectionError("CDP disconnected while creating page")
+
+
 class FakeBrowser:
     def __init__(self, context: FakeContext) -> None:
         self.contexts = [context]
@@ -56,6 +101,15 @@ class FakeChromium:
 class FakePlaywright:
     def __init__(self, chromium: FakeChromium) -> None:
         self.chromium = chromium
+
+
+class StoppablePlaywright(FakePlaywright):
+    def __init__(self, chromium: FakeChromium) -> None:
+        super().__init__(chromium)
+        self.stopped = False
+
+    async def stop(self) -> None:
+        self.stopped = True
 
 
 class FakeStarter:
@@ -279,6 +333,30 @@ async def test_concurrent_connect_creates_only_one_page_pair(monkeypatch) -> Non
     assert context.created == 2
 
 
+async def test_connect_replaces_disconnected_cdp_session(monkeypatch) -> None:
+    class DisconnectedBrowser(FakeBrowser):
+        def is_connected(self) -> bool:
+            return False
+
+    old_playwright = StoppablePlaywright(FakeChromium(FakeBrowser(FakeContext())))
+    calendar = ListingPage("<html>calendar</html>")
+    news = ListingPage('<div class="news-block__item">Latest</div>')
+    context = ListingContext([calendar, news])
+    chromium = FakeChromium(FakeBrowser(context))
+    starter = FakeStarter(FakePlaywright(chromium))
+    monkeypatch.setattr(browser_module, "async_playwright", lambda: starter)
+    session = BrowserSession("http://chrome:9222", news_retry_delay=0)
+    session.playwright = old_playwright  # type: ignore[assignment]
+    session.browser = DisconnectedBrowser(FakeContext())  # type: ignore[assignment]
+
+    html = await session.news_html()
+
+    assert html == news.html
+    assert old_playwright.stopped is True
+    assert chromium.connects == 1
+    assert context.created == 2
+
+
 async def test_calendar_navigation_is_serialized_on_shared_page() -> None:
     context = FakeContext()
     session = BrowserSession("http://chrome:9222")
@@ -304,6 +382,116 @@ async def test_news_navigation_is_serialized_on_shared_page() -> None:
     await asyncio.gather(session.news_html(), session.news_html())
 
     assert page.max_active_navigations == 1
+
+
+async def test_news_capture_replaces_timed_out_page_and_retries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    failed = ListingPage(
+        "<html><title>Incomplete</title></html>",
+        selector_error=TimeoutError("listing selector missing"),
+    )
+    recovered = ListingPage('<div class="news-block__item">Latest</div>')
+    context = ListingContext([recovered])
+    session = BrowserSession("http://chrome:9222", news_retry_delay=0)
+    session.browser = FakeBrowser(context)  # type: ignore[assignment]
+    session.news_page = failed  # type: ignore[assignment]
+
+    with caplog.at_level(logging.INFO):
+        html = await session.news_html()
+
+    assert html == recovered.html
+    assert failed.closed is True
+    assert context.created == 1
+    assert "replacing page and retrying" in caplog.text.lower()
+    assert "recovered after page replacement" in caplog.text.lower()
+
+
+async def test_news_capture_preserves_challenge_html_after_retry() -> None:
+    challenge = "<html><title>Just a moment...</title><div id='cf-chl-widget'></div></html>"
+    first = ListingPage(challenge)
+    second = ListingPage(challenge)
+    context = ListingContext([second])
+    session = BrowserSession("http://chrome:9222", news_retry_delay=0)
+    session.browser = FakeBrowser(context)  # type: ignore[assignment]
+    session.news_page = first  # type: ignore[assignment]
+
+    with pytest.raises(ChallengePageError) as captured:
+        await session.news_html()
+
+    assert captured.value.source_html == challenge
+    assert first.closed is True
+
+
+async def test_news_capture_allows_automatic_challenge_to_finish() -> None:
+    challenge = "<html><title>Just a moment...</title><div id='cf-chl-widget'></div></html>"
+    listing = '<div class="news-block__item">Latest</div>'
+    page = ListingPage([challenge, listing])
+    context = ListingContext([])
+    session = BrowserSession("http://chrome:9222", news_retry_delay=0)
+    session.browser = FakeBrowser(context)  # type: ignore[assignment]
+    session.news_page = page  # type: ignore[assignment]
+
+    html = await session.news_html()
+
+    assert html == listing
+    assert page.closed is False
+    assert context.created == 0
+
+
+async def test_news_capture_preserves_timeout_html_after_retry() -> None:
+    first = ListingPage("<html>first incomplete response</html>", selector_error=TimeoutError())
+    second = ListingPage("<html>second incomplete response</html>", selector_error=TimeoutError())
+    context = ListingContext([second])
+    session = BrowserSession("http://chrome:9222", news_retry_delay=0)
+    session.browser = FakeBrowser(context)  # type: ignore[assignment]
+    session.news_page = first  # type: ignore[assignment]
+
+    with pytest.raises(SourcePageError) as captured:
+        await session.news_html()
+
+    assert captured.value.source_html == second.html
+    assert "TimeoutError" in str(captured.value)
+
+
+async def test_news_page_replacement_reconnects_when_new_page_fails(monkeypatch) -> None:
+    failed = ListingPage("<html>stuck page</html>", selector_error=TimeoutError())
+    old_playwright = StoppablePlaywright(FakeChromium(FakeBrowser(FakeContext())))
+    calendar = ListingPage("<html>calendar</html>")
+    recovered = ListingPage('<div class="news-block__item">Latest</div>')
+    new_context = ListingContext([calendar, recovered])
+    chromium = FakeChromium(FakeBrowser(new_context))
+    starter = FakeStarter(FakePlaywright(chromium))
+    monkeypatch.setattr(browser_module, "async_playwright", lambda: starter)
+    session = BrowserSession("http://chrome:9222", news_retry_delay=0)
+    session.playwright = old_playwright  # type: ignore[assignment]
+    session.browser = FakeBrowser(FailingNewPageContext())  # type: ignore[assignment]
+    session.news_page = failed  # type: ignore[assignment]
+
+    html = await session.news_html()
+
+    assert html == recovered.html
+    assert old_playwright.stopped is True
+    assert chromium.connects == 1
+
+
+async def test_news_page_recovery_failure_retains_first_html(monkeypatch) -> None:
+    class FailingStarter:
+        async def start(self):
+            raise ConnectionError("CDP reconnect unavailable")
+
+    first_html = "<html>stuck page evidence</html>"
+    failed = ListingPage(first_html, selector_error=TimeoutError())
+    monkeypatch.setattr(browser_module, "async_playwright", lambda: FailingStarter())
+    session = BrowserSession("http://chrome:9222", news_retry_delay=0)
+    session.browser = FakeBrowser(FailingNewPageContext())  # type: ignore[assignment]
+    session.news_page = failed  # type: ignore[assignment]
+
+    with pytest.raises(SourcePageError) as captured:
+        await session.news_html()
+
+    assert captured.value.source_html == first_html
+    assert "recovery failed" in str(captured.value)
 
 
 async def test_news_detail_expands_all_comments_before_capturing_html() -> None:

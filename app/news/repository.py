@@ -1724,6 +1724,7 @@ class NewsRepository:
         for key in (
             "news_last_listing_success",
             "news_last_listing_error",
+            "news_last_listing_error_at",
             "news_last_detail_success",
             "news_last_detail_error",
             "news_last_comment_success",
@@ -1731,6 +1732,11 @@ class NewsRepository:
             "news_last_translation_success",
         ):
             result[key.removeprefix("news_")] = await self.get_runtime_state(key)
+        failures = await self.get_runtime_state("news_listing_consecutive_failures")
+        try:
+            result["listing_consecutive_failures"] = max(0, int(failures or 0))
+        except ValueError:
+            result["listing_consecutive_failures"] = 0
         return result
 
     @_snapshot_read

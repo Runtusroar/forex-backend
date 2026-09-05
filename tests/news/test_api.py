@@ -63,6 +63,7 @@ async def api(tmp_path: Path):
             feeds=(FeedObservation("100", "latest", 0, NOW),),
         )
     )
+    await news.set_runtime_state("news_last_listing_success", NOW.isoformat())
     await news.replace_detail(
         "100",
         DetailObservation(
@@ -131,6 +132,7 @@ async def api(tmp_path: Path):
             True,
         )
     )
+    await news.set_runtime_state("news_last_comment_success", NOW.isoformat())
     title_job = (await news.claim_localized_jobs(1, NOW))[0]
     await news.complete_localized_job(title_job, "日元上涨", "k3-256k")
     media_job = (await news.claim_media_jobs(1, NOW))[0]
@@ -177,6 +179,20 @@ async def test_sections_and_latest_are_stable_and_bilingual(api: httpx.AsyncClie
     assert listing.json()["items"][0]["title"] == {"en": "Yen rises", "zh_hans": "日元上涨"}
     assert listing.json()["items"][0]["breaking_impact"] == "high"
     assert listing.json()["items"][0]["thumbnail_url"] == "https://assets.example/yen.png"
+    assert listing.json()["source_updated_at"] == "2026-09-03T00:00:00Z"
+
+
+async def test_latest_comments_exposes_listing_collection_time(api: httpx.AsyncClient) -> None:
+    repo = api._transport.app.state.news_repository
+    await repo.set_runtime_state(
+        "news_last_comment_success", (NOW + timedelta(hours=1)).isoformat()
+    )
+    response = await api.get(
+        "/api/v2/news/comments/latest", headers={"X-API-Key": "api-secret"}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["source_updated_at"] == "2026-09-03T00:00:00Z"
 
 
 async def test_detail_comments_and_media_contract(api: httpx.AsyncClient) -> None:
@@ -256,6 +272,17 @@ async def test_status_exposes_schema_queues_and_sanitized_collector_state(
     assert "last_comment_error" in response.json()
     assert "source_documents" not in response.json()
     assert response.json()["last_listing_error"] is None
+
+
+async def test_status_exposes_listing_failure_diagnostics(api: httpx.AsyncClient) -> None:
+    repo = api._transport.app.state.news_repository
+    await repo.set_runtime_state("news_last_listing_error_at", NOW.isoformat())
+    await repo.set_runtime_state("news_listing_consecutive_failures", "3")
+
+    response = await api.get("/api/v2/status", headers={"X-API-Key": "api-secret"})
+
+    assert response.json()["last_listing_error_at"] == NOW.isoformat()
+    assert response.json()["listing_consecutive_failures"] == 3
 
 
 async def test_status_reports_collection_failure_instead_of_ok(api):

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections.abc import Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from urllib.parse import urlsplit
@@ -18,7 +20,9 @@ from playwright.async_api import (
 )
 
 from app.parsers.calendar import parse_calendar
-from app.parsers.errors import SourcePageError
+from app.parsers.errors import SourcePageError, reject_challenge
+
+logger = logging.getLogger(__name__)
 
 NEWS_SECTION_HEADINGS = {
     "latest": "News / Latest Stories",
@@ -173,8 +177,9 @@ async def _settled_news_block(
 
 
 class BrowserSession:
-    def __init__(self, cdp_url: str) -> None:
+    def __init__(self, cdp_url: str, news_retry_delay: float = 1.0) -> None:
         self.cdp_url = cdp_url
+        self.news_retry_delay = news_retry_delay
         self.playwright: Playwright | None = None
         self.browser: Browser | None = None
         self.calendar_page: Page | None = None
@@ -189,11 +194,21 @@ class BrowserSession:
         async with self._connect_lock:
             if self.browser and self.browser.is_connected():
                 return
+            await self._clear_disconnected_connection()
             self.playwright = await async_playwright().start()
             self.browser = await self.playwright.chromium.connect_over_cdp(self.cdp_url)
             context = self.browser.contexts[0]
             self.calendar_page = await context.new_page()
             self.news_page = await context.new_page()
+
+    async def _clear_disconnected_connection(self) -> None:
+        self.calendar_page = None
+        self.news_page = None
+        self.browser = None
+        if self.playwright:
+            with suppress(Exception):
+                await self.playwright.stop()
+        self.playwright = None
 
     async def calendar_html(self, day: date) -> str:
         await self.connect()
@@ -314,14 +329,94 @@ class BrowserSession:
     async def news_html(self) -> str:
         await self.connect()
         async with self._news_lock:
-            assert self.news_page is not None
-            await self.news_page.goto(
+            first_error: Exception | None = None
+            for attempt in range(2):
+                try:
+                    html = await self._news_html_once()
+                    if attempt:
+                        logger.info("News listing page recovered after page replacement")
+                    return html
+                except Exception as error:
+                    if attempt:
+                        if not getattr(error, "source_html", None) and first_error is not None:
+                            error.source_html = getattr(first_error, "source_html", None)
+                        raise
+                    first_error = error
+                    logger.warning(
+                        "News listing page capture failed; replacing page and retrying "
+                        "error_type=%s message=%s",
+                        type(error).__name__,
+                        str(error),
+                    )
+                    try:
+                        await self._replace_news_page()
+                    except Exception as recovery_error:
+                        detail = str(recovery_error).strip()
+                        suffix = f": {detail}" if detail else ""
+                        captured = SourcePageError(
+                            "news listing page recovery failed "
+                            f"({type(recovery_error).__name__}){suffix}"
+                        )
+                        captured.source_html = getattr(first_error, "source_html", None)
+                        raise captured from recovery_error
+                    if self.news_retry_delay:
+                        await asyncio.sleep(self.news_retry_delay)
+            raise AssertionError("unreachable")
+
+    async def _news_html_once(self) -> str:
+        assert self.news_page is not None
+        page = self.news_page
+        html: str | None = None
+        try:
+            await page.goto(
                 "https://www.forexfactory.com/news", wait_until="domcontentloaded"
             )
-            await self.news_page.wait_for_selector(
-                ".news-block__item, .news__item", state="attached", timeout=20_000
+            html = await page.content()
+            await page.wait_for_selector(
+                ".news-block__item, .news__item", state="attached", timeout=30_000
             )
-            return await self.news_page.content()
+            html = await page.content()
+            reject_challenge(html)
+            return html
+        except Exception as error:
+            with suppress(Exception):
+                html = await page.content()
+            if html and not isinstance(error, SourcePageError):
+                try:
+                    reject_challenge(html)
+                except SourcePageError as classified:
+                    classified.source_html = html
+                    raise classified from error
+            if isinstance(error, SourcePageError):
+                captured = error
+            else:
+                detail = str(error).strip()
+                suffix = f": {detail}" if detail else ""
+                captured = SourcePageError(
+                    f"news listing capture failed ({type(error).__name__}){suffix}"
+                )
+            if html:
+                captured.source_html = html
+            raise captured from error
+
+    async def _replace_news_page(self) -> None:
+        old_page = self.news_page
+        self.news_page = None
+        if old_page:
+            with suppress(Exception):
+                await old_page.close()
+        if self.browser and self.browser.is_connected():
+            try:
+                self.news_page = await self.browser.contexts[0].new_page()
+                return
+            except Exception as error:
+                logger.warning(
+                    "News page replacement failed; reconnecting CDP error_type=%s message=%s",
+                    type(error).__name__,
+                    str(error),
+                )
+        await self._clear_disconnected_connection()
+        await self.connect()
 
     async def news_detail_html(self, url: str, expected_comment_count: int | None = None) -> str:
         capture = await self._news_detail_capture(

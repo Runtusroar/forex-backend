@@ -138,6 +138,15 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
         async with live.database.read_connection() as reader:
             yield NewsRepository(live.db, live.write_lock, reader=reader)
 
+    async def source_updated_at(repo: NewsRepository, state_key: str) -> datetime | None:
+        raw = await repo.get_runtime_state(state_key)
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+
     @router.get("/news/sections")
     async def sections(repo: Annotated[NewsRepository, Depends(repository)]) -> dict:
         counts = await repo.section_counts()
@@ -169,6 +178,9 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
             "items": [_article(row) for row in rows],
             "next_cursor": _encode_cursor(section, next_value),
             "generated_at": datetime.now(UTC),
+            "source_updated_at": await source_updated_at(
+                repo, "news_last_listing_success"
+            ),
         }
 
     @router.get("/news/comments/latest")
@@ -184,6 +196,9 @@ def create_news_router(settings: Settings, authorize: Callable[..., None]) -> AP
             "next_cursor": _encode_cursor("latest-comments", next_value),
             "comments_complete": False,
             "generated_at": datetime.now(UTC),
+            "source_updated_at": await source_updated_at(
+                repo, "news_last_listing_success"
+            ),
         }
 
     @router.get("/news/media/{media_id}")
